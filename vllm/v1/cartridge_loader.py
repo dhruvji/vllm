@@ -128,10 +128,6 @@ def cleanup_all_cartridge_shm() -> None:
 # Compiled pattern for matching KV cache layer keys
 _KV_LAYER_PATTERN = re.compile(r"layers\.(\d+)\.attention\.prefix\.(keys|values)")
 
-# Global cache for active cartridge KV tensors
-# Maps request_id -> {layer_idx: (key_tensor, value_tensor)}
-_active_cartridge_kv: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
-
 # In-memory cache for parsed CartridgeData objects
 # Maps (cartridge_id, source) -> CartridgeData
 _cartridge_data_cache: dict[tuple[str, str], "CartridgeData"] = {}
@@ -175,54 +171,6 @@ def _parse_kv_cache_to_layers(
             values_by_layer[layer_idx] = tensor
 
     return keys_by_layer, values_by_layer
-
-
-def set_active_cartridge_kv(
-    request_id: str,
-    cartridge_data: "CartridgeData",
-    device: torch.device | str = "cuda",
-) -> None:
-    """Set the active cartridge KV for a request."""
-    if not cartridge_data.is_learned or not cartridge_data.kv_cache:
-        return
-
-    keys_by_layer, values_by_layer = _parse_kv_cache_to_layers(
-        cartridge_data.kv_cache, device
-    )
-
-    # Combine into layer_kv dict (only layers with both keys and values)
-    layer_kv = {
-        idx: (keys_by_layer[idx], values_by_layer[idx])
-        for idx in keys_by_layer
-        if idx in values_by_layer
-    }
-
-    if layer_kv:
-        _active_cartridge_kv[request_id] = layer_kv
-        logger.info(
-            "Set cartridge KV for request %s: %d layers",
-            request_id,
-            len(layer_kv),
-        )
-
-
-def get_active_cartridge_kv(
-    request_id: str,
-) -> dict[int, tuple[torch.Tensor, torch.Tensor]] | None:
-    """Get the active cartridge KV for a request."""
-    return _active_cartridge_kv.get(request_id)
-
-
-def get_all_active_cartridge_request_ids() -> list[str]:
-    """Get all request IDs that have active cartridge KV."""
-    return list(_active_cartridge_kv.keys())
-
-
-def clear_active_cartridge_kv(request_id: str) -> None:
-    """Clear the cartridge KV for a finished request."""
-    if request_id in _active_cartridge_kv:
-        del _active_cartridge_kv[request_id]
-        logger.debug("Cleared cartridge KV for request %s", request_id)
 
 
 def clear_cartridge_data_cache() -> None:
