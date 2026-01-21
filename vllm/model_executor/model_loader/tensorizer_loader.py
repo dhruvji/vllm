@@ -134,10 +134,6 @@ class TensorizerLoader(BaseModelLoader):
                         tensorizer_config=tensorizer_config, vllm_config=vllm_config
                     )
             self.load_weights(model, model_config)
-            # Tensorizer may leave parameters with requires_grad=True; disable
-            # grads for inference before post-load processing mutates params.
-            for param in model.parameters():
-                param.requires_grad_(False)
             process_weights_after_loading(
                 model=model,
                 model_config=model_config,

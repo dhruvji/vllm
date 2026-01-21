@@ -666,6 +666,11 @@ def serialize_vllm_model(
         nn.Parameter(torch.tensor((1,), device="meta"), requires_grad=False),
     )
 
+    # Disable gradients before serialization since tensorizer preserves
+    # requires_grad state. This ensures tensors load with requires_grad=False
+    # for inference, avoiding issues with in-place operations during loading.
+    model.requires_grad_(False)
+
     tensorizer_args = tensorizer_config._construct_tensorizer_args()
 
     encryption_params = None

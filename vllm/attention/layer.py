@@ -62,10 +62,13 @@ def set_default_quant_scales(layer: nn.Module, register_buffer: bool = False) ->
         layer.register_buffer("_q_scale", torch.tensor(1.0, dtype=torch.float32))
         layer.register_buffer("_prob_scale", torch.tensor(1.0, dtype=torch.float32))
     else:
-        layer._k_scale.fill_(1.0)
-        layer._v_scale.fill_(1.0)
-        layer._q_scale.fill_(1.0)
-        layer._prob_scale.fill_(1.0)
+        # Use no_grad to allow in-place ops on tensors that may have
+        # requires_grad=True (e.g., after tensorizer deserialization).
+        with torch.no_grad():
+            layer._k_scale.fill_(1.0)
+            layer._v_scale.fill_(1.0)
+            layer._q_scale.fill_(1.0)
+            layer._prob_scale.fill_(1.0)
 
     # We also keep q/k/v_scale on host (cpu) memory for attention
     # backends that require the scales to be on host instead of on device.
