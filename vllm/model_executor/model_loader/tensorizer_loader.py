@@ -139,6 +139,9 @@ class TensorizerLoader(BaseModelLoader):
             # grads for inference before post-load processing mutates params.
             for param in model.parameters():
                 param.requires_grad_(False)
+            for buffer in model.buffers():
+                if buffer.requires_grad:
+                    buffer.requires_grad_(False)
             process_weights_after_loading(
                 model=model,
                 model_config=model_config,
