@@ -9,55 +9,6 @@ from http import HTTPStatus
 from typing import Annotated, Any, ClassVar, Literal, TypeAlias
 
 import regex as re
-import torch
-from fastapi import HTTPException, UploadFile
-from openai.types.responses import (
-    ResponseCodeInterpreterCallCodeDeltaEvent,
-    ResponseCodeInterpreterCallCodeDoneEvent,
-    ResponseCodeInterpreterCallCompletedEvent,
-    ResponseCodeInterpreterCallInProgressEvent,
-    ResponseCodeInterpreterCallInterpretingEvent,
-    ResponseContentPartAddedEvent,
-    ResponseContentPartDoneEvent,
-    ResponseFunctionToolCall,
-    ResponseInputItemParam,
-    ResponseMcpCallArgumentsDeltaEvent,
-    ResponseMcpCallArgumentsDoneEvent,
-    ResponseMcpCallCompletedEvent,
-    ResponseMcpCallInProgressEvent,
-    ResponseOutputItem,
-    ResponseOutputItemAddedEvent,
-    ResponseOutputItemDoneEvent,
-    ResponsePrompt,
-    ResponseReasoningTextDeltaEvent,
-    ResponseReasoningTextDoneEvent,
-    ResponseStatus,
-    ResponseWebSearchCallCompletedEvent,
-    ResponseWebSearchCallInProgressEvent,
-    ResponseWebSearchCallSearchingEvent,
-)
-from openai.types.responses import (
-    ResponseCompletedEvent as OpenAIResponseCompletedEvent,
-)
-from openai.types.responses import ResponseCreatedEvent as OpenAIResponseCreatedEvent
-from openai.types.responses import (
-    ResponseInProgressEvent as OpenAIResponseInProgressEvent,
-)
-from openai.types.responses.response_reasoning_item import (
-    Content as ResponseReasoningTextContent,
-)
-from openai_harmony import Message as OpenAIHarmonyMessage
-
-# Backward compatibility for OpenAI client versions
-try:  # For older openai versions (< 1.100.0)
-    from openai.types.responses import ResponseTextConfig
-except ImportError:  # For newer openai versions (>= 1.100.0)
-    from openai.types.responses import ResponseFormatTextConfig as ResponseTextConfig
-
-
-from openai.types.responses.response import IncompleteDetails, ToolChoice
-from openai.types.responses.tool import Tool
-from openai.types.shared import Metadata, Reasoning
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -81,8 +32,6 @@ from vllm.utils import random_uuid
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 logger = init_logger(__name__)
-
-_LONG_INFO = torch.iinfo(torch.long)
 
 
 class OpenAIBaseModel(BaseModel):
