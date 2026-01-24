@@ -19,6 +19,7 @@ from pydantic import (
 )
 
 from openai.types.responses import ResponseInputItemParam, ResponseOutputItem
+from openai.types.shared import Metadata
 
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam, make_tool_call_id
 from vllm.exceptions import VLLMValidationError
