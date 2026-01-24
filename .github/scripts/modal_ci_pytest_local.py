@@ -86,7 +86,7 @@ base_image = (
     .uv_pip_install(
         "vllm @ file:///tmp/vllm",
         "huggingface-hub[hf_transfer]==0.36.0",
-        "flashinfer-python==0.5.3",
+        "flashinfer-python==0.6.1",
         "boto3",
         "pytest",
         "pytest-asyncio",
