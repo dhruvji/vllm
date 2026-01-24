@@ -9,6 +9,7 @@ from http import HTTPStatus
 from typing import Annotated, Any, ClassVar, Literal, TypeAlias
 
 import regex as re
+import torch
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -22,9 +23,11 @@ from openai.types.responses import (
     ResponseCodeInterpreterCallCodeDeltaEvent,
     ResponseCodeInterpreterCallCodeDoneEvent,
     ResponseCodeInterpreterCallCompletedEvent,
+    ResponseCodeInterpreterCallInProgressEvent,
     ResponseCodeInterpreterCallInterpretingEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
+    ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseMcpCallArgumentsDeltaEvent,
     ResponseMcpCallArgumentsDoneEvent,
@@ -48,12 +51,14 @@ from openai.types.responses import ResponseCreatedEvent as OpenAIResponseCreated
 from openai.types.responses import (
     ResponseInProgressEvent as OpenAIResponseInProgressEvent,
 )
-from openai.types.responses.response import ToolChoice
+from openai.types.responses.response import IncompleteDetails, ToolChoice
 from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
 )
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
+from openai_harmony import Message as OpenAIHarmonyMessage
+from fastapi import UploadFile
 
 # Backward compatibility for OpenAI client versions
 try:  # For older openai versions (< 1.100.0)
@@ -75,6 +80,8 @@ from vllm.utils import random_uuid
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 logger = init_logger(__name__)
+
+_LONG_INFO = torch.iinfo(torch.long)
 
 
 class OpenAIBaseModel(BaseModel):
