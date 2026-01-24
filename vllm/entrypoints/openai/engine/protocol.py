@@ -18,8 +18,48 @@ from pydantic import (
     model_validator,
 )
 
-from openai.types.responses import ResponseInputItemParam, ResponseOutputItem
-from openai.types.shared import Metadata
+from openai.types.responses import (
+    ResponseCodeInterpreterCallCodeDeltaEvent,
+    ResponseCodeInterpreterCallCodeDoneEvent,
+    ResponseCodeInterpreterCallCompletedEvent,
+    ResponseCodeInterpreterCallInterpretingEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
+    ResponseInputItemParam,
+    ResponseMcpCallArgumentsDeltaEvent,
+    ResponseMcpCallArgumentsDoneEvent,
+    ResponseMcpCallCompletedEvent,
+    ResponseMcpCallInProgressEvent,
+    ResponseOutputItem,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponsePrompt,
+    ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent,
+    ResponseStatus,
+    ResponseWebSearchCallCompletedEvent,
+    ResponseWebSearchCallInProgressEvent,
+    ResponseWebSearchCallSearchingEvent,
+)
+from openai.types.responses import (
+    ResponseCompletedEvent as OpenAIResponseCompletedEvent,
+)
+from openai.types.responses import ResponseCreatedEvent as OpenAIResponseCreatedEvent
+from openai.types.responses import (
+    ResponseInProgressEvent as OpenAIResponseInProgressEvent,
+)
+from openai.types.responses.response import ToolChoice
+from openai.types.responses.response_reasoning_item import (
+    Content as ResponseReasoningTextContent,
+)
+from openai.types.responses.tool import Tool
+from openai.types.shared import Metadata, Reasoning
+
+# Backward compatibility for OpenAI client versions
+try:  # For older openai versions (< 1.100.0)
+    from openai.types.responses import ResponseTextConfig
+except ImportError:  # For newer openai versions (>= 1.100.0)
+    from openai.types.responses import ResponseFormatTextConfig as ResponseTextConfig
 
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam, make_tool_call_id
 from vllm.exceptions import VLLMValidationError
