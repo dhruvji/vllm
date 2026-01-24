@@ -18,6 +18,8 @@ from pydantic import (
     model_validator,
 )
 
+from openai.types.responses import ResponseInputItemParam, ResponseOutputItem
+
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam, make_tool_call_id
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
