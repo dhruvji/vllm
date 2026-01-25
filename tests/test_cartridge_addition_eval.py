@@ -89,6 +89,7 @@ def vllm_server():
 
     env = os.environ.copy()
     env["VLLM_PASSTHROUGH_ERRORS"] = "1"
+    env["VLLM_USE_V1"] = "1"
 
     with RemoteOpenAIServer(
         BASE_MODEL, args, env_dict=env, max_wait_seconds=300
