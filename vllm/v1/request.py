@@ -3,7 +3,9 @@
 
 import enum
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -27,6 +29,33 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
+@dataclass
+class StreamingUpdate:
+    """Lightweight data for streaming session continuation.
+
+    Contains only the fields needed to update an existing streaming session
+    with new input data.
+    """
+
+    mm_features: list[MultiModalFeatureSpec] | None
+    prompt_token_ids: list[int] | None
+    max_tokens: int
+    arrival_time: float
+    sampling_params: SamplingParams | None
+
+    @classmethod
+    def from_request(cls, request: "Request") -> "StreamingUpdate | None":
+        if not request.resumable:
+            return None
+        return cls(
+            mm_features=request.mm_features,
+            prompt_token_ids=request.prompt_token_ids,
+            max_tokens=request.max_tokens,
+            arrival_time=request.arrival_time,
+            sampling_params=request.sampling_params,
+        )
+
+
 class Request:
     def __init__(
         self,
@@ -47,6 +76,7 @@ class Request:
         cartridge_kv: list[torch.Tensor] | None = None,
         cartridge_id: str | None = None,
         cartridge_seq_len: int | None = None,
+        resumable: bool = False,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -108,8 +138,6 @@ class Request:
 
         # Multi-modal related
         self.mm_features = mm_features or []
-        self.num_encoder_inputs = len(self.mm_features)
-        self.has_encoder_inputs = self.num_encoder_inputs > 0
 
         # Cartridge KV for learned cartridge injection.
         # Format: [stacked_keys, stacked_values] where each is
@@ -155,6 +183,11 @@ class Request:
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
+        # Used for streaming
+        self.resumable = resumable
+        # None entry in the queue means finished.
+        self.streaming_queue: deque[StreamingUpdate | None] | None = None
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -179,6 +212,7 @@ class Request:
             cartridge_kv=request.cartridge_kv,
             cartridge_id=request.cartridge_id,
             cartridge_seq_len=request.cartridge_seq_len,
+            resumable=request.resumable,
         )
 
     def append_output_token_ids(
@@ -210,6 +244,14 @@ class Request:
     @property
     def num_output_tokens(self) -> int:
         return len(self._output_token_ids)
+
+    @property
+    def num_encoder_inputs(self) -> int:
+        return len(self.mm_features)
+
+    @property
+    def has_encoder_inputs(self) -> bool:
+        return self.num_encoder_inputs > 0
 
     def get_skip_reading_prefix_cache(self) -> bool:
         # NOTE: Cartridge requests CAN use prefix cache now. The cartridge_id
@@ -271,6 +313,7 @@ class RequestStatus(enum.IntEnum):
     WAITING = enum.auto()
     WAITING_FOR_FSM = enum.auto()
     WAITING_FOR_REMOTE_KVS = enum.auto()
+    WAITING_FOR_STREAMING_REQ = enum.auto()
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()
     # Note: anything after PREEMPTED will be considered
@@ -281,7 +324,7 @@ class RequestStatus(enum.IntEnum):
     FINISHED_IGNORED = enum.auto()
     FINISHED_ERROR = enum.auto()
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
     @staticmethod
@@ -303,4 +346,5 @@ _FINISHED_REASON_MAP = {
     RequestStatus.FINISHED_ABORTED: FinishReason.ABORT,
     RequestStatus.FINISHED_IGNORED: FinishReason.LENGTH,
     RequestStatus.FINISHED_ERROR: FinishReason.ERROR,
+    RequestStatus.WAITING_FOR_STREAMING_REQ: FinishReason.STOP,
 }
