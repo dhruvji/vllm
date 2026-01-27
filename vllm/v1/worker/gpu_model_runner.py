@@ -922,6 +922,21 @@ class GPUModelRunner(
         k_scale = torch.ones(1, device=self.device, dtype=torch.float32)
         v_scale = torch.ones(1, device=self.device, dtype=torch.float32)
 
+        # Determine K/V unbind dimension based on backend
+        # flash_attn: (2, num_blocks, ...) -> unbind(0)
+        # flashinfer: (num_blocks, 2, ...) -> unbind(1)
+        backend_name = self.attn_groups[0][0].backend.__name__
+        if "FlashAttention" in backend_name:
+            kv_dim = 0
+        elif "FlashInfer" in backend_name:
+            kv_dim = 1
+        else:
+            raise NotImplementedError(
+                f"Cartridge prepopulation not supported for backend: "
+                f"{backend_name}. Only FlashAttention and FlashInfer "
+                f"are supported."
+            )
+
         # Write cartridge KV to each layer's cache
         num_layers = len(layer_kv_list)
         for layer_idx in range(num_layers):
@@ -929,7 +944,7 @@ class GPUModelRunner(
                 break
 
             kv_cache = self.kv_caches[layer_idx]
-            key_cache, value_cache = kv_cache.unbind(0)
+            key_cache, value_cache = kv_cache.unbind(kv_dim)
 
             # Get precomputed layer tensors (already transposed and on GPU)
             layer_keys, layer_values = layer_kv_list[layer_idx]
