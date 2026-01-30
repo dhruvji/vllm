@@ -111,9 +111,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.fa_utils import (
-    reshape_and_cache_flash,
-)
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
@@ -943,6 +940,9 @@ class GPUModelRunner(
                 f"{backend_name}. Only FlashAttention and FlashInfer "
                 f"are supported."
             )
+
+        # Lazy import to avoid module-level import failures on non-CUDA platforms
+        from vllm.v1.attention.backends.fa_utils import reshape_and_cache_flash
 
         # Write cartridge KV to each layer's cache
         num_layers = len(layer_kv_list)
