@@ -564,7 +564,9 @@ class InputProcessor:
         eos_token_id = self.input_preprocessor.get_eos_token_id()
 
         encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
-        self._validate_model_inputs(encoder_inputs, decoder_inputs)
+        self._validate_model_inputs(
+            encoder_inputs, decoder_inputs, cartridge_seq_len=cartridge_seq_len
+        )
 
         # Mypy can be conservative for TypedDict unions; normalize access.
         if decoder_inputs["type"] == "embeds":
@@ -644,18 +646,26 @@ class InputProcessor:
         )
 
     def _validate_model_inputs(
-        self, encoder_inputs: SingletonInputs | None, decoder_inputs: SingletonInputs
+        self,
+        encoder_inputs: SingletonInputs | None,
+        decoder_inputs: SingletonInputs,
+        cartridge_seq_len: int | None = None,
     ):
         if encoder_inputs is not None:
-            self._validate_model_input(encoder_inputs, prompt_type="encoder")
+            self._validate_model_input(
+                encoder_inputs, prompt_type="encoder", cartridge_seq_len=cartridge_seq_len
+            )
 
-        self._validate_model_input(decoder_inputs, prompt_type="decoder")
+        self._validate_model_input(
+            decoder_inputs, prompt_type="decoder", cartridge_seq_len=cartridge_seq_len
+        )
 
     def _validate_model_input(
         self,
         prompt_inputs: SingletonInputs,
         *,
         prompt_type: Literal["encoder", "decoder"],
+        cartridge_seq_len: int | None = None,
     ):
         model_config = self.model_config
 
@@ -670,6 +680,7 @@ class InputProcessor:
             else None
         )
         prompt_len = length_from_prompt_token_ids_or_embeds(prompt_ids, prompt_embeds)
+        effective_cartridge_len = cartridge_seq_len or 0
         if not prompt_ids:
             if prompt_type == "encoder" and model_config.is_multimodal_model:
                 pass  # Mllama may have empty encoder inputs for text-only data
@@ -750,6 +761,22 @@ class InputProcessor:
                 f"requested output tokens (at least 1) is longer than the maximum "
                 f"model length of {max_prompt_len}. {suggestion}"
             )
+
+        # Validate that cartridge + prompt + min output tokens fits within max_model_len
+        if effective_cartridge_len > 0 and prompt_type == "decoder":
+            # For decoder prompts, we need at least 1 token for output
+            min_output_tokens = 1 if self.model_config.runner_type != "pooling" else 0
+            total_required_len = effective_cartridge_len + prompt_len + min_output_tokens
+
+            if total_required_len > max_prompt_len:
+                raise ValueError(
+                    f"The request cannot be scheduled: cartridge length "
+                    f"({effective_cartridge_len}) + prompt length ({prompt_len}) + "
+                    f"minimum output tokens ({min_output_tokens}) = {total_required_len} "
+                    f"exceeds max_model_len ({max_prompt_len}). "
+                    f"Please increase max_model_len to at least {total_required_len} or "
+                    f"use a shorter cartridge/prompt."
+                )
 
     def stat_mm_cache(self) -> MultiModalCacheStats | None:
         return self.input_preprocessor.stat_mm_cache()
