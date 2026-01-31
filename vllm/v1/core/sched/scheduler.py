@@ -689,19 +689,14 @@ class Scheduler(SchedulerInterface):
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
 
-                    # For cartridge cache MISS, count cart_seq_len in budget
-                    # (need to load cartridge). For cache HIT, don't count
-                    # (cartridge already in memory, shared via prefix cache).
-                    # Note: budget_cost is for scheduling limits, num_new_tokens
-                    # is for tracking actual tokens computed.
+                    # Cartridge KV is pre-computed and doesn't require forward pass.
+                    # Only the prompt tokens need compute budget.
+                    # Cartridge prepopulation is I/O (writing KV to cache), not compute.
                     cart_seq_len = getattr(request, "cartridge_seq_len", 0)
                     cartridge_cache_hit = req_to_cartridge_cache_hit.get(
                         request.request_id, False
                     )
-                    if cart_seq_len > 0 and not cartridge_cache_hit:
-                        budget_cost = num_new_tokens + cart_seq_len
-                    else:
-                        budget_cost = num_new_tokens
+                    budget_cost = num_new_tokens
 
                     if _CARTRIDGE_DEBUG_TIMING and cart_seq_len > 0:
                         logger.info(
