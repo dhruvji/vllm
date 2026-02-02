@@ -846,6 +846,12 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.get_blocks(request.request_id)
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
+
+                # Recalculate budget_cost after chunking. Cartridge KV is
+                # pre-computed and doesn't require forward pass, so we only
+                # count the prompt tokens that need compute budget.
+                budget_cost = num_new_tokens
+
                 token_budget -= budget_cost
                 if (
                     _CARTRIDGE_DEBUG_TIMING
