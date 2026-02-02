@@ -3413,3 +3413,50 @@ def test_prepend_skipped_requests_order():
 
     # verify waiting order is preserved
     assert list(scheduler.waiting) == expected_waiting_reqs
+
+
+def test_cartridge_scheduling_with_chunked_prefill():
+    """Test that cartridge requests are scheduled correctly with chunked prefill.
+
+    This test verifies the fix for a bug where cartridge requests with
+    enable_chunked_prefill=True would fail to schedule when:
+    - budget_cost (num_new_tokens + cart_seq_len) > token_budget
+
+    The bug was caused by an extra budget check that prevented chunked prefill
+    from working. This test ensures cartridge requests can be chunked correctly.
+    """
+    # Create scheduler with chunked prefill and small token budget
+    scheduler = create_scheduler(
+        max_num_batched_tokens=2048,  # Small budget to force chunking
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+    )
+
+    # Create a request with cartridge
+    requests = create_requests(num_requests=1, num_tokens=2048, max_tokens=16)
+    request = requests[0]
+
+    # Simulate a cartridge with 4096 tokens (cache miss)
+    # budget_cost = 2048 + 4096 = 6144 > 2048 (token_budget)
+    request.cartridge_seq_len = 4096
+
+    # Add request to scheduler
+    scheduler.add_request(request)
+    assert len(scheduler.waiting) == 1
+
+    # Schedule - should succeed with chunking
+    output = scheduler.schedule()
+
+    # Verify the request was scheduled (not stuck)
+    assert len(output.scheduled_new_reqs) == 1
+    assert request.request_id in output.num_scheduled_tokens
+
+    # Verify chunking happened: num_scheduled_tokens should be <= token_budget
+    num_scheduled = output.num_scheduled_tokens[request.request_id]
+    assert num_scheduled <= 2048, (
+        f"Expected chunking: num_scheduled={num_scheduled} should be <= 2048"
+    )
+
+    # Verify the request is now running (not stuck in waiting)
+    assert len(scheduler.running) == 1
+    assert len(scheduler.waiting) == 0
