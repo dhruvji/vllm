@@ -17,9 +17,9 @@ Cartridges support two use cases:
 
 import hashlib
 import os
-import re
 from typing import Any
 
+import boto3
 import torch
 
 from vllm.logger import init_logger
@@ -445,6 +445,57 @@ def load_cartridge(
     return cartridge_data
 
 
+def _resolve_s3_glob(s3_pattern: str) -> str | None:
+    """Resolve S3 glob to most recently modified matching file.
+
+    Args:
+        s3_pattern: S3 URI with optional * glob (e.g., s3://bucket/path/step-*/file.pt)
+
+    Returns:
+        Resolved S3 URI, or original if no glob/matches
+    """
+    # Only resolve if glob present
+    if "*" not in s3_pattern:
+        return s3_pattern
+
+    if not s3_pattern.startswith("s3://"):
+        return s3_pattern
+
+    try:
+        # Parse: s3://bucket/prefix*suffix
+        s3_path = s3_pattern[5:]
+        bucket, _, path_pattern = s3_path.partition("/")
+        prefix, _, suffix = path_pattern.partition("*")
+
+        # List objects
+        s3 = boto3.client("s3")
+        response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+
+        if "Contents" not in response:
+            return None
+
+        # Find matches, sort by last modified (newest first)
+        matches = [
+            (obj["LastModified"], obj["Key"])
+            for obj in response["Contents"]
+            if obj["Key"].endswith(suffix)
+        ]
+
+        if not matches:
+            return None
+
+        matches.sort(reverse=True)
+        latest_key = matches[0][1]
+        resolved = f"s3://{bucket}/{latest_key}"
+
+        logger.info(f"Resolved {s3_pattern} -> {resolved}")
+        return resolved
+
+    except Exception as e:
+        logger.error(f"Failed to resolve S3 glob {s3_pattern}: {e}")
+        return None
+
+
 def load_cartridges_from_request(
     cartridges_spec: list[dict[str, Any]],
 ) -> list[CartridgeData]:
@@ -457,14 +508,20 @@ def load_cartridges_from_request(
             logger.warning("Skipping cartridge with missing id: %s", spec)
             continue
 
+        # Resolve glob patterns in cartridge ID
+        resolved_id = _resolve_s3_glob(cartridge_id)
+        if resolved_id is None:
+            logger.warning("Could not resolve cartridge glob: %s", cartridge_id)
+            continue
+
         try:
             cartridge_data = load_cartridge(
-                cartridge_id=cartridge_id,
+                cartridge_id=resolved_id,
                 force_redownload=spec.get("force_redownload", False),
             )
             loaded_cartridges.append(cartridge_data)
         except Exception as e:
-            logger.error("Failed to load cartridge %s: %s", cartridge_id, e)
-            raise RuntimeError(f"Failed to load cartridge {cartridge_id}: {e}") from e
+            logger.error("Failed to load cartridge %s: %s", resolved_id, e)
+            raise RuntimeError(f"Failed to load cartridge {resolved_id}: {e}") from e
 
     return loaded_cartridges
