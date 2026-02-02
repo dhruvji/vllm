@@ -689,14 +689,19 @@ class Scheduler(SchedulerInterface):
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
 
-                    # Cartridge KV is pre-computed and doesn't require forward pass.
-                    # Only the prompt tokens need compute budget.
-                    # Cartridge prepopulation is I/O (writing KV to cache), not compute.
+                    # For cartridge cache MISS, count cart_seq_len in budget
+                    # (need to load cartridge). For cache HIT, don't count
+                    # (cartridge already in memory, shared via prefix cache).
+                    # Note: budget_cost is for scheduling limits, num_new_tokens
+                    # is for tracking actual tokens computed.
                     cart_seq_len = getattr(request, "cartridge_seq_len", 0)
                     cartridge_cache_hit = req_to_cartridge_cache_hit.get(
                         request.request_id, False
                     )
-                    budget_cost = num_new_tokens
+                    if cart_seq_len > 0 and not cartridge_cache_hit:
+                        budget_cost = num_new_tokens + cart_seq_len
+                    else:
+                        budget_cost = num_new_tokens
 
                     if _CARTRIDGE_DEBUG_TIMING and cart_seq_len > 0:
                         logger.info(
@@ -715,7 +720,6 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
-                        budget_cost = num_new_tokens
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -735,17 +739,6 @@ class Scheduler(SchedulerInterface):
                             )
                         break
 
-                    if budget_cost > token_budget:
-                        # Not enough budget for this cartridge request
-                        if _CARTRIDGE_DEBUG_TIMING and cart_seq_len > 0:
-                            logger.info(
-                                "[cartridge-sched] BREAK (over budget) "
-                                "req=%s budget_cost=%d token_budget=%d",
-                                request.request_id,
-                                budget_cost,
-                                token_budget,
-                            )
-                        break
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
