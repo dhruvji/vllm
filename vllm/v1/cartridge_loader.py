@@ -15,8 +15,12 @@ Cartridges support two use cases:
    - Requires direct KV injection into attention (not token prepending)
 """
 
+import fcntl
 import hashlib
+import json
 import os
+import re
+import time
 from typing import Any
 
 import boto3
@@ -31,6 +35,13 @@ logger = init_logger(__name__)
 # Use /root/.cache/vllm/cartridges instead of /dev/shm for Modal compatibility
 # Modal volumes are shared across processes, /dev/shm is not
 SHM_CARTRIDGE_DIR = "/root/.cache/vllm/cartridges"
+
+# Directory for checkpoint resolution cache
+# Shared volume for caching latest.txt timestamps across containers
+CHECKPOINT_CACHE_DIR = "/root/.cache/vllm/checkpoint_cache"
+
+# How often to check for new checkpoints (seconds)
+CHECKPOINT_CHECK_INTERVAL = 30
 
 # Track active shm paths for cleanup
 _active_shm_paths: dict[str, str] = {}  # cartridge_id -> shm_path
@@ -445,8 +456,154 @@ def load_cartridge(
     return cartridge_data
 
 
+class CheckpointCache:
+    """Cache for checkpoint resolution with TTL and HEAD request optimization.
+
+    Caches checkpoint paths on disk (with file locking) to share across containers.
+    Uses HEAD requests to check if latest.txt has been updated.
+
+    Process-safe: Uses fcntl.flock() for atomic reads/writes across containers.
+    """
+
+    def __init__(self, cache_dir: str = CHECKPOINT_CACHE_DIR, ttl: int = CHECKPOINT_CHECK_INTERVAL):
+        self.cache_dir = cache_dir
+        self.ttl = ttl
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def _get_cache_path(self, run_dir: str) -> str:
+        """Get local cache file path for a checkpoint run directory."""
+        run_hash = hashlib.sha256(run_dir.encode()).hexdigest()[:16]
+        return os.path.join(self.cache_dir, f"{run_hash}.json")
+
+    def get(self, run_dir: str) -> dict | None:
+        """Get cached checkpoint info if fresh (< TTL seconds old).
+
+        Uses file locking for process-safety across containers.
+        """
+        cache_path = self._get_cache_path(run_dir)
+
+        if not os.path.exists(cache_path):
+            return None
+
+        try:
+            with open(cache_path, "r") as f:
+                # Acquire shared lock for reading
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    cache = json.load(f)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+            # Check if cache is fresh
+            if time.time() - cache.get("last_checked", 0) < self.ttl:
+                logger.debug(f"Using fresh cache for {run_dir}")
+                return cache
+
+            logger.debug(f"Cache stale for {run_dir}")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to read checkpoint cache: {e}")
+            return None
+
+    def set(self, run_dir: str, checkpoint_path: str, latest_txt_mtime: float) -> None:
+        """Write checkpoint info to disk cache.
+
+        Uses exclusive file locking for process-safety across containers.
+        """
+        cache_path = self._get_cache_path(run_dir)
+
+        cache = {
+            "checkpoint_path": checkpoint_path,
+            "latest_txt_mtime": latest_txt_mtime,
+            "last_checked": time.time()
+        }
+
+        try:
+            # Use exclusive lock for writing (atomic write)
+            with open(cache_path, "w") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    json.dump(cache, f)
+                    f.flush()
+                    os.fsync(f.fileno())  # Ensure written to disk
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            logger.debug(f"Wrote checkpoint cache for {run_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to write checkpoint cache: {e}")
+
+    def check_latest_txt(self, run_dir: str, cached_mtime: float | None = None) -> tuple[str | None, float | None]:
+        """Check latest.txt for newest checkpoint using HEAD request.
+
+        Returns (checkpoint_path, mtime) if updated, else (None, None).
+        """
+        if not run_dir.startswith("s3://"):
+            return None, None
+
+        # Parse s3://bucket/path
+        s3_path = run_dir[5:]
+        bucket, _, prefix = s3_path.partition("/")
+        latest_txt_key = f"{prefix}/latest.txt" if prefix else "latest.txt"
+
+        try:
+            s3 = boto3.client("s3")
+
+            # HEAD request to check Last-Modified
+            response = s3.head_object(Bucket=bucket, Key=latest_txt_key)
+            latest_txt_mtime = response["LastModified"].timestamp()
+
+            # Skip if unchanged
+            if cached_mtime is not None and latest_txt_mtime <= cached_mtime:
+                logger.debug(f"latest.txt unchanged for {run_dir}")
+                return None, None
+
+            # Read latest.txt content
+            logger.info(f"Detected new checkpoint in latest.txt for {run_dir}")
+            obj = s3.get_object(Bucket=bucket, Key=latest_txt_key)
+            checkpoint_path = obj["Body"].read().decode("utf-8").strip()
+
+            return checkpoint_path, latest_txt_mtime
+
+        except s3.exceptions.NoSuchKey:
+            logger.debug(f"latest.txt not found for {run_dir}")
+            return None, None
+        except Exception as e:
+            logger.warning(f"Failed to check latest.txt for {run_dir}: {e}")
+            return None, None
+
+
+# Global cache instance
+_checkpoint_cache = CheckpointCache()
+
+
+def _extract_run_dir_from_glob(s3_pattern: str) -> str | None:
+    """Extract run directory from glob pattern.
+
+    Example: s3://bucket/weights/torchtitan/2026-02-03/run-id/step-*/model.pt
+          -> s3://bucket/weights/torchtitan/2026-02-03/run-id
+    """
+    if not s3_pattern.startswith("s3://") or "*" not in s3_pattern:
+        return None
+
+    # Find the part before the first glob
+    parts = s3_pattern.split("/")
+    run_dir_parts = []
+    for part in parts:
+        if "*" in part:
+            break
+        run_dir_parts.append(part)
+
+    return "/".join(run_dir_parts) if len(run_dir_parts) > 3 else None
+
+
 def _resolve_s3_glob(s3_pattern: str) -> str | None:
-    """Resolve S3 glob to most recently modified matching file.
+    """Resolve S3 glob to most recently modified matching file with smart caching.
+
+    Uses latest.txt for dynamic checkpoint updates:
+    1. Checks local cache (<30s old) for checkpoint path
+    2. If stale, does HEAD request to latest.txt to check for updates
+    3. Only reads latest.txt if Last-Modified changed
+    4. Falls back to listing objects if latest.txt not found
 
     Args:
         s3_pattern: S3 URI with optional * glob (e.g., s3://bucket/path/step-*/file.pt)
@@ -461,13 +618,38 @@ def _resolve_s3_glob(s3_pattern: str) -> str | None:
     if not s3_pattern.startswith("s3://"):
         return s3_pattern
 
+    # Extract run directory for caching (e.g., s3://bucket/run-id)
+    run_dir = _extract_run_dir_from_glob(s3_pattern)
+
+    # Try cache first (if < 30s old)
+    if run_dir:
+        cache = _checkpoint_cache.get(run_dir)
+        if cache:
+            logger.debug(f"Using cached checkpoint: {cache['checkpoint_path']}")
+            return cache["checkpoint_path"]
+
+        # Cache miss or stale - check latest.txt
+        cached_mtime = cache.get("latest_txt_mtime") if cache else None
+        checkpoint_path, latest_txt_mtime = _checkpoint_cache.check_latest_txt(run_dir, cached_mtime)
+
+        if checkpoint_path:
+            # Found new checkpoint via latest.txt
+            _checkpoint_cache.set(run_dir, checkpoint_path, latest_txt_mtime)
+            logger.info(f"Resolved {s3_pattern} -> {checkpoint_path} (via latest.txt)")
+            return checkpoint_path
+
+        # latest.txt exists but unchanged - use cached path
+        if cache and latest_txt_mtime is None and cached_mtime is not None:
+            # Update last_checked timestamp
+            _checkpoint_cache.set(run_dir, cache["checkpoint_path"], cached_mtime)
+            return cache["checkpoint_path"]
+
+    # Fallback: No latest.txt or error - list objects (original logic)
     try:
-        # Parse: s3://bucket/prefix*suffix
         s3_path = s3_pattern[5:]
         bucket, _, path_pattern = s3_path.partition("/")
         prefix, _, suffix = path_pattern.partition("*")
 
-        # List objects
         s3 = boto3.client("s3")
         response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
 
@@ -488,7 +670,7 @@ def _resolve_s3_glob(s3_pattern: str) -> str | None:
         latest_key = matches[0][1]
         resolved = f"s3://{bucket}/{latest_key}"
 
-        logger.info(f"Resolved {s3_pattern} -> {resolved}")
+        logger.info(f"Resolved {s3_pattern} -> {resolved} (via listing)")
         return resolved
 
     except Exception as e:
