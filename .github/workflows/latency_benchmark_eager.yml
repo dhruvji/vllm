@@ -43,7 +43,7 @@ jobs:
 
       - name: Run latency benchmark (eager)
         run: |
-          modal run .github/scripts/modal_ci_benchmark.py \
+          modal run --env=ci .github/scripts/modal_ci_benchmark.py \
             --config-paths .github/benchmark_configs/base_latency_eager.json
 
       - name: Report results

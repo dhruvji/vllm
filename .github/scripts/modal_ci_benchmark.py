@@ -34,7 +34,7 @@ PORT = 8000
 BRANCH = os.environ.get("BRANCH", "main")
 GPU_TYPE = os.environ.get("GPU_TYPE", "H200")
 GPU_COUNT = int(os.environ.get("GPU_COUNT", 1))
-SECRETS = os.environ.get("SECRETS", "sabri-api-keys")
+SECRETS = os.environ.get("SECRETS", "dev-api-keys")
 
 # vLLM optimization args
 MAX_NUM_SEQS = int(os.environ.get("MAX_NUM_SEQS", "128"))

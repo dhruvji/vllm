@@ -42,7 +42,7 @@ jobs:
 
       - name: Run cartridge evaluation tests
         run: |
-          modal run .github/scripts/modal_ci_pytest.py \
+          modal run --env=ci .github/scripts/modal_ci_pytest.py \
             --test-path tests/test_cartridge_addition_eval.py \
             --pytest-args "-v -x -m benchmark" \
             --env-vars "VLLM_TEST_ENABLE_CARTRIDGE=1,VLLM_PASSTHROUGH_ERRORS=1"

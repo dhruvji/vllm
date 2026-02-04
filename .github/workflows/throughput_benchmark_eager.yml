@@ -43,7 +43,7 @@ jobs:
 
       - name: Run throughput benchmark (eager)
         run: |
-          modal run .github/scripts/modal_ci_benchmark.py \
+          modal run --env=ci .github/scripts/modal_ci_benchmark.py \
             --config-paths .github/benchmark_configs/base_throughput_eager.json
 
       - name: Report results

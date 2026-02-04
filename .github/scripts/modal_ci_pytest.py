@@ -23,7 +23,7 @@ import modal
 BRANCH = os.environ.get("BRANCH", "main")
 GPU_TYPE = os.environ.get("GPU_TYPE", "A100")
 GPU_COUNT = int(os.environ.get("GPU_COUNT", 1))
-SECRETS = os.environ.get("SECRETS", "sabri-api-keys")
+SECRETS = os.environ.get("SECRETS", "dev-api-keys")
 
 MINUTES = 60  # seconds
 
