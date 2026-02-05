@@ -729,9 +729,20 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
-                        if _CARTRIDGE_DEBUG_TIMING and cart_seq_len > 0:
+                        if cart_seq_len > 0:
+                            # Cartridge requests MUST have chunked prefill enabled
+                            # or sufficient token budget, otherwise they get stuck
+                            # in waiting forever.
+                            raise RuntimeError(
+                                f"Cartridge request {request.request_id} cannot be "
+                                f"scheduled: budget_cost={budget_cost} > "
+                                f"token_budget={token_budget}. Enable chunked "
+                                f"prefill (--enable-chunked-prefill) or increase "
+                                f"--max-num-batched-tokens to at least {budget_cost}."
+                            )
+                        if _CARTRIDGE_DEBUG_TIMING:
                             logger.info(
-                                "[cartridge-sched] BREAK (chunked_prefill disabled) "
+                                "[sched] BREAK (chunked_prefill disabled) "
                                 "req=%s budget_cost=%d token_budget=%d",
                                 request.request_id,
                                 budget_cost,
@@ -942,6 +953,16 @@ class Scheduler(SchedulerInterface):
                 for req in scheduled_new_reqs
             ]
         else:
+            # For resumed cartridge requests, route through NewRequestData so
+            # the cartridge gets re-prepopulated after preemption evicted it.
+            resumed_cartridge_reqs = [
+                req for req in scheduled_resumed_reqs
+                if getattr(req, "cartridge_seq_len", 0) > 0
+            ]
+            scheduled_resumed_reqs = [
+                req for req in scheduled_resumed_reqs
+                if getattr(req, "cartridge_seq_len", 0) == 0
+            ]
             new_reqs_data = [
                 NewRequestData.from_request(
                     req,
@@ -949,7 +970,7 @@ class Scheduler(SchedulerInterface):
                     None,
                     req_to_cartridge_cache_hit.get(req.request_id, False),
                 )
-                for req in scheduled_new_reqs
+                for req in scheduled_new_reqs + resumed_cartridge_reqs
             ]
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
