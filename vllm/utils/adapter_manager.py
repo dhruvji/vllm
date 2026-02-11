@@ -7,6 +7,11 @@ Handles downloading and caching of:
 - LoRA adapter weights
 - Other trained artifacts
 
+Supports multiple storage backends:
+- S3 (s3://bucket/path) - downloaded and cached locally
+- Modal Volumes (modal://volume-name/path) - loaded directly from mount
+- Local paths (/path/to/file) - loaded directly
+
 This class is storage-agnostic and doesn't handle adapter-specific logic.
 """
 
@@ -21,19 +26,86 @@ from pathlib import Path as StdPath
 import filelock
 import torch
 
-from vllm.path import Path
+from vllm.path import ModalVolumePath, Path
 
 logger = logging.getLogger(__name__)
+
+# Coalesced volume reload: many concurrent requests may discover a missing
+# adapter at the same time.  Only ONE reload runs in a background thread
+# so it doesn't block the GIL and stall vLLM's engine.
+_volume_reload_lock = threading.Lock()
+_volume_reload_time: float = 0  # last successful reload timestamp
+_volume_reload_done = threading.Event()
+_volume_reload_done.set()  # initially "done" (no reload in progress)
+_cached_volume = None  # avoid repeated modal.Volume.from_name() network calls
+
+
+def _reload_hot_checkpoints_volume(min_interval: float = 5.0) -> bool:
+    """Trigger a hot-checkpoints volume reload if not reloaded recently.
+
+    The reload runs in a background thread to avoid blocking the GIL.
+    Waits up to 30s for the reload to complete before returning.
+
+    Returns True if a reload completed (or recently completed),
+    False if skipped or failed.
+    """
+    global _volume_reload_time, _cached_volume
+    now = time.monotonic()
+    if now - _volume_reload_time < min_interval:
+        return False  # Already reloaded recently
+
+    # Wait if another thread is already reloading
+    if not _volume_reload_done.is_set():
+        _volume_reload_done.wait(timeout=30)
+        return _volume_reload_time > now  # True if reload happened while we waited
+
+    if not _volume_reload_lock.acquire(blocking=False):
+        # Another thread just started — wait for it
+        _volume_reload_done.wait(timeout=30)
+        return _volume_reload_time > now
+
+    try:
+        # Double-check after acquiring lock
+        if time.monotonic() - _volume_reload_time < min_interval:
+            return True
+
+        _volume_reload_done.clear()
+
+        def _do_reload():
+            global _volume_reload_time, _cached_volume
+            try:
+                if _cached_volume is None:
+                    import modal
+                    _cached_volume = modal.Volume.from_name(
+                        "torchtitan-hot-checkpoints-v2"
+                    )
+                _cached_volume.reload()
+                _volume_reload_time = time.monotonic()
+                logger.info("Reloaded hot-checkpoints volume")
+            except Exception as e:
+                logger.warning("Failed to reload hot-checkpoints volume: %s", e)
+            finally:
+                _volume_reload_done.set()
+
+        t = threading.Thread(target=_do_reload, daemon=True)
+        t.start()
+    finally:
+        _volume_reload_lock.release()
+
+    # Wait for the background reload to finish
+    _volume_reload_done.wait(timeout=30)
+    return time.monotonic() - _volume_reload_time < min_interval
 
 
 class AdapterManager:
     """
-    Manager for downloading and caching adapter artifacts from S3 or local paths.
+    Manager for downloading and caching adapter artifacts from multiple backends.
 
     This class handles:
     - Downloading adapters from S3 URIs (s3://bucket/path/to/adapter.pt)
+    - Loading adapters from Modal Volumes (modal://volume-name/path/to/adapter.pt)
     - Loading adapters from local file paths
-    - Caching downloaded files to avoid re-downloading
+    - Caching downloaded files to avoid re-downloading (S3 only)
     - Thread-safe file locking during downloads
 
     Supports multiple adapter types:
@@ -81,18 +153,19 @@ class AdapterManager:
         force_redownload: bool = False,
     ) -> torch.Tensor:
         """
-        Get an adapter, downloading from S3 or loading from local path.
+        Get an adapter, downloading from S3 or loading from local/volume path.
 
         The adapter_id can be either:
-        - S3 URI: s3://bucket/path/to/adapter.pt
-        - Local path: /path/to/local/adapter.pt or ./adapter.pt
+        - S3 URI: s3://bucket/path/to/adapter.pt (downloaded and cached)
+        - Modal Volume: modal://volume-name/path/to/adapter.pt (loaded directly)
+        - Local path: /path/to/local/adapter.pt or ./adapter.pt (loaded directly)
 
-        The Path abstraction automatically handles both cases.
+        The Path abstraction automatically handles all cases.
 
         Args:
-            adapter_id: The identifier/path of the adapter (S3 URI or local path)
+            adapter_id: The identifier/path of the adapter
             force_redownload: If True, re-download even if cached
-                (only applies to remote files)
+                (only applies to S3 paths)
 
         Returns:
             Loaded adapter tensor data
@@ -103,7 +176,7 @@ class AdapterManager:
         """
         source_path = Path(adapter_id)
 
-        # For remote paths (S3), use caching
+        # For S3 paths, use caching (need to download)
         if adapter_id.startswith("s3://"):
             cache_path = self._get_cache_path(adapter_id)
             lock_path = cache_path.with_suffix(".lock")
@@ -247,10 +320,56 @@ class AdapterManager:
                             ) from retry_e
                     raise RuntimeError(f"Failed to load adapter: {e}") from e
 
+        # For Modal Volume paths, load directly from mount point
+        elif adapter_id.startswith("modal://"):
+            # ModalVolumePath handles translation to local mount path
+            if not isinstance(source_path, ModalVolumePath):
+                source_path = ModalVolumePath(adapter_id)
+
+            local_path = source_path.local_path
+            if not source_path.exists():
+                if _reload_hot_checkpoints_volume():
+                    if not source_path.exists():
+                        raise FileNotFoundError(
+                            f"Modal volume adapter not found: {adapter_id} "
+                            f"(local path: {local_path})"
+                        )
+                else:
+                    raise FileNotFoundError(
+                        f"Modal volume adapter not found: {adapter_id} "
+                        f"(local path: {local_path})"
+                    )
+
+            logger.info(
+                "Loading adapter from Modal volume: %s (mount: %s)",
+                adapter_id,
+                local_path,
+            )
+            try:
+                data = torch.load(local_path, map_location="cpu")
+                return data
+            except Exception as e:
+                logger.error(
+                    "Failed to load adapter from Modal volume %s: %s",
+                    adapter_id,
+                    e,
+                )
+                raise
+
         # For local paths, load directly
         else:
             if not source_path.exists():
-                raise FileNotFoundError(f"Local adapter not found: {adapter_id}")
+                # Adapter may have been committed to a Modal volume by another
+                # container but our local mount is stale.  Reload once & retry.
+                if _reload_hot_checkpoints_volume():
+                    if not source_path.exists():
+                        raise FileNotFoundError(
+                            f"Local adapter not found: {adapter_id}"
+                        )
+                else:
+                    raise FileNotFoundError(
+                        f"Local adapter not found: {adapter_id}"
+                    )
 
             logger.info("Loading adapter from local path: %s", adapter_id)
             try:

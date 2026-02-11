@@ -406,6 +406,13 @@ class CompletionLogProbs(OpenAIBaseModel):
     token_logprobs: list[float | None] = Field(default_factory=list)
     tokens: list[str] = Field(default_factory=list)
     top_logprobs: list[dict[str, float] | None] = Field(default_factory=list)
+    # Flat-packed arrays for efficient logprob extraction (avoids string parsing).
+    # Populated when return_tokens_as_token_ids=True.
+    # Layout: flat arrays of length n_tokens * top_k, row-major.
+    # Client reshapes with np.array(values).reshape(n_tokens, top_k).
+    top_k: int | None = None  # number of top logprobs per token
+    flat_top_token_ids: list[int] | None = None  # length n_tokens * top_k
+    flat_top_logprobs: list[float] | None = None  # length n_tokens * top_k
 
 
 class CompletionResponseChoice(OpenAIBaseModel):
@@ -439,6 +446,9 @@ class CompletionResponse(OpenAIBaseModel):
     # vLLM-specific fields that are not in OpenAI spec
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
+    )
+    cartridge_id: str | None = Field(
+        default=None, description="Cartridge/adapter checkpoint path used."
     )
 
 

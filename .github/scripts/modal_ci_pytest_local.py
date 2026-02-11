@@ -77,7 +77,7 @@ base_image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     .entrypoint([])
     .apt_install("git", "rsync")
-    .env({"VLLM_USE_PRECOMPILED": "1"})
+    .env({"VLLM_USE_PRECOMPILED": "1", "VLLM_PRECOMPILED_WHEEL_COMMIT": "2b465570e6dd327e8422ef9c87e9b2b1454ceaed"})
     .run_commands(
         f"git clone https://$GITHUB_TOKEN@github.com/engram-lab/vllm.git -b {BRANCH} /tmp/vllm",
         secrets=[secrets],

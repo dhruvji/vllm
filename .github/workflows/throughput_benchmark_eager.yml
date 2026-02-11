@@ -25,6 +25,7 @@ jobs:
       GPU_TYPE: "H200"
       GPU_COUNT: "1"
       THROUGHPUT_THRESHOLD_TOK_S: "2500.0"
+      VLLM_PRECOMPILED_WHEEL_COMMIT: "2b465570e6dd327e8422ef9c87e9b2b1454ceaed"
       BRANCH: ${{ github.head_ref || github.ref_name }}
 
     steps:

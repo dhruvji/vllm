@@ -102,7 +102,11 @@ class EngineCore:
 
         self.log_stats = log_stats
         # Cache learned cartridge KV on the engine core to avoid repeated IPC.
-        self._cartridge_kv_cache: dict[str, list[torch.Tensor]] = {}
+        # Use OrderedDict for LRU eviction — only keep the 20 most recent
+        # cartridges to prevent unbounded CPU memory growth (~500MB each).
+        from collections import OrderedDict
+        self._cartridge_kv_cache: OrderedDict[str, list[torch.Tensor]] = OrderedDict()
+        self._cartridge_kv_cache_max_size: int = 20
         # Track cartridge IDs loaded from shm for cleanup
         self._cartridge_shm_ids: set[str] = set()
 
@@ -654,6 +658,16 @@ class EngineCore:
                 elif request.cartridge_kv is not None:
                     # Fallback: use IPC tensor (legacy path)
                     self._cartridge_kv_cache[request.cartridge_id] = request.cartridge_kv
+
+                # LRU eviction: remove oldest cartridge to prevent unbounded
+                # CPU memory growth (~500MB per cartridge for prefix adapters).
+                while len(self._cartridge_kv_cache) > self._cartridge_kv_cache_max_size:
+                    evicted_id, evicted_kv = self._cartridge_kv_cache.popitem(last=False)
+                    del evicted_kv
+                    self._cartridge_shm_ids.discard(evicted_id)
+            else:
+                # Move to end for LRU ordering
+                self._cartridge_kv_cache.move_to_end(request.cartridge_id)
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
         if req.cartridge_kv is None and req.cartridge_id in self._cartridge_kv_cache:

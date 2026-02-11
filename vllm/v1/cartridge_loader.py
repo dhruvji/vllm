@@ -16,17 +16,21 @@ Cartridges support two use cases:
 """
 
 import fcntl
+import glob as globlib
 import hashlib
 import json
 import os
 import re
+import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 import boto3
 import torch
 
 from vllm.logger import init_logger
+from vllm.path import ModalVolumePath
 from vllm.utils.adapter_manager import get_adapter_manager
 
 logger = init_logger(__name__)
@@ -139,9 +143,11 @@ def cleanup_all_cartridge_shm() -> None:
 # Compiled pattern for matching KV cache layer keys
 _KV_LAYER_PATTERN = re.compile(r"layers\.(\d+)\.attention\.prefix\.(keys|values)")
 
-# In-memory cache for parsed CartridgeData objects
-# Maps (cartridge_id, source) -> CartridgeData
-_cartridge_data_cache: dict[tuple[str, str], "CartridgeData"] = {}
+# In-memory LRU cache for parsed CartridgeData objects
+# Limited to 3 entries to prevent memory growth with frequent checkpoint updates
+# Uses OrderedDict for LRU eviction (move to end on access, pop from front when full)
+_CARTRIDGE_CACHE_MAX_SIZE = 20
+_cartridge_data_cache: OrderedDict[str, "CartridgeData"] = OrderedDict()
 
 
 def _parse_kv_cache_to_layers(
@@ -411,6 +417,14 @@ class CartridgeData:
         )
 
 
+def _get_cartridge_lock_path(cartridge_id: str) -> str:
+    """Get the lock file path for a cartridge ID."""
+    id_hash = hashlib.sha256(cartridge_id.encode()).hexdigest()[:16]
+    lock_dir = os.path.join(SHM_CARTRIDGE_DIR, "locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    return os.path.join(lock_dir, f"cart_{id_hash}.lock")
+
+
 def load_cartridge(
     cartridge_id: str,
     force_redownload: bool = False,
@@ -423,6 +437,9 @@ def load_cartridge(
 
     The Path abstraction automatically handles both cases.
 
+    Uses file-based locking to prevent thundering herd when multiple
+    containers try to load the same cartridge simultaneously.
+
     Args:
         cartridge_id: The identifier/path of the cartridge (S3 URI or local path)
         force_redownload: If True, re-download even if cached
@@ -432,28 +449,52 @@ def load_cartridge(
     """
     cache_key = cartridge_id
 
+    # Fast path: check cache without lock
     if not force_redownload and cache_key in _cartridge_data_cache:
         logger.debug("Using cached CartridgeData for: %s", cartridge_id)
+        _cartridge_data_cache.move_to_end(cache_key)
         return _cartridge_data_cache[cache_key]
 
-    logger.info("Loading cartridge: %s", cartridge_id)
+    # Slow path: acquire file lock to prevent thundering herd across containers
+    lock_path = _get_cartridge_lock_path(cartridge_id)
 
-    manager = get_adapter_manager()
-    cartridge_tensor = manager.get_adapter(
-        adapter_id=cartridge_id,
-        force_redownload=force_redownload,
-    )
+    with open(lock_path, "w") as lock_file:
+        logger.debug("Acquiring lock for cartridge: %s", cartridge_id)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            # Double-check cache after acquiring lock (another process may have loaded it)
+            if not force_redownload and cache_key in _cartridge_data_cache:
+                logger.debug("Cache hit after lock for: %s", cartridge_id)
+                _cartridge_data_cache.move_to_end(cache_key)
+                return _cartridge_data_cache[cache_key]
 
-    if not isinstance(cartridge_tensor, dict):
-        raise ValueError(
-            f"Invalid cartridge format. Expected dict, got {type(cartridge_tensor)}"
-        )
+            logger.info("Loading cartridge (holding lock): %s", cartridge_id)
 
-    cartridge_data = CartridgeData.from_dict(cartridge_tensor)
-    logger.info("Successfully loaded cartridge: %s", cartridge_data)
+            manager = get_adapter_manager()
+            cartridge_tensor = manager.get_adapter(
+                adapter_id=cartridge_id,
+                force_redownload=force_redownload,
+            )
 
-    _cartridge_data_cache[cache_key] = cartridge_data
-    return cartridge_data
+            if not isinstance(cartridge_tensor, dict):
+                raise ValueError(
+                    f"Invalid cartridge format. Expected dict, got {type(cartridge_tensor)}"
+                )
+
+            cartridge_data = CartridgeData.from_dict(cartridge_tensor)
+            logger.info("Successfully loaded cartridge: %s", cartridge_data)
+
+            # LRU eviction: remove oldest if at max size
+            while len(_cartridge_data_cache) >= _CARTRIDGE_CACHE_MAX_SIZE:
+                evicted_key, evicted_data = _cartridge_data_cache.popitem(last=False)
+                logger.info("Evicted cartridge from cache: %s", evicted_key)
+                cleanup_cartridge_shm(evicted_key)
+                del evicted_data
+
+            _cartridge_data_cache[cache_key] = cartridge_data
+            return cartridge_data
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class CheckpointCache:
@@ -678,6 +719,140 @@ def _resolve_s3_glob(s3_pattern: str) -> str | None:
         return None
 
 
+def _resolve_modal_glob(modal_pattern: str) -> str | None:
+    """Resolve Modal volume glob to most recent matching file.
+
+    For modal:// paths, use local glob since the volume is mounted locally.
+    Also checks for latest.txt file for dynamic checkpoint resolution.
+
+    Args:
+        modal_pattern: Modal URI with optional * glob
+                       (e.g., modal://volume-name/step-*/model.pt)
+
+    Returns:
+        Resolved modal:// URI, or original if no glob/matches
+    """
+    # Only resolve if glob present
+    if "*" not in modal_pattern:
+        return modal_pattern
+
+    if not modal_pattern.startswith("modal://"):
+        return modal_pattern
+
+    try:
+        # Parse modal://volume-name/path/step-*/model.pt
+        modal_path = ModalVolumePath(modal_pattern)
+        local_pattern = modal_path.local_path
+
+        # First check for latest.txt in the base directory (before the glob)
+        # e.g., /hot-checkpoints/step-*/model.pt -> /hot-checkpoints/latest.txt
+        # Find the directory before the first glob component
+        parts = local_pattern.split("/")
+        base_parts = []
+        for part in parts:
+            if "*" in part:
+                break
+            base_parts.append(part)
+        base_dir = "/".join(base_parts) or "/"
+        latest_txt = os.path.join(base_dir, "latest.txt")
+        if os.path.exists(latest_txt):
+            try:
+                with open(latest_txt) as f:
+                    latest_path = f.read().strip()
+                if os.path.exists(latest_path):
+                    # Convert back to modal:// path
+                    mount_path = modal_path._get_mounts().get(
+                        modal_path.volume_name,
+                        f"/{modal_path.volume_name}",
+                    )
+                    rel_path = latest_path[len(mount_path) :].lstrip("/")
+                    resolved = f"modal://{modal_path.volume_name}/{rel_path}"
+                    logger.info(
+                        f"Resolved {modal_pattern} -> {resolved} (via latest.txt)"
+                    )
+                    return resolved
+            except Exception as e:
+                logger.debug(f"Could not read latest.txt: {e}")
+
+        # Fallback: use local glob
+        matches = globlib.glob(local_pattern)
+        if not matches:
+            return None
+
+        # Sort by modification time (newest first)
+        matches_with_mtime = [(os.path.getmtime(m), m) for m in matches]
+        matches_with_mtime.sort(reverse=True)
+        latest_local = matches_with_mtime[0][1]
+
+        # Convert back to modal:// path
+        mount_path = modal_path._get_mounts().get(
+            modal_path.volume_name,
+            f"/{modal_path.volume_name}",
+        )
+        rel_path = latest_local[len(mount_path) :].lstrip("/")
+        resolved = f"modal://{modal_path.volume_name}/{rel_path}"
+
+        logger.info(f"Resolved {modal_pattern} -> {resolved} (via glob)")
+        return resolved
+
+    except Exception as e:
+        logger.error(f"Failed to resolve Modal glob {modal_pattern}: {e}")
+        return None
+
+
+def _resolve_glob(pattern: str) -> str | None:
+    """Resolve glob pattern for any supported backend.
+
+    Dispatches to the appropriate resolver based on URI scheme:
+    - s3:// -> _resolve_s3_glob
+    - modal:// -> _resolve_modal_glob
+    - local paths -> local glob
+
+    Args:
+        pattern: Path pattern with optional * glob
+
+    Returns:
+        Resolved path, or original if no glob/matches
+    """
+    if pattern.startswith("s3://"):
+        return _resolve_s3_glob(pattern)
+    elif pattern.startswith("modal://"):
+        return _resolve_modal_glob(pattern)
+    elif "*" in pattern:
+        # Local path glob - first check for latest.txt
+        parts = pattern.split("/")
+        base_parts = []
+        for part in parts:
+            if "*" in part:
+                break
+            base_parts.append(part)
+        base_dir = "/".join(base_parts) or "/"
+        latest_txt = os.path.join(base_dir, "latest.txt")
+
+        if os.path.exists(latest_txt):
+            try:
+                with open(latest_txt) as f:
+                    latest_path = f.read().strip()
+                if os.path.exists(latest_path):
+                    logger.info(f"Resolved {pattern} -> {latest_path} (via latest.txt)")
+                    return latest_path
+            except Exception as e:
+                logger.debug(f"Could not read latest.txt: {e}")
+
+        # Fallback: use glob
+        matches = globlib.glob(pattern)
+        if not matches:
+            return None
+        # Sort by modification time (newest first)
+        matches_with_mtime = [(os.path.getmtime(m), m) for m in matches]
+        matches_with_mtime.sort(reverse=True)
+        resolved = matches_with_mtime[0][1]
+        logger.info(f"Resolved {pattern} -> {resolved} (via local glob)")
+        return resolved
+    else:
+        return pattern
+
+
 def load_cartridges_from_request(
     cartridges_spec: list[dict[str, Any]],
 ) -> list[CartridgeData]:
@@ -690,11 +865,15 @@ def load_cartridges_from_request(
             logger.warning("Skipping cartridge with missing id: %s", spec)
             continue
 
-        # Resolve glob patterns in cartridge ID
-        resolved_id = _resolve_s3_glob(cartridge_id)
+        # Resolve glob patterns in cartridge ID (supports s3://, modal://, local)
+        resolved_id = _resolve_glob(cartridge_id)
         if resolved_id is None:
             logger.warning("Could not resolve cartridge glob: %s", cartridge_id)
             continue
+
+        # Log which checkpoint is being used for this request
+        if resolved_id != cartridge_id:
+            logger.info(f"Using cartridge: {cartridge_id} -> {resolved_id}")
 
         try:
             cartridge_data = load_cartridge(

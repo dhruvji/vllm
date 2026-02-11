@@ -46,7 +46,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
@@ -532,6 +532,32 @@ class Scheduler(SchedulerInterface):
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
+
+        # Group waiting requests by cartridge_id to maximize prefix cache hits.
+        # The first request with a given cartridge pays the prepopulate cost,
+        # subsequent ones get cache hits. Groups are ordered by first
+        # appearance in the queue to preserve FCFS fairness between cartridges.
+        if len(self.waiting) > 1 and isinstance(self.waiting, FCFSRequestQueue):
+            has_cartridges = any(
+                getattr(r, "cartridge_id", None) is not None
+                for r in self.waiting
+            )
+            if has_cartridges:
+                # Assign each cartridge_id a group index based on first
+                # appearance so FCFS order is preserved between groups.
+                group_order: dict[str | None, int] = {}
+                for r in self.waiting:
+                    cid = getattr(r, "cartridge_id", None)
+                    if cid not in group_order:
+                        group_order[cid] = len(group_order)
+                sorted_reqs = sorted(
+                    self.waiting,
+                    key=lambda r: group_order[
+                        getattr(r, "cartridge_id", None)
+                    ],
+                )
+                self.waiting.clear()
+                self.waiting.extend(sorted_reqs)
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs:

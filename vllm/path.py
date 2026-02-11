@@ -1119,9 +1119,157 @@ def _copy_across_filesystems(source, dest, recursive):
                 shutil.copyfileobj(src, dst)
 
 
+class ModalVolumePath(Path):
+    """Path implementation for Modal Volumes.
+
+    Handles modal:// URIs and translates them to local mount paths.
+    Format: modal://volume-name/path -> /mount-path/path
+
+    Default volume mount mappings:
+    - torchtitan-hot-checkpoints -> /hot-checkpoints
+
+    Custom mappings can be provided via MODAL_VOLUME_MOUNTS environment variable
+    as JSON: {"volume-name": "/mount-path", ...}
+    """
+
+    __slots__ = ("_path", "_local_path")
+
+    # Default volume name to mount path mappings
+    DEFAULT_MOUNTS = {
+        "torchtitan-hot-checkpoints": "/hot-checkpoints",
+        "huggingface-cache-v2": "/root/.cache/huggingface",
+        "vllm-cache-v2": "/root/.cache/vllm",
+    }
+
+    _custom_mounts = None
+
+    @classmethod
+    def _get_mounts(cls):
+        """Get volume mount mappings, including custom ones from environment."""
+        if cls._custom_mounts is None:
+            cls._custom_mounts = dict(cls.DEFAULT_MOUNTS)
+            # Load custom mounts from environment
+            custom_json = os.environ.get("MODAL_VOLUME_MOUNTS")
+            if custom_json:
+                import json
+
+                try:
+                    custom = json.loads(custom_json)
+                    cls._custom_mounts.update(custom)
+                except json.JSONDecodeError:
+                    pass  # Ignore invalid JSON
+        return cls._custom_mounts
+
+    @classmethod
+    def add_mount(cls, volume_name: str, mount_path: str):
+        """Add a volume mount mapping programmatically."""
+        cls._get_mounts()[volume_name] = mount_path
+
+    def __init__(self, path):
+        path = str(path)
+        super().__init__(path)
+
+        # Parse modal://volume-name/path
+        if not path.startswith("modal://"):
+            raise ValueError(f"ModalVolumePath requires modal:// URI, got: {path}")
+
+        # Extract volume name and path
+        without_prefix = path[8:]  # Remove "modal://"
+        if "/" in without_prefix:
+            volume_name, remainder = without_prefix.split("/", 1)
+        else:
+            volume_name = without_prefix
+            remainder = ""
+
+        # Look up mount path
+        mounts = self._get_mounts()
+        if volume_name in mounts:
+            mount_path = mounts[volume_name]
+        else:
+            # Default: use volume name as mount point
+            mount_path = f"/{volume_name}"
+
+        # Build local path
+        if remainder:
+            self._local_path = f"{mount_path}/{remainder}"
+        else:
+            self._local_path = mount_path
+
+    @property
+    def volume_name(self):
+        """Get the volume name from the modal:// URI."""
+        without_prefix = self._path[8:]
+        return without_prefix.split("/", 1)[0]
+
+    @property
+    def local_path(self):
+        """Get the translated local path."""
+        return self._local_path
+
+    def _as_local(self):
+        """Get a LocalPath for the translated path."""
+        return LocalPath(self._local_path)
+
+    # Delegate all operations to LocalPath
+    @property
+    def size(self):
+        return self._as_local().size
+
+    def open(self, mode="r"):
+        return self._as_local().open(mode)
+
+    def absolute(self):
+        return type(self)(self._path)
+
+    def glob(self, pattern):
+        local = self._as_local()
+        for local_match in local.glob(pattern):
+            # Convert back to modal:// path
+            rel_path = str(local_match)[len(self._local_path) :].lstrip("/")
+            yield type(self)(f"{self._path}/{rel_path}" if rel_path else self._path)
+
+    def exists(self):
+        return self._as_local().exists()
+
+    def isfile(self):
+        return self._as_local().isfile()
+
+    def isdir(self):
+        return self._as_local().isdir()
+
+    def mkdir(self, **kwargs):
+        return self._as_local().mkdir(**kwargs)
+
+    def remove(self, recursive=False):
+        return self._as_local().remove(recursive)
+
+    def copy(self, dest, recursive=False):
+        dest = Path(dest)
+        if isinstance(dest, type(self)):
+            # Both are modal paths, use local copy
+            self._as_local().copy(dest._local_path, recursive)
+        elif isinstance(dest, LocalPath):
+            # Copy to local path
+            self._as_local().copy(str(dest), recursive)
+        else:
+            # Cross-filesystem copy
+            _copy_across_filesystems(self, dest, recursive)
+
+    def move(self, dest, recursive=False):
+        dest = Path(dest)
+        if isinstance(dest, type(self)):
+            self._as_local().move(dest._local_path, recursive)
+        elif isinstance(dest, LocalPath):
+            self._as_local().move(str(dest), recursive)
+        else:
+            _copy_across_filesystems(self, dest, recursive)
+            self.remove(recursive)
+
+
 Path.filesystems = [
     (S3Path, lambda path: path.startswith("s3://")),
     (GCSPath, lambda path: path.startswith("gs://")),
+    (ModalVolumePath, lambda path: path.startswith("modal://")),
     (TFPath, lambda path: path.startswith("/cns/")),
     (LocalPath, lambda path: True),
 ]
