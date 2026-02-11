@@ -463,6 +463,37 @@ async def test_cartridge_high_concurrency_streaming(vllm_client):
     print(f"✓ All {n_concurrent} streaming requests completed successfully")
 
 
+async def test_cartridge_prompt_exceeds_max_model_len_rejected(vllm_client):
+    """Test that requests are rejected when prompt exceeds remaining budget.
+
+    The server has max_model_len=2048. The cartridge uses some of that budget.
+    A prompt that fills the rest should be rejected with a clear error.
+    """
+    # Generate a prompt long enough to exceed max_model_len (2048) when
+    # combined with the cartridge prefix length + min output tokens
+    long_prompt = "Add these numbers: " + " ".join(str(i) for i in range(500))
+
+    with pytest.raises(openai.BadRequestError):
+        await vllm_client.chat.completions.create(
+            model=BASE_MODEL,
+            messages=[{"role": "user", "content": long_prompt}],
+            temperature=0.0,
+            max_tokens=32,
+            extra_body={
+                "adapters": {
+                    "prefix": [{
+                        "id": CHECKPOINT_PATH,
+                        "source": "s3",
+                        "type": "prefix",
+                    }]
+                },
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+
+    print("✓ Server correctly rejects cartridge request exceeding max_model_len")
+
+
 async def test_cartridge_gpu_memory_cleanup(vllm_client, vllm_server):
     """Test that cartridge GPU memory is properly freed after requests finish.
     

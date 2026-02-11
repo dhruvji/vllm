@@ -161,8 +161,11 @@ class UltravoxDummyInputsBuilder(BaseDummyInputsBuilder[UltravoxProcessingInfo])
         seq_len: int,
         mm_counts: Mapping[str, int],
         mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_processor_kwargs: Mapping[str, object] | None = None,
     ) -> MultiModalDataDict:
-        feature_extractor = self.info.get_feature_extractor()
+        feature_extractor = self.info.get_feature_extractor(
+            **(mm_processor_kwargs or {})
+        )
 
         sampling_rate = feature_extractor.sampling_rate
         audio_len = (
@@ -209,6 +212,7 @@ class UltravoxMultiModalProcessor(BaseMultiModalProcessor[UltravoxProcessingInfo
         item_processor_data = dict(**mm_data, audios=audios)
 
         # some tokenizer kwargs are incompatible with UltravoxProcessor
+        tok_kwargs.pop("add_special_tokens", None)
         tok_kwargs.pop("padding", None)
         tok_kwargs.pop("truncation", None)
 

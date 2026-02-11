@@ -39,7 +39,7 @@ SECRETS = os.environ.get("SECRETS", "dev-api-keys")
 # vLLM optimization args
 MAX_NUM_SEQS = int(os.environ.get("MAX_NUM_SEQS", "128"))
 MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "32768"))
-MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "8192"))
+MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "16384"))
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
 
 # Benchmark thresholds (can be overridden by config)
@@ -63,7 +63,7 @@ image = (
     .uv_pip_install(
         "vllm @ file:///tmp/vllm",
         "huggingface-hub[hf_transfer]==0.36.0",
-        "flashinfer-python>=0.5.2",
+        "flashinfer-python==0.6.1",
         "boto3",
     )
     .env(
