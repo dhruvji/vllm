@@ -449,7 +449,7 @@ class OpenAIServingChat(OpenAIServing):
                         cartridge_seq_len,
                         cartridge_shm_path,
                         dynamic_lora_request,
-                    ) = self._process_adapters(
+                    ) = await self._process_adapters(
                         adapters_config=adapters_dict,
                         prompt_token_ids=engine_prompt["prompt_token_ids"],
                         request_id=sub_request_id,

@@ -254,7 +254,7 @@ class OpenAIServing:
         self._sent_cartridge_ids: OrderedDict[str, None] = OrderedDict()
         self._sent_cartridge_ids_max_size: int = 8
 
-    def _process_adapters(
+    async def _process_adapters(
         self,
         adapters_config: dict[str, Any] | None,
         prompt_token_ids: list[int],
@@ -292,7 +292,7 @@ class OpenAIServing:
         # Process prefix adapters (cartridges)
         prefix_specs = adapters_config.get("prefix")
         prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len, prefix_shm_path = (
-            self._process_cartridges(
+            await self._process_cartridges(
                 cartridges=prefix_specs,
                 prompt_token_ids=prompt_token_ids,
                 request_id=request_id,
@@ -308,7 +308,7 @@ class OpenAIServing:
 
         return prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len, prefix_shm_path, lora_request
 
-    def _process_cartridges(
+    async def _process_cartridges(
         self,
         cartridges: list[dict[str, Any]] | None,
         prompt_token_ids: list[int],
@@ -335,6 +335,8 @@ class OpenAIServing:
             - Cartridge sequence length, or None if no learned cartridge
             - Path to cartridge KV in shared memory, or None if not saved
         """
+        import asyncio
+
         import torch
 
         if not cartridges:
@@ -349,8 +351,11 @@ class OpenAIServing:
         logger = init_logger(__name__)
 
         try:
-            # Load all cartridges
-            loaded_cartridges = load_cartridges_from_request(cartridges)
+            # Load cartridges in a thread to avoid blocking the event loop
+            # during volume reloads, file locks, and torch.load().
+            loaded_cartridges = await asyncio.to_thread(
+                load_cartridges_from_request, cartridges
+            )
 
             # Separate learned and pre-computed cartridges
             learned_cartridges = []
