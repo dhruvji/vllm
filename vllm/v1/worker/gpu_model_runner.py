@@ -895,6 +895,83 @@ class GPUModelRunner(
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
 
+    def _prepare_cartridge_kv(
+        self,
+        stacked_keys: torch.Tensor,
+        stacked_values: torch.Tensor,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Validate, shard, transpose, and transfer cartridge KV to GPU.
+
+        Args:
+            stacked_keys: (num_layers, num_kv_heads, seq_len, head_dim)
+            stacked_values: (num_layers, num_kv_heads, seq_len, head_dim)
+
+        Returns:
+            List of (layer_keys, layer_values) tuples, each
+            (seq_len, num_kv_heads, head_dim) on GPU.
+        """
+        # Validate cartridge dimensions match model architecture
+        total_kv_heads = self.model_config.get_total_num_kv_heads()
+        expected_head_size = self.model_config.get_head_size()
+        expected_num_layers = self.model_config.get_num_layers(
+            self.parallel_config
+        )
+        cart_num_layers, cart_kv_heads, cart_seq_len, cart_head_dim = (
+            stacked_keys.shape
+        )
+        if cart_num_layers != expected_num_layers:
+            raise ValueError(
+                f"Cartridge incompatible with model: "
+                f"num_layers={cart_num_layers} but model expects "
+                f"{expected_num_layers}."
+            )
+        if cart_kv_heads != total_kv_heads:
+            raise ValueError(
+                f"Cartridge incompatible with model: "
+                f"num_kv_heads={cart_kv_heads} but model expects "
+                f"{total_kv_heads}."
+            )
+        if cart_head_dim != expected_head_size:
+            raise ValueError(
+                f"Cartridge incompatible with model: "
+                f"head_dim={cart_head_dim} but model expects "
+                f"{expected_head_size}."
+            )
+
+        # Shard cartridge KV for tensor parallelism
+        tp_size = self.parallel_config.tensor_parallel_size
+        if tp_size > 1 and total_kv_heads >= tp_size:
+            tp_rank = get_tp_group().rank_in_group
+            heads_per_gpu = total_kv_heads // tp_size
+            start_head = tp_rank * heads_per_gpu
+            end_head = start_head + heads_per_gpu
+            stacked_keys = stacked_keys[
+                :, start_head:end_head, :, :
+            ].contiguous()
+            stacked_values = stacked_values[
+                :, start_head:end_head, :, :
+            ].contiguous()
+
+        # Transpose and transfer to GPU once per layer.
+        layer_kv_list = []
+        for layer_idx in range(cart_num_layers):
+            # (num_kv_heads, seq_len, head_dim) ->
+            # (seq_len, num_kv_heads, head_dim)
+            layer_keys = (
+                stacked_keys[layer_idx].transpose(0, 1).contiguous()
+            )
+            layer_values = (
+                stacked_values[layer_idx].transpose(0, 1).contiguous()
+            )
+            layer_keys = layer_keys.to(
+                self.device, dtype=self.kv_cache_dtype
+            )
+            layer_values = layer_values.to(
+                self.device, dtype=self.kv_cache_dtype
+            )
+            layer_kv_list.append((layer_keys, layer_values))
+        return layer_kv_list
+
     def _prepopulate_cartridge_to_cache(
         self,
         block_ids: tuple[list[int], ...],
@@ -991,6 +1068,74 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # Process cartridge KV overwrites (mid-generation pipeline updates).
+        # Look up block_ids from live requests (always up-to-date, even after
+        # preemption) rather than caching block_ids separately.
+        if scheduler_output.cartridge_overwrites:
+            for cartridge_id, new_kv in (
+                scheduler_output.cartridge_overwrites.items()
+            ):
+                stacked_keys, stacked_values = new_kv
+                new_layer_kv_list = self._prepare_cartridge_kv(
+                    stacked_keys, stacked_values
+                )
+                new_seq_len = new_layer_kv_list[0][0].shape[0]
+
+                # Validate seq_len matches old cartridge (block allocation
+                # is fixed, so a size change would corrupt other data).
+                if cartridge_id in self.gpu_cartridge_cache:
+                    old_seq_len = (
+                        self.gpu_cartridge_cache[cartridge_id][0][0].shape[0]
+                    )
+                    if new_seq_len != old_seq_len:
+                        logger.error(
+                            "[cartridge-overwrite] seq_len mismatch for %s: "
+                            "old=%d new=%d, skipping overwrite",
+                            cartridge_id,
+                            old_seq_len,
+                            new_seq_len,
+                        )
+                        continue
+
+                # Update GPU cache.
+                self.gpu_cartridge_cache[cartridge_id] = new_layer_kv_list
+
+                # Find all live requests using this cartridge and overwrite
+                # their KV cache blocks.  With prefix caching the physical
+                # blocks are shared so we deduplicate by the first block id.
+                seen_block_sets: set[int] = set()
+                n_updated = 0
+                for req_id, cid in self._request_to_cartridge.items():
+                    if cid != cartridge_id:
+                        continue
+                    req_state = self.requests.get(req_id)
+                    if req_state is None:
+                        continue
+                    # Deduplicate: with prefix caching, multiple requests
+                    # share the same physical blocks.
+                    first_block = req_state.block_ids[0][0]
+                    if first_block in seen_block_sets:
+                        continue
+                    seen_block_sets.add(first_block)
+                    self._prepopulate_cartridge_to_cache(
+                        req_state.block_ids, new_layer_kv_list, new_seq_len
+                    )
+                    n_updated += 1
+
+                if n_updated == 0:
+                    logger.warning(
+                        "[cartridge-overwrite] no active requests for %s",
+                        cartridge_id,
+                    )
+                elif _CARTRIDGE_DEBUG_TIMING:
+                    logger.info(
+                        "[cartridge-overwrite] id=%s seq_len=%d "
+                        "block_sets_updated=%d",
+                        cartridge_id,
+                        new_seq_len,
+                        n_updated,
+                    )
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1137,73 +1282,10 @@ class GPUModelRunner(
                             stacked_keys.dtype,
                         )
 
-                    # Validate cartridge dimensions match model architecture
-                    total_kv_heads = self.model_config.get_total_num_kv_heads()
-                    expected_head_size = self.model_config.get_head_size()
-                    expected_num_layers = self.model_config.get_num_layers(
-                        self.parallel_config
+                    layer_kv_list = self._prepare_cartridge_kv(
+                        stacked_keys, stacked_values
                     )
-                    cart_num_layers, cart_kv_heads, cart_seq_len, cart_head_dim = (
-                        stacked_keys.shape
-                    )
-                    if cart_num_layers != expected_num_layers:
-                        raise ValueError(
-                            f"Cartridge incompatible with model: "
-                            f"num_layers={cart_num_layers} but model expects "
-                            f"{expected_num_layers}. Cartridge may have been "
-                            f"trained on a different model."
-                        )
-                    if cart_kv_heads != total_kv_heads:
-                        raise ValueError(
-                            f"Cartridge incompatible with model: "
-                            f"num_kv_heads={cart_kv_heads} but model expects "
-                            f"{total_kv_heads}. Cartridge may have been "
-                            f"trained on a different model."
-                        )
-                    if cart_head_dim != expected_head_size:
-                        raise ValueError(
-                            f"Cartridge incompatible with model: "
-                            f"head_dim={cart_head_dim} but model expects "
-                            f"{expected_head_size}. Cartridge may have been "
-                            f"trained on a different model."
-                        )
-
-                    # Shard cartridge KV for tensor parallelism
-                    tp_size = self.parallel_config.tensor_parallel_size
-                    if tp_size > 1 and total_kv_heads >= tp_size:
-                        tp_rank = get_tp_group().rank_in_group
-                        heads_per_gpu = total_kv_heads // tp_size
-                        start_head = tp_rank * heads_per_gpu
-                        end_head = start_head + heads_per_gpu
-                        stacked_keys = stacked_keys[
-                            :, start_head:end_head, :, :
-                        ].contiguous()
-                        stacked_values = stacked_values[
-                            :, start_head:end_head, :, :
-                        ].contiguous()
-
-                    # Precompute transposed layer tensors and move to GPU once.
-                    # This avoids repeated transpose().contiguous().to() calls.
-                    layer_kv_list = []
-                    transpose_start = time.perf_counter()
-                    for layer_idx in range(cart_num_layers):
-                        # (num_kv_heads, seq_len, head_dim) ->
-                        # (seq_len, num_kv_heads, head_dim)
-                        layer_keys = (
-                            stacked_keys[layer_idx].transpose(0, 1).contiguous()
-                        )
-                        layer_values = (
-                            stacked_values[layer_idx].transpose(0, 1).contiguous()
-                        )
-                        # Transfer to GPU and convert dtype
-                        layer_keys = layer_keys.to(
-                            self.device, dtype=self.kv_cache_dtype
-                        )
-                        layer_values = layer_values.to(
-                            self.device, dtype=self.kv_cache_dtype
-                        )
-                        layer_kv_list.append((layer_keys, layer_values))
-                    transpose_ms = (time.perf_counter() - transpose_start) * 1000.0
+                    cart_seq_len = layer_kv_list[0][0].shape[0]
 
                     # Cache the precomputed layer tensors
                     self.gpu_cartridge_cache[cartridge_id] = layer_kv_list
@@ -1211,12 +1293,11 @@ class GPUModelRunner(
 
                     if _CARTRIDGE_DEBUG_TIMING:
                         logger.info(
-                            "[cartridge-prepare] req=%s transpose_and_transfer_ms=%.2f "
-                            "total_prepare_ms=%.2f num_layers=%d",
+                            "[cartridge-prepare] req=%s total_prepare_ms=%.2f "
+                            "num_layers=%d",
                             req_id,
-                            transpose_ms,
                             prepare_ms,
-                            cart_num_layers,
+                            len(layer_kv_list),
                         )
                 else:
                     # No GPU cache and no KV payload; fall back to provided seq_len.

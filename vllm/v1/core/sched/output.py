@@ -261,6 +261,10 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # Cartridge KV overwrites to apply this step.
+    # Maps cartridge_id -> [stacked_keys, stacked_values]
+    cartridge_overwrites: "dict[str, list[torch.Tensor]] | None" = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

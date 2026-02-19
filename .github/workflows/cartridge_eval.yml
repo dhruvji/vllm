@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:  # Allow manual triggering
 
 concurrency:
@@ -48,8 +49,15 @@ jobs:
             --pytest-args "-v -x -m benchmark" \
             --env-vars "VLLM_TEST_ENABLE_CARTRIDGE=1,VLLM_PASSTHROUGH_ERRORS=1"
 
+      - name: Run cartridge pipeline tests
+        run: |
+          modal run --env=ci .github/scripts/modal_ci_pytest.py \
+            --test-path tests/test_cartridge_pipeline.py \
+            --pytest-args "-v -x -m benchmark" \
+            --env-vars "VLLM_TEST_ENABLE_CARTRIDGE=1,VLLM_PASSTHROUGH_ERRORS=1"
+
       - name: Report results
         if: always()
         run: |
-          echo "Cartridge evaluation completed (includes memory cleanup tests)"
+          echo "Cartridge evaluation completed (includes pipeline tests)"
           echo "Check the logs above for results"

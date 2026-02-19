@@ -535,6 +535,7 @@ class InputProcessor:
         cartridge_id: str | None = None,
         cartridge_seq_len: int | None = None,
         cartridge_shm_path: str | None = None,
+        cartridge_allow_pipelining: bool | None = None,
         supported_tasks: tuple[SupportedTask, ...] | None = None,
         resumable: bool = False,
     ) -> EngineCoreRequest:
@@ -679,6 +680,7 @@ class InputProcessor:
             cartridge_id=cartridge_id,
             cartridge_seq_len=cartridge_seq_len,
             cartridge_shm_path=cartridge_shm_path,
+            cartridge_allow_pipelining=cartridge_allow_pipelining,
             resumable=resumable,
         )
 

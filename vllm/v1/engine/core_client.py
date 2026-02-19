@@ -804,6 +804,13 @@ class SyncMPClient(MPClient):
     def execute_dummy_batch(self) -> None:
         self.call_utility("execute_dummy_batch")
 
+    def update_cartridge(
+        self, cartridge_id: str, cartridge_shm_path: str
+    ) -> str:
+        return self.call_utility(
+            "update_cartridge", cartridge_id, cartridge_shm_path
+        )
+
     def collective_rpc(
         self,
         method: str | Callable[..., _R],
@@ -1013,6 +1020,13 @@ class AsyncMPClient(MPClient):
 
     async def execute_dummy_batch_async(self) -> None:
         await self.call_utility_async("execute_dummy_batch")
+
+    async def update_cartridge_async(
+        self, cartridge_id: str, cartridge_shm_path: str
+    ) -> str:
+        return await self.call_utility_async(
+            "update_cartridge", cartridge_id, cartridge_shm_path
+        )
 
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
         return await self.call_utility_async("add_lora", lora_request)

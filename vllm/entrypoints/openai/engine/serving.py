@@ -265,6 +265,7 @@ class OpenAIServing:
         str | None,
         int | None,
         str | None,
+        bool | None,
         LoRARequest | None,
     ]:
         """
@@ -284,19 +285,25 @@ class OpenAIServing:
             - Prefix ID for deduplication, or None if no learned prefix
             - Prefix sequence length, or None if no learned prefix
             - Path to prefix KV in shared memory, or None if not saved
+            - Whether this request allows cartridge pipelining
             - LoRARequest object if LoRA adapters specified, or None
         """
         if not adapters_config:
-            return prompt_token_ids, None, None, None, None, None
+            return prompt_token_ids, None, None, None, None, None, None
 
         # Process prefix adapters (cartridges)
         prefix_specs = adapters_config.get("prefix")
-        prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len, prefix_shm_path = (
-            await self._process_cartridges(
-                cartridges=prefix_specs,
-                prompt_token_ids=prompt_token_ids,
-                request_id=request_id,
-            )
+        (
+            prompt_token_ids,
+            prefix_kv,
+            prefix_id,
+            prefix_seq_len,
+            prefix_shm_path,
+            allow_pipelining,
+        ) = await self._process_cartridges(
+            cartridges=prefix_specs,
+            prompt_token_ids=prompt_token_ids,
+            request_id=request_id,
         )
 
         # Process LoRA adapters
@@ -306,14 +313,29 @@ class OpenAIServing:
             request_id=request_id,
         )
 
-        return prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len, prefix_shm_path, lora_request
+        return (
+            prompt_token_ids,
+            prefix_kv,
+            prefix_id,
+            prefix_seq_len,
+            prefix_shm_path,
+            allow_pipelining,
+            lora_request,
+        )
 
     async def _process_cartridges(
         self,
         cartridges: list[dict[str, Any]] | None,
         prompt_token_ids: list[int],
         request_id: str | None = None,
-    ) -> tuple[list[int], list["torch.Tensor"] | None, str | None, int | None, str | None]:
+    ) -> tuple[
+        list[int],
+        list["torch.Tensor"] | None,
+        str | None,
+        int | None,
+        str | None,
+        bool | None,
+    ]:
         """
         Load cartridges and process them for the request.
 
@@ -334,13 +356,14 @@ class OpenAIServing:
             - Cartridge ID for deduplication, or None if no learned cartridge
             - Cartridge sequence length, or None if no learned cartridge
             - Path to cartridge KV in shared memory, or None if not saved
+            - Whether this request allows cartridge pipelining
         """
         import asyncio
 
         import torch
 
         if not cartridges:
-            return prompt_token_ids, None, None, None, None
+            return prompt_token_ids, None, None, None, None, None
 
         from vllm.logger import init_logger
         from vllm.v1.cartridge_loader import (
@@ -360,6 +383,7 @@ class OpenAIServing:
             # Separate learned and pre-computed cartridges
             learned_cartridges = []
             learned_cartridge_ids = []
+            learned_cartridge_allow_pipelining = []
             precomputed_cartridges = []
 
             for i, cartridge_data in enumerate(loaded_cartridges):
@@ -368,6 +392,9 @@ class OpenAIServing:
                     # Get cartridge ID from original spec
                     learned_cartridge_ids.append(
                         cartridges[i].get("id", f"unknown_{i}")
+                    )
+                    learned_cartridge_allow_pipelining.append(
+                        bool(cartridges[i].get("allow_pipelining", False))
                     )
                 elif cartridge_data.has_valid_token_ids():
                     precomputed_cartridges.append(cartridge_data)
@@ -382,6 +409,7 @@ class OpenAIServing:
             cartridge_id: str | None = None
             cartridge_seq_len: int | None = None
             cartridge_shm_path: str | None = None
+            allow_pipelining: bool | None = None
             if learned_cartridges:
                 # Currently only supports one learned cartridge per request
                 if len(learned_cartridges) > 1:
@@ -393,6 +421,7 @@ class OpenAIServing:
                 cartridge_data = learned_cartridges[0]
                 cartridge_id = learned_cartridge_ids[0]
                 cartridge_seq_len = cartridge_data.num_tokens
+                allow_pipelining = learned_cartridge_allow_pipelining[0]
                 assert cartridge_id is not None  # Guaranteed by learned_cartridge_ids
 
                 # Get stacked KV tensors and save to shared storage for zero-copy IPC.
@@ -459,6 +488,7 @@ class OpenAIServing:
                     cartridge_id,
                     cartridge_seq_len,
                     cartridge_shm_path,
+                    allow_pipelining,
                 )
             else:
                 return (
@@ -467,6 +497,7 @@ class OpenAIServing:
                     cartridge_id,
                     cartridge_seq_len,
                     cartridge_shm_path,
+                    allow_pipelining,
                 )
 
         except Exception as e:

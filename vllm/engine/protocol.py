@@ -153,6 +153,13 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def update_cartridge(
+        self, cartridge_id: str, cartridge_shm_path: str
+    ) -> str:
+        """Queue a cartridge KV overwrite for the next step."""
+        ...
+
+    @abstractmethod
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
         ...

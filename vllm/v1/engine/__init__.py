@@ -81,6 +81,8 @@ class EngineCoreRequest(
     # Path to cartridge KV in shared memory (/dev/shm) for zero-copy IPC.
     # When set, engine core loads from this path instead of receiving via IPC.
     cartridge_shm_path: str | None = None
+    # Allow this request to trigger cartridge pipelining for matching requests.
+    cartridge_allow_pipelining: bool | None = None
 
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.

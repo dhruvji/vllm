@@ -252,6 +252,13 @@ class AdapterSpec(OpenAIBaseModel):
             "If false, use cached version if available."
         ),
     )
+    allow_pipelining: bool = Field(
+        default=False,
+        description=(
+            "If true, allow this prefix/cartridge to trigger mid-generation "
+            "pipelining updates for matching cartridges."
+        ),
+    )
 
 
 class AdaptersConfig(OpenAIBaseModel):

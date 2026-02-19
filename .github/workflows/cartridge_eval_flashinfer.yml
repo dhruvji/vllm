@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:  # Allow manual triggering
 
 concurrency:
@@ -48,10 +49,17 @@ jobs:
             --pytest-args "-v -x -m benchmark" \
             --env-vars "VLLM_TEST_ENABLE_CARTRIDGE=1,VLLM_PASSTHROUGH_ERRORS=1,VLLM_ATTENTION_BACKEND=FLASHINFER,VLLM_USE_V1=1"
 
+      - name: Run cartridge pipeline tests (FlashInfer + V1)
+        run: |
+          modal run --env=ci .github/scripts/modal_ci_pytest.py \
+            --test-path tests/test_cartridge_pipeline.py \
+            --pytest-args "-v -x -m benchmark" \
+            --env-vars "VLLM_TEST_ENABLE_CARTRIDGE=1,VLLM_PASSTHROUGH_ERRORS=1,VLLM_ATTENTION_BACKEND=FLASHINFER,VLLM_USE_V1=1"
+
       - name: Report results
         if: always()
         run: |
-          echo "Cartridge evaluation (FlashInfer V1) completed"
+          echo "Cartridge evaluation (FlashInfer V1) completed (includes pipeline tests)"
           echo "Backend: FlashInfer"
           echo "vLLM Version: V1"
           echo "Check the logs above for results"

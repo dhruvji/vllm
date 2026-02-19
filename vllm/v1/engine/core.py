@@ -19,6 +19,7 @@ import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
+import vllm.envs as envs
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
@@ -110,6 +111,8 @@ class EngineCore:
         self._cartridge_kv_cache_max_size: int = 20
         # Track cartridge IDs loaded from shm for cleanup
         self._cartridge_shm_ids: set[str] = set()
+        # Pending cartridge KV overwrites for the next step (pipeline mode).
+        self._pending_cartridge_overwrites: dict[str, list[torch.Tensor]] = {}
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -230,6 +233,83 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+    def _maybe_pipeline_cartridge_update(self, request: EngineCoreRequest) -> None:
+        """Queue cartridge updates for all live cartridges if allowed."""
+        if not request.cartridge_allow_pipelining:
+            return
+        if not request.cartridge_id:
+            return
+        if not self.scheduler.use_pp:
+            return
+        new_kv = self._cartridge_kv_cache.get(request.cartridge_id)
+        if new_kv is None:
+            return
+
+        matched_ids: set[str] = set()
+        for req in self.scheduler.requests.values():
+            if req.cartridge_id is None:
+                continue
+            if RequestStatus.is_finished(req.status):
+                continue
+            if req.cartridge_id == request.cartridge_id:
+                continue
+            # Skip cartridges with mismatched seq_len to avoid unsafe overwrites.
+            if req.cartridge_seq_len != (request.cartridge_seq_len or 0):
+                continue
+            matched_ids.add(req.cartridge_id)
+
+        if not matched_ids:
+            return
+
+        for cartridge_id in matched_ids:
+            self._pending_cartridge_overwrites[cartridge_id] = new_kv
+            self._cartridge_kv_cache[cartridge_id] = new_kv
+
+        logger.info(
+            "Pipelined cartridge update: %s -> %d matching cartridges",
+            request.cartridge_id,
+            len(matched_ids),
+        )
+
+    def _has_live_cartridge_request(self, cartridge_id: str) -> bool:
+        for req in self.scheduler.requests.values():
+            if req.cartridge_id != cartridge_id:
+                continue
+            if RequestStatus.is_finished(req.status):
+                continue
+            return True
+        return False
+
+    def _get_running_cartridge_ids(self) -> set[str]:
+        running_ids: set[str] = set()
+        for req in self.scheduler.requests.values():
+            if req.cartridge_id is None:
+                continue
+            if req.status != RequestStatus.RUNNING:
+                continue
+            running_ids.add(req.cartridge_id)
+        return running_ids
+
+    def _attach_pending_cartridge_overwrites(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        if not self._pending_cartridge_overwrites:
+            return
+        running_ids = self._get_running_cartridge_ids()
+        if running_ids:
+            scheduler_output.cartridge_overwrites = {
+                cid: kv
+                for cid, kv in self._pending_cartridge_overwrites.items()
+                if cid in running_ids
+            }
+        # Keep pending overwrites for any live requests (running, waiting, preempted).
+        # This ensures pipeline updates apply once requests are actively running.
+        self._pending_cartridge_overwrites = {
+            cid: kv
+            for cid, kv in self._pending_cartridge_overwrites.items()
+            if self._has_live_cartridge_request(cid)
+        }
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(
@@ -411,6 +491,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        self._attach_pending_cartridge_overwrites(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -472,6 +553,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            self._attach_pending_cartridge_overwrites(scheduler_output)
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
@@ -588,6 +670,21 @@ class EngineCore:
             cleanup_cartridge_shm(cartridge_id)
         self._cartridge_shm_ids.clear()
         self._cartridge_kv_cache.clear()
+
+    def update_cartridge(
+        self, cartridge_id: str, cartridge_shm_path: str
+    ) -> str:
+        """Queue a cartridge KV overwrite for the next step."""
+        from vllm.v1.cartridge_loader import load_cartridge_from_shm
+        stacked_kv = load_cartridge_from_shm(cartridge_shm_path)
+        if stacked_kv is None:
+            raise ValueError(
+                f"Failed to load cartridge from {cartridge_shm_path}"
+            )
+        self._pending_cartridge_overwrites[cartridge_id] = stacked_kv
+        # Also update the engine core's own cache
+        self._cartridge_kv_cache[cartridge_id] = stacked_kv
+        return "queued"
 
     def profile(self, is_start: bool = True):
         self.model_executor.profile(is_start)
@@ -716,6 +813,9 @@ class EngineCore:
             else:
                 # Move to end for LRU ordering
                 self._cartridge_kv_cache.move_to_end(request.cartridge_id)
+
+        # Optionally pipeline cartridge updates based on the incoming request.
+        self._maybe_pipeline_cartridge_update(request)
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
         if req.cartridge_kv is None and req.cartridge_id in self._cartridge_kv_cache:

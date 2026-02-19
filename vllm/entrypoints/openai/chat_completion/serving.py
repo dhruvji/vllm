@@ -429,6 +429,7 @@ class OpenAIServingChat(OpenAIServing):
                 cartridge_id = None
                 cartridge_seq_len = None
                 cartridge_shm_path = None
+                cartridge_allow_pipelining = None
                 dynamic_lora_request = None
 
                 # Convert adapters config to dict if present
@@ -448,6 +449,7 @@ class OpenAIServingChat(OpenAIServing):
                         cartridge_id,
                         cartridge_seq_len,
                         cartridge_shm_path,
+                        cartridge_allow_pipelining,
                         dynamic_lora_request,
                     ) = await self._process_adapters(
                         adapters_config=adapters_dict,
@@ -483,6 +485,7 @@ class OpenAIServingChat(OpenAIServing):
                         cartridge_id=cartridge_id,
                         cartridge_seq_len=cartridge_seq_len,
                         cartridge_shm_path=cartridge_shm_path,
+                        cartridge_allow_pipelining=cartridge_allow_pipelining,
                         data_parallel_rank=data_parallel_rank,
                     )
                     reasoning_ended = None
