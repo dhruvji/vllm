@@ -9,6 +9,7 @@ import json
 import operator
 import os
 import pprint
+import shutil
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
@@ -223,9 +224,43 @@ class CompilerManager:
         if (compile_range, graph_index, self.compiler.name) not in self.cache:
             return None
         handle = self.cache[(compile_range, graph_index, self.compiler.name)]
-        compiled_graph = self.compiler.load(
-            handle, graph, example_inputs, graph_index, compile_range
-        )
+        try:
+            compiled_graph = self.compiler.load(
+                handle, graph, example_inputs, graph_index, compile_range
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "Bytes object is corrupted" in msg and "checksum does not match" in msg:
+                path = None
+                if isinstance(handle, tuple) and len(handle) >= 2:
+                    candidate = handle[1]
+                    if isinstance(candidate, str):
+                        path = candidate
+                if path:
+                    try:
+                        if os.path.isdir(path):
+                            shutil.rmtree(path, ignore_errors=True)
+                        elif os.path.exists(path):
+                            os.remove(path)
+                        logger.warning(
+                            "Detected corrupted compiled artifact at %s; "
+                            "deleted and will recompile.",
+                            path,
+                        )
+                    except Exception as cleanup_exc:
+                        logger.warning(
+                            "Detected corrupted compiled artifact at %s but "
+                            "failed to delete it (%s); will recompile anyway.",
+                            path,
+                            cleanup_exc,
+                        )
+                else:
+                    logger.warning(
+                        "Detected corrupted compiled artifact (no path in handle); "
+                        "will recompile."
+                    )
+                return None
+            raise
         logger.debug(
             "Directly load the %s-th graph for compile range %sfrom %s via handle %s",
             graph_index,

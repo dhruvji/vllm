@@ -727,19 +727,15 @@ class Scheduler(SchedulerInterface):
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
 
-                    # For cartridge cache MISS, count cart_seq_len in budget
-                    # (need to load cartridge). For cache HIT, don't count
-                    # (cartridge already in memory, shared via prefix cache).
-                    # Note: budget_cost is for scheduling limits, num_new_tokens
-                    # is for tracking actual tokens computed.
+                    # Always count cart_seq_len in budget for cartridge
+                    # requests. Even on cache hit, prefill tokens attend to
+                    # the full cached cartridge KV, so the actual attention
+                    # cost is num_new_tokens * (num_new_tokens + cart_seq_len).
                     cart_seq_len = getattr(request, "cartridge_seq_len", 0)
                     cartridge_cache_hit = req_to_cartridge_cache_hit.get(
                         request.request_id, False
                     )
-                    if cart_seq_len > 0 and not cartridge_cache_hit:
-                        budget_cost = num_new_tokens + cart_seq_len
-                    else:
-                        budget_cost = num_new_tokens
+                    budget_cost = num_new_tokens + cart_seq_len
 
                     if _CARTRIDGE_DEBUG_TIMING and cart_seq_len > 0:
                         logger.info(
@@ -955,20 +951,6 @@ class Scheduler(SchedulerInterface):
         assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
             scheduled_running_reqs
         ) <= len(self.running)
-
-        # Log summary of cartridge scheduling
-        if _CARTRIDGE_DEBUG_TIMING and req_to_cartridge_cache_hit:
-            cart_hits = sum(1 for v in req_to_cartridge_cache_hit.values() if v)
-            cart_misses = sum(1 for v in req_to_cartridge_cache_hit.values() if not v)
-            logger.info(
-                "[cartridge-sched-summary] new_reqs=%d cart_cache_hits=%d "
-                "cart_cache_misses=%d waiting=%d running=%d",
-                len(scheduled_new_reqs),
-                cart_hits,
-                cart_misses,
-                len(self.waiting),
-                len(self.running),
-            )
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
