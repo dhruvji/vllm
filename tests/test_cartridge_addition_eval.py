@@ -494,6 +494,39 @@ async def test_cartridge_prompt_exceeds_max_model_len_rejected(vllm_client):
     print("✓ Server correctly rejects cartridge request exceeding max_model_len")
 
 
+async def test_cartridge_not_found_returns_http_error(vllm_server):
+    """Test missing cartridge path returns non-200 HTTP error."""
+    missing_cartridge_path = "/tmp/vllm-cartridge-does-not-exist.pt"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            vllm_server.url_for("v1", "chat/completions"),
+            json={
+                "model": BASE_MODEL,
+                "messages": [{"role": "user", "content": "Problem inputs: 1 and 2"}],
+                "temperature": 0.0,
+                "max_tokens": 32,
+                "adapters": {
+                    "prefix": [
+                        {
+                            "id": missing_cartridge_path,
+                            "source": "local",
+                            "type": "prefix",
+                        }
+                    ]
+                },
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert "error" in body
+    assert body["error"]["code"] == 400
+    assert "Failed to process cartridges" in body["error"]["message"]
+    assert "not found" in body["error"]["message"].lower()
+
+
 async def test_cartridge_gpu_memory_cleanup(vllm_client, vllm_server):
     """Test that cartridge GPU memory is properly freed after requests finish.
     

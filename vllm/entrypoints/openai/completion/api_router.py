@@ -57,7 +57,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     try:
         generator = await handler.create_completion(request, raw_request)
     except Exception as e:
-        return handler.create_error_response(e)
+        error = handler.create_error_response(e)
+        return JSONResponse(content=error.model_dump(), status_code=error.error.code)
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
@@ -94,7 +95,8 @@ async def render_completion(request: CompletionRequest, raw_request: Request):
     try:
         result = await handler.render_completion_request(request)
     except Exception as e:
-        return handler.create_error_response(e)
+        error = handler.create_error_response(e)
+        return JSONResponse(content=error.model_dump(), status_code=error.error.code)
 
     if isinstance(result, ErrorResponse):
         return JSONResponse(content=result.model_dump(), status_code=result.error.code)
