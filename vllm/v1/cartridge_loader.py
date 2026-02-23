@@ -881,6 +881,12 @@ def load_cartridges_from_request(
                 force_redownload=spec.get("force_redownload", False),
             )
             loaded_cartridges.append(cartridge_data)
+        except FileNotFoundError as e:
+            # Normalize to a clear, user-facing error that downstream HTTP layer
+            # will surface as a 400 BadRequest (see create_error_response).
+            msg = f"Cartridge not found: {resolved_id}"
+            logger.error("%s (%s)", msg, e)
+            raise RuntimeError(msg) from e
         except Exception as e:
             logger.error("Failed to load cartridge %s: %s", resolved_id, e)
             raise RuntimeError(f"Failed to load cartridge {resolved_id}: {e}") from e

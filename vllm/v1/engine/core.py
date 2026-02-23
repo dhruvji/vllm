@@ -109,6 +109,8 @@ class EngineCore:
         from collections import OrderedDict
         self._cartridge_kv_cache: OrderedDict[str, list[torch.Tensor]] = OrderedDict()
         self._cartridge_kv_cache_max_size: int = 20
+        # Track cartridge shm paths for reload after LRU eviction
+        self._cartridge_shm_paths: dict[str, str] = {}
         # Track cartridge IDs loaded from shm for cleanup
         self._cartridge_shm_ids: set[str] = set()
         # Pending cartridge KV overwrites for the next step (pipeline mode).
@@ -791,14 +793,19 @@ class EngineCore:
         # Handle cartridge KV: load from shm if path provided, otherwise use IPC tensor
         if request.cartridge_id:
             if request.cartridge_id not in self._cartridge_kv_cache:
-                # First time seeing this cartridge - load from shm or use IPC tensor
-                if request.cartridge_shm_path:
-                    # Load from shared memory (fast, zero-copy from RAM)
-                    from vllm.v1.cartridge_loader import load_cartridge_from_shm
-                    stacked_kv = load_cartridge_from_shm(request.cartridge_shm_path)
+                from vllm.v1.cartridge_loader import load_cartridge_from_shm
+
+                shm_path = (
+                    request.cartridge_shm_path
+                    or self._cartridge_shm_paths.get(request.cartridge_id)
+                )
+                if shm_path:
+                    # Load (or reload after LRU eviction) from shared memory
+                    stacked_kv = load_cartridge_from_shm(shm_path)
                     if stacked_kv is not None:
                         self._cartridge_kv_cache[request.cartridge_id] = stacked_kv
                         self._cartridge_shm_ids.add(request.cartridge_id)
+                        self._cartridge_shm_paths[request.cartridge_id] = shm_path
                         request.cartridge_kv = stacked_kv
                 elif request.cartridge_kv is not None:
                     # Fallback: use IPC tensor (legacy path)
@@ -806,6 +813,7 @@ class EngineCore:
 
                 # LRU eviction: remove oldest cartridge to prevent unbounded
                 # CPU memory growth (~500MB per cartridge for prefix adapters).
+                # Note: we keep _cartridge_shm_paths so we can reload if needed.
                 while len(self._cartridge_kv_cache) > self._cartridge_kv_cache_max_size:
                     evicted_id, evicted_kv = self._cartridge_kv_cache.popitem(last=False)
                     del evicted_kv

@@ -33,7 +33,7 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     .entrypoint([])
     .apt_install("git", "rsync")
-    .env({"VLLM_USE_PRECOMPILED": "1", "VLLM_PRECOMPILED_WHEEL_COMMIT": "2b465570e6dd327e8422ef9c87e9b2b1454ceaed"})
+    .env({"VLLM_USE_PRECOMPILED": "1", "VLLM_PRECOMPILED_WHEEL_COMMIT": "be7f3d5d2016b326d12ff"})
     .run_commands(
         f"git clone https://$GITHUB_TOKEN@github.com/engram-lab/vllm.git -b {BRANCH} /tmp/vllm",
         secrets=[secrets],
@@ -42,13 +42,24 @@ image = (
     .uv_pip_install(
         "vllm @ file:///tmp/vllm",
         "huggingface-hub[hf_transfer]==0.36.0",
-        "flashinfer-python==0.6.1",
         "boto3",
         "pytest",
         "pytest-asyncio",
         "httpx",
         "openai",
         "tblib",
+    )
+    # Align torch and flashinfer with the precompiled vLLM wheel (torch 2.10 build).
+    .uv_pip_install(
+        "torch==2.10.0",
+        "torchvision==0.25.0",
+        extra_index_url="https://download.pytorch.org/whl/cu128",
+    )
+    .uv_pip_install(
+        "flashinfer-python==0.6.3",
+        "flashinfer-cubin==0.6.3",
+        "flashinfer-jit-cache",
+        extra_index_url="https://flashinfer.ai/whl/nightly/cu128",
     )
     .env(
         {

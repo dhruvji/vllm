@@ -251,7 +251,7 @@ class OpenAIServing:
         # Track cartridges that have already sent KV to engine core.
         # Bounded to prevent unbounded memory growth with frequent checkpoint updates.
         from collections import OrderedDict
-        self._sent_cartridge_ids: OrderedDict[str, None] = OrderedDict()
+        self._sent_cartridge_ids: OrderedDict[str, str | None] = OrderedDict()
         self._sent_cartridge_ids_max_size: int = 8
 
     async def _process_adapters(
@@ -429,9 +429,10 @@ class OpenAIServing:
                 # Only save once per cartridge to avoid repeated disk writes.
                 if cartridge_id in self._sent_cartridge_ids:
                     self._sent_cartridge_ids.move_to_end(cartridge_id)  # LRU touch
-                    # Already saved to shared storage, engine core will load from there
+                    # Already saved to shared storage — re-send the shm path
+                    # so engine core can reload if it evicted from its LRU cache.
                     stacked_cartridge_kv = None
-                    cartridge_shm_path = None
+                    cartridge_shm_path = self._sent_cartridge_ids[cartridge_id]
                 else:
                     stacked_cartridge_kv = cartridge_data.get_stacked_kv()
                     if stacked_cartridge_kv is not None:
@@ -463,7 +464,7 @@ class OpenAIServing:
                         )
                         # Don't send tensors via IPC, engine core will load from shared storage
                         stacked_cartridge_kv = None
-                        self._sent_cartridge_ids[cartridge_id] = None
+                        self._sent_cartridge_ids[cartridge_id] = cartridge_shm_path
                         # LRU eviction
                         while len(self._sent_cartridge_ids) > self._sent_cartridge_ids_max_size:
                             self._sent_cartridge_ids.popitem(last=False)

@@ -434,9 +434,15 @@ class BackgroundResources:
                     shutdown_sender.send(b"")
 
     def validate_alive(self, frames: Sequence[zmq.Frame]):
-        if len(frames) == 1 and (frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD):
-            self.engine_dead = True
-            raise EngineDeadError()
+        if len(frames) == 1:
+            frame_bytes = bytes(frames[0].buffer)
+            if frame_bytes.startswith(EngineCoreProc.ENGINE_CORE_DEAD):
+                self.engine_dead = True
+                sep = EngineCoreProc.ENGINE_CORE_DEAD + b":"
+                if frame_bytes.startswith(sep):
+                    error_msg = frame_bytes[len(sep):].decode("utf-8", errors="replace")
+                    raise EngineDeadError(f"EngineCore died: {error_msg}")
+                raise EngineDeadError()
 
 
 class MPClient(EngineCoreClient):
@@ -567,9 +573,11 @@ class MPClient(EngineCoreClient):
 
     def _format_exception(self, e: Exception) -> Exception:
         """If errored, use EngineDeadError so root cause is clear."""
-        return (
-            EngineDeadError(suppress_context=True) if self.resources.engine_dead else e
-        )
+        if self.resources.engine_dead:
+            # Preserve EngineDeadError if it already has context (e.g. error msg
+            # extracted from ENGINE_CORE_DEAD signal), otherwise use a generic one.
+            return e if isinstance(e, EngineDeadError) else EngineDeadError(suppress_context=True)
+        return e
 
     def ensure_alive(self):
         if self.resources.engine_dead:

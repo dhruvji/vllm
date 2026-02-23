@@ -25,8 +25,44 @@ from pathlib import Path as StdPath
 
 import filelock
 import torch
+from safetensors.torch import load as safetensors_load
 
 from vllm.path import ModalVolumePath, Path
+
+
+def _load_adapter(path: str | StdPath, **kwargs) -> dict:
+    """Load adapter from .pt (torch) or .safetensors format.
+
+    For safetensors we read the entire file into memory first and
+    deserialize from bytes.  This avoids mmap, which keeps file
+    descriptors open and blocks Modal volume reloads.
+    """
+    path_str = str(path)
+    if path_str.endswith(".safetensors"):
+        data = _read_file_bytes(path_str)
+        return safetensors_load(data)
+    return torch.load(path_str, map_location="cpu", **kwargs)
+
+
+_HOT_CHECKPOINTS_MOUNT = "/hot-checkpoints"
+
+
+def _read_file_bytes(path: str) -> bytes:
+    """Read file bytes, using Modal Volume API for hot-checkpoint paths.
+
+    For paths on the hot-checkpoints volume, bypasses FUSE and reads via
+    the Modal API.  This always sees committed data without needing
+    vol.reload() (which fails when files are open).
+    """
+    if path.startswith(_HOT_CHECKPOINTS_MOUNT):
+        import modal
+
+        vol = modal.Volume.from_name("torchtitan-hot-checkpoints-v2", version=2)
+        rel = path[len(_HOT_CHECKPOINTS_MOUNT):].lstrip("/")
+        chunks = list(vol.read_file(rel))
+        return b"".join(chunks)
+    with open(path, "rb") as f:
+        return f.read()
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +113,7 @@ def _reload_hot_checkpoints_volume(min_interval: float = 5.0) -> bool:
                 if _cached_volume is None:
                     import modal
                     _cached_volume = modal.Volume.from_name(
-                        "torchtitan-hot-checkpoints-v2"
+                        "torchtitan-hot-checkpoints-v2", version=2
                     )
                 _cached_volume.reload()
                 _volume_reload_time = time.monotonic()
@@ -299,7 +335,7 @@ class AdapterManager:
 
                 # Load the adapter
                 try:
-                    data = torch.load(cache_path, map_location="cpu")
+                    data = _load_adapter(cache_path)
                     return data
                 except Exception as e:
                     # If loading failed, try re-downloading once
@@ -311,7 +347,7 @@ class AdapterManager:
                             if cache_path.exists():
                                 cache_path.unlink()
                             _copy_with_progress(reason="retry_after_load_failure")
-                            data = torch.load(cache_path, map_location="cpu")
+                            data = _load_adapter(cache_path)
                             return data
                         except Exception as retry_e:
                             _cleanup_temp_files()
@@ -328,7 +364,7 @@ class AdapterManager:
 
             local_path = source_path.local_path
             if not source_path.exists():
-                if _reload_hot_checkpoints_volume():
+                if _reload_hot_checkpoints_volume(min_interval=0):
                     if not source_path.exists():
                         raise FileNotFoundError(
                             f"Modal volume adapter not found: {adapter_id} "
@@ -346,7 +382,7 @@ class AdapterManager:
                 local_path,
             )
             try:
-                data = torch.load(local_path, map_location="cpu")
+                data = _load_adapter(local_path)
                 return data
             except Exception as e:
                 logger.error(
@@ -356,25 +392,14 @@ class AdapterManager:
                 )
                 raise
 
-        # For local paths, load directly
+        # For local paths, load directly.  _load_adapter uses the Modal
+        # Volume API for hot-checkpoint paths, bypassing FUSE entirely,
+        # so the file doesn't need to be visible on the local mount.
         else:
-            if not source_path.exists():
-                # Adapter may have been committed to a Modal volume by another
-                # container but our local mount is stale.  Reload once & retry.
-                if _reload_hot_checkpoints_volume():
-                    if not source_path.exists():
-                        raise FileNotFoundError(
-                            f"Local adapter not found: {adapter_id}"
-                        )
-                else:
-                    raise FileNotFoundError(
-                        f"Local adapter not found: {adapter_id}"
-                    )
-
-            logger.info("Loading adapter from local path: %s", adapter_id)
+            adapter_str = str(source_path)
+            logger.info("Loading adapter from local path: %s", adapter_str)
             try:
-                # For local paths, we can use the path directly as it's file-like
-                data = torch.load(str(source_path), map_location="cpu")
+                data = _load_adapter(source_path)
                 return data
             except Exception as e:
                 logger.error("Failed to load local adapter: %s", e)
