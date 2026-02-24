@@ -178,29 +178,40 @@ class CompilerManager:
 
         if not disable_cache and os.path.exists(self.cache_file_path):
             # load the cache from the file
-            with open(self.cache_file_path) as f:
-                # we use ast.literal_eval to parse the data
-                # because it is a safe way to parse Python literals.
-                # do not use eval(), it is unsafe.
-                cache = ast.literal_eval(f.read())
+            try:
+                with open(self.cache_file_path) as f:
+                    # we use ast.literal_eval to parse the data
+                    # because it is a safe way to parse Python literals.
+                    # do not use eval(), it is unsafe.
+                    cache = ast.literal_eval(f.read())
 
-            def check_type(value: Any, ty: type) -> None:
-                if not isinstance(value, ty):
-                    raise TypeError(f"Expected {ty} but got {type(value)} for {value}")
+                def check_type(value: Any, ty: type) -> None:
+                    if not isinstance(value, ty):
+                        raise TypeError(
+                            f"Expected {ty} but got {type(value)} for {value}"
+                        )
 
-            def parse_key(key: Any) -> tuple[Range, int, str]:
-                range_tuple, graph_index, compiler_name = key
-                check_type(graph_index, int)
-                check_type(compiler_name, str)
-                if isinstance(range_tuple, tuple):
-                    start, end = range_tuple
-                    check_type(start, int)
-                    check_type(end, int)
-                    range_tuple = Range(start=start, end=end)
-                check_type(range_tuple, Range)
-                return range_tuple, graph_index, compiler_name
+                def parse_key(key: Any) -> tuple[Range, int, str]:
+                    range_tuple, graph_index, compiler_name = key
+                    check_type(graph_index, int)
+                    check_type(compiler_name, str)
+                    if isinstance(range_tuple, tuple):
+                        start, end = range_tuple
+                        check_type(start, int)
+                        check_type(end, int)
+                        range_tuple = Range(start=start, end=end)
+                    check_type(range_tuple, Range)
+                    return range_tuple, graph_index, compiler_name
 
-            self.cache = {parse_key(key): value for key, value in cache.items()}
+                self.cache = {
+                    parse_key(key): value for key, value in cache.items()
+                }
+            except Exception:
+                logger.warning(
+                    "Corrupt compile cache file %s, deleting and recompiling",
+                    self.cache_file_path,
+                )
+                os.remove(self.cache_file_path)
 
         self.compiler.initialize_cache(
             cache_dir=cache_dir, disable_cache=disable_cache, prefix=prefix
@@ -211,8 +222,14 @@ class CompilerManager:
             return
         printer = pprint.PrettyPrinter(indent=4)
         data = printer.pformat(self.cache)
-        with open(self.cache_file_path, "w") as f:
+        # Atomic write: write to temp file then rename, so concurrent
+        # readers never see a partially-written cache file.
+        tmp_path = self.cache_file_path + ".tmp"
+        with open(tmp_path, "w") as f:
             f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self.cache_file_path)
 
     def load(
         self,
