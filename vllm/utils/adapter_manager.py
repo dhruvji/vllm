@@ -30,14 +30,38 @@ from safetensors.torch import load as safetensors_load
 from vllm.path import ModalVolumePath, Path
 
 
+def _resolve_adapter_path(path: str | StdPath) -> str:
+    """Resolve adapter path, handling directories transparently.
+
+    If *path* points to a directory, looks for ``model.pt`` or
+    ``adapter_model.safetensors`` inside it.  Otherwise returns
+    the path as-is.  This lets callers pass either a directory
+    (e.g. an S3 prefix / checkpoint dir) or a direct file path.
+    """
+    p = StdPath(path)
+    if p.is_dir():
+        for candidate in ("model.pt", "adapter_model.safetensors"):
+            child = p / candidate
+            if child.exists():
+                return str(child)
+        raise FileNotFoundError(
+            f"Adapter directory {path} does not contain model.pt "
+            f"or adapter_model.safetensors"
+        )
+    return str(path)
+
+
 def _load_adapter(path: str | StdPath, **kwargs) -> dict:
     """Load adapter from .pt (torch) or .safetensors format.
+
+    If *path* is a directory, automatically resolves to ``model.pt``
+    or ``adapter_model.safetensors`` inside it.
 
     For safetensors we read the entire file into memory first and
     deserialize from bytes.  This avoids mmap, which keeps file
     descriptors open and blocks Modal volume reloads.
     """
-    path_str = str(path)
+    path_str = _resolve_adapter_path(path)
     if path_str.endswith(".safetensors"):
         data = _read_file_bytes(path_str)
         return safetensors_load(data)
