@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import faulthandler
 import os
 import queue
 import signal
+import sys
+import traceback
 import threading
 import time
 from collections import deque
@@ -1086,6 +1089,7 @@ class EngineCoreProc(EngineCore):
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
+        faulthandler.enable(file=sys.stderr, all_threads=True)
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
@@ -1286,10 +1290,15 @@ class EngineCoreProc(EngineCore):
             exception: The exception that caused the engine to die. If provided,
                       the error message will be propagated to the client.
         """
-        # Include the exception message if available for better debugging
+        # Include the full traceback if available for better debugging
         if exception is not None:
             # Format: ENGINE_CORE_DEAD:<error_message>
-            error_msg = f"{type(exception).__name__}: {exception}"
+            error_msg = "".join(
+                traceback.format_exception(type(exception), exception,
+                                           exception.__traceback__))
+            # Also flush to stderr to ensure it's visible in server logs
+            sys.stderr.write(f"EngineCore fatal error:\n{error_msg}")
+            sys.stderr.flush()
             dead_signal = (
                 EngineCoreProc.ENGINE_CORE_DEAD
                 + b":"

@@ -580,20 +580,28 @@ class LoRAModelManager:
     def _create_merged_loras_inplace(self, lora_model: LoRAModel) -> None:
         for module_name, new_module_names in self.packed_modules.items():
             replacement_loras: list[LoRALayerWeights | None] = []
-            replaced_module: set[str] = set()
-            has_replacement = False
+            present_modules: list[str] = []
             for r in new_module_names:
                 lora = self._get_lora_layer_weights(lora_model, r)
                 replacement_loras.append(lora)
                 if lora:
-                    has_replacement = True
-                    replaced_module.add(r)
-            if not has_replacement:
+                    present_modules.append(r)
+            if not present_modules:
                 continue
-            for i in range(len(replacement_loras)):
-                if replacement_loras[i]:
-                    continue
-                replacement_loras[i] = None
+
+            # Fail fast on partial packed-module adapters. A partial adapter can
+            # silently apply only a subset of qkv/gate_up/etc. and produce
+            # incorrect behavior while still "loading successfully".
+            if len(present_modules) != len(new_module_names):
+                missing_modules = [
+                    m for m, lora in zip(new_module_names, replacement_loras) if lora is None
+                ]
+                raise ValueError(
+                    "Partial LoRA detected for packed module "
+                    f"'{module_name}': expected {new_module_names}, "
+                    f"present={present_modules}, missing={missing_modules}. "
+                    "This adapter is invalid and loading is aborted."
+                )
             # HACK Temporary solution for the pool model.
             if self.is_pooling_model and not lora_model.check_lora_name(module_name):
                 replaced_module_name = module_name.replace("model.", "")
@@ -614,7 +622,7 @@ class LoRAModelManager:
                     replacement_loras
                 )
             # Remove the modules that have been replaced.
-            for module in replaced_module:
+            for module in present_modules:
                 lora_model.loras.pop(module, None)
 
         for lora in lora_model.loras.values():

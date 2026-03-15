@@ -12,6 +12,7 @@ from typing import Literal
 from vllm.config.lora import LoRAConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+from vllm.path import Path
 
 logger = init_logger(__name__)
 
@@ -105,7 +106,7 @@ class PEFTHelper:
             )
 
         else:
-            with open(lora_config_path) as f:
+            with Path(lora_config_path).open("r") as f:
                 config = json.load(f)
 
         config["vllm_max_position_embeddings"] = max_position_embeddings

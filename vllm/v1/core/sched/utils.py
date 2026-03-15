@@ -56,7 +56,7 @@ def check_stop(request: Request, max_model_len: int) -> bool:
         request.stop_reason = last_token_id
         return True
     if (
-        request.num_tokens >= max_model_len
+        request.num_tokens + request.cartridge_seq_len >= max_model_len
         or request.num_output_tokens >= request.max_tokens
     ):
         request.status = RequestStatus.FINISHED_LENGTH_CAPPED

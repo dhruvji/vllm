@@ -30,7 +30,7 @@ import boto3
 import torch
 
 from vllm.logger import init_logger
-from vllm.path import ModalVolumePath
+from vllm.path import Path
 from vllm.utils.adapter_manager import get_adapter_manager
 
 logger = init_logger(__name__)
@@ -722,8 +722,8 @@ def _resolve_s3_glob(s3_pattern: str) -> str | None:
 def _resolve_modal_glob(modal_pattern: str) -> str | None:
     """Resolve Modal volume glob to most recent matching file.
 
-    For modal:// paths, use local glob since the volume is mounted locally.
-    Also checks for latest.txt file for dynamic checkpoint resolution.
+    Uses the active path backend for modal:// paths and checks for latest.txt
+    for dynamic checkpoint resolution.
 
     Args:
         modal_pattern: Modal URI with optional * glob
@@ -740,57 +740,60 @@ def _resolve_modal_glob(modal_pattern: str) -> str | None:
         return modal_pattern
 
     try:
-        # Parse modal://volume-name/path/step-*/model.pt
-        modal_path = ModalVolumePath(modal_pattern)
-        local_pattern = modal_path.local_path
+        without_prefix = modal_pattern[8:]
+        volume_name, _, remainder = without_prefix.partition("/")
 
-        # First check for latest.txt in the base directory (before the glob)
-        # e.g., /hot-checkpoints/step-*/model.pt -> /hot-checkpoints/latest.txt
-        # Find the directory before the first glob component
-        parts = local_pattern.split("/")
-        base_parts = []
-        for part in parts:
+        pattern_parts = remainder.split("/") if remainder else []
+        base_parts: list[str] = []
+        for part in pattern_parts:
             if "*" in part:
                 break
             base_parts.append(part)
-        base_dir = "/".join(base_parts) or "/"
-        latest_txt = os.path.join(base_dir, "latest.txt")
-        if os.path.exists(latest_txt):
+
+        base_prefix = f"modal://{volume_name}"
+        if base_parts:
+            base_prefix = f"{base_prefix}/{'/'.join(base_parts)}"
+
+        latest_txt = Path(f"{base_prefix}/latest.txt")
+        if latest_txt.isfile():
             try:
-                with open(latest_txt) as f:
-                    latest_path = f.read().strip()
-                if os.path.exists(latest_path):
-                    # Convert back to modal:// path
-                    mount_path = modal_path._get_mounts().get(
-                        modal_path.volume_name,
-                        f"/{modal_path.volume_name}",
+                latest_path = latest_txt.read_text().strip()
+                if latest_path.startswith("modal://"):
+                    if Path(latest_path).exists():
+                        logger.info(
+                            f"Resolved {modal_pattern} -> {latest_path} (via latest.txt)"
+                        )
+                        return latest_path
+                elif latest_path.startswith("/"):
+                    latest_parts = latest_path.strip("/").split("/", 1)
+                    rel_path = latest_parts[1] if len(latest_parts) > 1 else ""
+                    candidate = (
+                        f"modal://{volume_name}/{rel_path}"
+                        if rel_path
+                        else f"modal://{volume_name}"
                     )
-                    rel_path = latest_path[len(mount_path) :].lstrip("/")
-                    resolved = f"modal://{modal_path.volume_name}/{rel_path}"
-                    logger.info(
-                        f"Resolved {modal_pattern} -> {resolved} (via latest.txt)"
-                    )
-                    return resolved
+                    if Path(candidate).exists():
+                        logger.info(
+                            f"Resolved {modal_pattern} -> {candidate} (via latest.txt)"
+                        )
+                        return candidate
+                elif latest_path:
+                    candidate = f"modal://{volume_name}/{latest_path.lstrip('/')}"
+                    if Path(candidate).exists():
+                        logger.info(
+                            f"Resolved {modal_pattern} -> {candidate} (via latest.txt)"
+                        )
+                        return candidate
             except Exception as e:
                 logger.debug(f"Could not read latest.txt: {e}")
 
-        # Fallback: use local glob
-        matches = globlib.glob(local_pattern)
+        glob_root = Path(base_prefix)
+        relative_pattern = "/".join(pattern_parts[len(base_parts) :]) or "*"
+        matches = sorted(str(path) for path in glob_root.glob(relative_pattern))
         if not matches:
             return None
 
-        # Sort by modification time (newest first)
-        matches_with_mtime = [(os.path.getmtime(m), m) for m in matches]
-        matches_with_mtime.sort(reverse=True)
-        latest_local = matches_with_mtime[0][1]
-
-        # Convert back to modal:// path
-        mount_path = modal_path._get_mounts().get(
-            modal_path.volume_name,
-            f"/{modal_path.volume_name}",
-        )
-        rel_path = latest_local[len(mount_path) :].lstrip("/")
-        resolved = f"modal://{modal_path.volume_name}/{rel_path}"
+        resolved = matches[-1]
 
         logger.info(f"Resolved {modal_pattern} -> {resolved} (via glob)")
         return resolved

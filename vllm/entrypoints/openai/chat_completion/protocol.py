@@ -73,9 +73,6 @@ class ChatCompletionLogProb(OpenAIBaseModel):
 
 
 class ChatCompletionLogProbsContent(ChatCompletionLogProb):
-    # Workaround: redefine fields name cache so that it's not
-    # shared with the super class.
-    field_names: ClassVar[set[str] | None] = None
     top_logprobs: list[ChatCompletionLogProb] = Field(default_factory=list)
 
 

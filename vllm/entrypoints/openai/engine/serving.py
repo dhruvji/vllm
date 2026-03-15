@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import hashlib
 import json
+import os
+import shutil
 import sys
+import tempfile
+import threading
 import time
 import traceback
+from collections import OrderedDict
+from pathlib import Path
 from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -137,6 +144,22 @@ class GenerationError(Exception):
 
 logger = init_logger(__name__)
 
+_REMOTE_LORA_SCHEMES = ("s3://", "gs://")
+_LORA_WEIGHT_SUFFIXES = (".safetensors", ".pt", ".bin")
+
+
+def _normalize_lora_runtime_path(path: str) -> str:
+    """Return the directory path that the worker-side PEFT loader expects."""
+    normalized = path.rstrip("/")
+    if normalized.endswith(_LORA_WEIGHT_SUFFIXES):
+        return normalized.rsplit("/", 1)[0] if "/" in normalized else "."
+    return normalized
+
+
+def _requires_staged_lora_dir(path: str) -> bool:
+    """Return True when the worker cannot consume the source path directly."""
+    return path.startswith(_REMOTE_LORA_SCHEMES)
+
 
 class RendererRequest(Protocol):
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
@@ -250,9 +273,16 @@ class OpenAIServing:
         self.max_model_len = self.model_config.max_model_len
         # Track cartridges that have already sent KV to engine core.
         # Bounded to prevent unbounded memory growth with frequent checkpoint updates.
-        from collections import OrderedDict
         self._sent_cartridge_ids: OrderedDict[str, str | None] = OrderedDict()
         self._sent_cartridge_ids_max_size: int = 8
+        # Track prepared LoRA directories to avoid repeatedly loading and
+        # re-serializing the same adapter on every request.
+        self._prepared_lora_dirs: OrderedDict[str, str] = OrderedDict()
+        self._prepared_lora_dirs_max_size: int = 8
+        # Per-adapter locks to prevent concurrent threads from racing to
+        # stage the same adapter simultaneously (shutil.rmtree race).
+        self._lora_staging_locks: dict[str, threading.Lock] = {}
+        self._lora_staging_locks_meta = threading.Lock()
 
     async def _process_adapters(
         self,
@@ -308,7 +338,7 @@ class OpenAIServing:
 
         # Process LoRA adapters
         lora_specs = adapters_config.get("lora")
-        lora_request = self._process_lora(
+        lora_request = await self._process_lora(
             lora_specs=lora_specs,
             request_id=request_id,
         )
@@ -505,7 +535,111 @@ class OpenAIServing:
             logger.error("Failed to process cartridges: %s", e)
             raise RuntimeError(f"Failed to process cartridges: {e}") from e
 
-    def _process_lora(
+    def _prepare_staged_lora_dir(
+        self,
+        lora_id: str,
+        force_redownload: bool,
+    ) -> str:
+        from safetensors.torch import save_file as safetensors_save_file
+
+        from vllm.utils.adapter_manager import get_adapter_manager
+
+        lora_hash = hashlib.sha256(lora_id.encode()).hexdigest()[:16]
+        lora_cache_dir = envs.VLLM_LORA_RESOLVER_CACHE_DIR or tempfile.gettempdir()
+        local_lora_dir = Path(lora_cache_dir) / lora_hash
+        adapter_model_path = local_lora_dir / "adapter_model.safetensors"
+        adapter_config_path = local_lora_dir / "adapter_config.json"
+
+        def _can_reuse() -> bool:
+            cached = self._prepared_lora_dirs.get(lora_id)
+            return (
+                not force_redownload
+                and cached == str(local_lora_dir)
+                and adapter_model_path.exists()
+                and adapter_config_path.exists()
+            )
+
+        # Fast path: reuse already-staged adapter without acquiring the lock.
+        if _can_reuse():
+            self._prepared_lora_dirs.move_to_end(lora_id)  # LRU touch
+            logger.debug(
+                "[LoRA] reusing prepared adapter directory: %s",
+                local_lora_dir,
+            )
+            return str(local_lora_dir)
+
+        # Acquire a per-adapter lock so concurrent threads for the same
+        # lora_id serialize instead of racing to rmtree + re-stage.
+        with self._lora_staging_locks_meta:
+            if lora_id not in self._lora_staging_locks:
+                self._lora_staging_locks[lora_id] = threading.Lock()
+            lock = self._lora_staging_locks[lora_id]
+
+        with lock:
+            # Double-check after acquiring lock: a sibling thread may have
+            # already staged the adapter while we were waiting.
+            if _can_reuse():
+                self._prepared_lora_dirs.move_to_end(lora_id)
+                logger.debug(
+                    "[LoRA] reusing prepared adapter directory (post-lock): %s",
+                    local_lora_dir,
+                )
+                return str(local_lora_dir)
+
+            if lora_id in self._prepared_lora_dirs:
+                self._prepared_lora_dirs.pop(lora_id, None)
+
+            manager = get_adapter_manager()
+            logger.info(
+                "[LoRA] staging adapter_id=%s force=%s",
+                lora_id,
+                force_redownload,
+            )
+            lora_data = manager.get_adapter(
+                adapter_id=lora_id,
+                force_redownload=force_redownload,
+            )
+            logger.info(
+                "[LoRA] got %d keys: %s, shapes: %s",
+                len(lora_data),
+                list(lora_data.keys())[:5],
+                {k: v.shape for k, v in list(lora_data.items())[:5]},
+            )
+
+            if local_lora_dir.exists():
+                shutil.rmtree(local_lora_dir)
+            local_lora_dir.mkdir(parents=True, exist_ok=True)
+
+            safetensors_save_file(lora_data, str(adapter_model_path))
+
+            source_dir = _normalize_lora_runtime_path(lora_id)
+            config_ids = [
+                os.path.join(source_dir, "adapter_config.json"),
+                os.path.join(source_dir, "lora_config.json"),
+            ]
+            last_error = None
+            for config_id in config_ids:
+                try:
+                    manager.download_json(
+                        json_id=config_id,
+                        target_path=adapter_config_path,
+                    )
+                    break
+                except Exception as e:
+                    last_error = e
+            else:
+                raise RuntimeError(
+                    "Failed to download LoRA config from any known path "
+                    f"{config_ids}: {last_error}"
+                ) from last_error
+
+            self._prepared_lora_dirs[lora_id] = str(local_lora_dir)
+            self._prepared_lora_dirs.move_to_end(lora_id)  # LRU touch
+            while len(self._prepared_lora_dirs) > self._prepared_lora_dirs_max_size:
+                self._prepared_lora_dirs.popitem(last=False)
+            return str(local_lora_dir)
+
+    async def _process_lora(
         self,
         lora_specs: list[dict[str, Any]] | None,
         request_id: str | None = None,
@@ -524,7 +658,7 @@ class OpenAIServing:
             return None
 
         from vllm.logger import init_logger
-        from vllm.utils.adapter_manager import get_adapter_manager
+        from vllm.v1.cartridge_loader import _resolve_glob
 
         logger = init_logger(__name__)
 
@@ -547,92 +681,30 @@ class OpenAIServing:
                 logger.error("LoRA adapter spec missing 'id' field")
                 return None
 
-            # Download/load the LoRA adapter directory
-            # (contains adapter_model.pt + adapter_config.json)
-            manager = get_adapter_manager()
+            resolved_id = await asyncio.to_thread(_resolve_glob, lora_id)
+            if resolved_id is None:
+                raise RuntimeError(f"Could not resolve LoRA glob: {lora_id}")
+            if resolved_id != lora_id:
+                logger.info("Using LoRA: %s -> %s", lora_id, resolved_id)
 
-            import hashlib
-            import os
-            import tempfile
-            from pathlib import Path
-
-            import torch
-
-            import vllm.envs as envs
-
-            # Create a unique local path for this LoRA adapter
-            # Use persistent cache directory if configured, otherwise fall back to /tmp
-            lora_hash = hashlib.sha256(lora_id.encode()).hexdigest()[:16]
-            lora_cache_dir = envs.VLLM_LORA_RESOLVER_CACHE_DIR or tempfile.gettempdir()
-            local_lora_dir = Path(lora_cache_dir) / lora_hash
-            local_lora_dir.mkdir(parents=True, exist_ok=True)
-            logger.info("LoRA adapter storage directory: %s", local_lora_dir)
-
-            # Download model.pt and lora_config.json from S3,
-            # save as adapter_model.pt and adapter_config.json (vLLM format)
-            adapter_model_path = local_lora_dir / "adapter_model.pt"
-            adapter_config_path = local_lora_dir / "adapter_config.json"
-
-            if not adapter_model_path.exists() or force_redownload:
-                # lora_id should be a directory path (e.g., s3://bucket/path/to/checkpoint)
-                # We need to download model.pt from that directory (S3 naming)
-
-                # Download model.pt from S3, save as adapter_model.pt locally
-                adapter_model_id = (
-                    os.path.join(lora_id, "model.pt")
-                    if not lora_id.endswith(".pt")
-                    else lora_id
+            if _requires_staged_lora_dir(resolved_id):
+                runtime_lora_path = await asyncio.to_thread(
+                    self._prepare_staged_lora_dir,
+                    resolved_id,
+                    force_redownload,
                 )
+            else:
+                runtime_lora_path = _normalize_lora_runtime_path(resolved_id)
 
-                lora_data = manager.get_adapter(
-                    adapter_id=adapter_model_id,
-                    force_redownload=force_redownload,
-                )
+            logger.debug("LoRA runtime path: %s", runtime_lora_path)
 
-                torch.save(lora_data, adapter_model_path)
-
-                # Download lora_config.json from S3,
-                # save as adapter_config.json locally (vLLM format)
-                # If lora_id ends with .pt, use its directory;
-                # otherwise use lora_id as-is
-                lora_dir = (
-                    os.path.dirname(lora_id) if lora_id.endswith(".pt") else lora_id
-                )
-                adapter_config_id = os.path.join(lora_dir, "lora_config.json")
-
-                try:
-                    manager.download_json(
-                        json_id=adapter_config_id,
-                        target_path=adapter_config_path,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Failed to download lora_config.json: %s. "
-                        "vLLM may fail to load LoRA.",
-                        e,
-                    )
-
-            # Verify files exist before creating LoRARequest
-            if not adapter_model_path.exists():
-                raise FileNotFoundError(
-                    f"adapter_model.pt not found at {adapter_model_path}"
-                )
-            if not adapter_config_path.exists():
-                logger.warning(
-                    "adapter_config.json not found at %s, vLLM may fail to load LoRA",
-                    adapter_config_path,
-                )
-
-            # Create LoRARequest
-            # Generate a stable int ID based on lora_id only (not request_id)
-            # This ensures the same LoRA gets the same ID across all requests,
-            # allowing vLLM to reuse the loaded LoRA instead of reloading it
-            lora_int_id = hash(lora_id) & 0x7FFFFFFF  # Positive int
+            # Generate a stable int ID so vLLM reuses loaded LoRA across requests.
+            lora_int_id = hash(resolved_id) & 0x7FFFFFFF
 
             lora_request = LoRARequest(
-                lora_name=lora_id,  # Use full lora_id for better traceability
+                lora_name=resolved_id,
                 lora_int_id=lora_int_id,
-                lora_path=f"{str(local_lora_dir)}/",  # vLLM expects directory path
+                lora_path=runtime_lora_path,
             )
 
             return lora_request

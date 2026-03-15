@@ -27,7 +27,40 @@ import filelock
 import torch
 from safetensors.torch import load as safetensors_load
 
-from vllm.path import ModalVolumePath, Path
+from vllm.path import Path
+
+
+def _resolve_adapter_file(path_str: str) -> str:
+    """If path is a directory, resolve to the best adapter file inside it.
+
+    Prefers adapter_model.safetensors, then model.pt.
+    Returns path unchanged if it already points to a file.
+    """
+    # Quick check: if it looks like a file path already, return as-is.
+    if path_str.endswith((".safetensors", ".pt", ".bin")):
+        logger.info("[resolve] path is already a file: %s", path_str)
+        return path_str
+
+    candidates = (
+        "adapter_model.safetensors",
+        "model.safetensors",
+        "adapter_model.bin",
+        "adapter_model.pt",
+        "model.pt",
+    )
+
+    path = Path(path_str)
+
+    if path.isdir():
+        for candidate in candidates:
+            candidate_path = path / candidate
+            if candidate_path.isfile():
+                size = candidate_path.size
+                logger.info("[resolve] found local %s: %d bytes", candidate_path, size)
+                return str(candidate_path)
+        raise FileNotFoundError(f"No adapter file found in directory: {path_str}")
+
+    return path_str
 
 
 def _resolve_adapter_path(path: str | StdPath) -> str:
@@ -54,107 +87,53 @@ def _resolve_adapter_path(path: str | StdPath) -> str:
 def _load_adapter(path: str | StdPath, **kwargs) -> dict:
     """Load adapter from .pt (torch) or .safetensors format.
 
-    If *path* is a directory, automatically resolves to ``model.pt``
-    or ``adapter_model.safetensors`` inside it.
-
+    If path is a directory, resolves to the best file inside it.
     For safetensors we read the entire file into memory first and
-    deserialize from bytes.  This avoids mmap, which keeps file
-    descriptors open and blocks Modal volume reloads.
+    deserialize from bytes.
     """
-    path_str = _resolve_adapter_path(path)
+    path_str = _resolve_adapter_file(str(path))
+    path_obj = Path(path_str)
+    logger.info("[load_adapter] resolved path: %s", path_str)
     if path_str.endswith(".safetensors"):
         data = _read_file_bytes(path_str)
-        return safetensors_load(data)
-    return torch.load(path_str, map_location="cpu", **kwargs)
-
-
-_HOT_CHECKPOINTS_MOUNT = "/hot-checkpoints"
+        logger.info(
+            "[load_adapter] safetensors bytes: %d, first16=%s, last16=%s",
+            len(data),
+            data[:16].hex(),
+            data[-16:].hex() if len(data) >= 16 else data.hex(),
+        )
+        result = safetensors_load(data)
+        logger.info(
+            "[load_adapter] safetensors loaded: %d keys, keys=%s",
+            len(result),
+            list(result.keys())[:5],
+        )
+        return result
+    with path_obj.open("rb") as f:
+        return torch.load(f, map_location="cpu", **kwargs)
 
 
 def _read_file_bytes(path: str) -> bytes:
-    """Read file bytes, using Modal Volume API for hot-checkpoint paths.
-
-    For paths on the hot-checkpoints volume, bypasses FUSE and reads via
-    the Modal API.  This always sees committed data without needing
-    vol.reload() (which fails when files are open).
-    """
-    if path.startswith(_HOT_CHECKPOINTS_MOUNT):
-        import modal
-
-        vol = modal.Volume.from_name("torchtitan-hot-checkpoints-v2", version=2)
-        rel = path[len(_HOT_CHECKPOINTS_MOUNT):].lstrip("/")
-        chunks = list(vol.read_file(rel))
-        return b"".join(chunks)
-    with open(path, "rb") as f:
-        return f.read()
+    """Read file bytes via the configured path backend."""
+    data = Path(path).read_bytes()
+    logger.info("[read_file_bytes] %s: %d bytes", path, len(data))
+    return data
 
 logger = logging.getLogger(__name__)
 
-# Coalesced volume reload: many concurrent requests may discover a missing
-# adapter at the same time.  Only ONE reload runs in a background thread
-# so it doesn't block the GIL and stall vLLM's engine.
-_volume_reload_lock = threading.Lock()
-_volume_reload_time: float = 0  # last successful reload timestamp
-_volume_reload_done = threading.Event()
-_volume_reload_done.set()  # initially "done" (no reload in progress)
-_cached_volume = None  # avoid repeated modal.Volume.from_name() network calls
+MODAL_LOAD_RETRY_DELAY_SECONDS = 5.0
 
 
-def _reload_hot_checkpoints_volume(min_interval: float = 5.0) -> bool:
-    """Trigger a hot-checkpoints volume reload if not reloaded recently.
-
-    The reload runs in a background thread to avoid blocking the GIL.
-    Waits up to 30s for the reload to complete before returning.
-
-    Returns True if a reload completed (or recently completed),
-    False if skipped or failed.
-    """
-    global _volume_reload_time, _cached_volume
-    now = time.monotonic()
-    if now - _volume_reload_time < min_interval:
-        return False  # Already reloaded recently
-
-    # Wait if another thread is already reloading
-    if not _volume_reload_done.is_set():
-        _volume_reload_done.wait(timeout=30)
-        return _volume_reload_time > now  # True if reload happened while we waited
-
-    if not _volume_reload_lock.acquire(blocking=False):
-        # Another thread just started — wait for it
-        _volume_reload_done.wait(timeout=30)
-        return _volume_reload_time > now
-
-    try:
-        # Double-check after acquiring lock
-        if time.monotonic() - _volume_reload_time < min_interval:
-            return True
-
-        _volume_reload_done.clear()
-
-        def _do_reload():
-            global _volume_reload_time, _cached_volume
-            try:
-                if _cached_volume is None:
-                    import modal
-                    _cached_volume = modal.Volume.from_name(
-                        "torchtitan-hot-checkpoints-v2", version=2
-                    )
-                _cached_volume.reload()
-                _volume_reload_time = time.monotonic()
-                logger.info("Reloaded hot-checkpoints volume")
-            except Exception as e:
-                logger.warning("Failed to reload hot-checkpoints volume: %s", e)
-            finally:
-                _volume_reload_done.set()
-
-        t = threading.Thread(target=_do_reload, daemon=True)
-        t.start()
-    finally:
-        _volume_reload_lock.release()
-
-    # Wait for the background reload to finish
-    _volume_reload_done.wait(timeout=30)
-    return time.monotonic() - _volume_reload_time < min_interval
+def _normalize_adapter_id(adapter_id: str) -> str:
+    """Trim accidental surrounding whitespace without changing the path body."""
+    normalized = adapter_id.strip()
+    if normalized != adapter_id:
+        logger.warning(
+            "Normalized adapter path by trimming surrounding whitespace: %r -> %r",
+            adapter_id,
+            normalized,
+        )
+    return normalized
 
 
 class AdapterManager:
@@ -203,8 +182,12 @@ class AdapterManager:
         Returns:
             Path to the cached file
         """
-        # Use hash of URI as filename to avoid path traversal issues
+        # Use hash of URI as filename, preserving the original extension so
+        # _load_adapter can pick the right deserializer (safetensors vs torch).
         uri_hash = hashlib.sha256(uri.encode()).hexdigest()
+        for ext in (".safetensors", ".pt", ".bin"):
+            if uri.endswith(ext):
+                return self.cache_dir / f"{uri_hash}{ext}"
         return self.cache_dir / f"{uri_hash}.pt"
 
     def get_adapter(
@@ -234,6 +217,7 @@ class AdapterManager:
             FileNotFoundError: If file doesn't exist
             RuntimeError: If download or loading fails
         """
+        adapter_id = _normalize_adapter_id(adapter_id)
         source_path = Path(adapter_id)
 
         # For S3 paths, use caching (need to download)
@@ -380,41 +364,37 @@ class AdapterManager:
                             ) from retry_e
                     raise RuntimeError(f"Failed to load adapter: {e}") from e
 
-        # For Modal Volume paths, load directly from mount point
+        # For Modal Volume paths, load directly via the path abstraction.
         elif adapter_id.startswith("modal://"):
-            # ModalVolumePath handles translation to local mount path
-            if not isinstance(source_path, ModalVolumePath):
-                source_path = ModalVolumePath(adapter_id)
-
-            local_path = source_path.local_path
-            if not source_path.exists():
-                if _reload_hot_checkpoints_volume(min_interval=0):
-                    if not source_path.exists():
-                        raise FileNotFoundError(
-                            f"Modal volume adapter not found: {adapter_id} "
-                            f"(local path: {local_path})"
+            for attempt in range(2):
+                logger.info("Loading adapter from Modal volume: %s", adapter_id)
+                try:
+                    data = _load_adapter(adapter_id)
+                    return data
+                except FileNotFoundError as e:
+                    if attempt == 0:
+                        logger.warning(
+                            "Modal adapter load failed for %s; waiting %.1fs "
+                            "before retrying: %s",
+                            adapter_id,
+                            MODAL_LOAD_RETRY_DELAY_SECONDS,
+                            e,
                         )
-                else:
-                    raise FileNotFoundError(
-                        f"Modal volume adapter not found: {adapter_id} "
-                        f"(local path: {local_path})"
+                        time.sleep(MODAL_LOAD_RETRY_DELAY_SECONDS)
+                        continue
+                    logger.error(
+                        "Failed to load adapter from Modal volume %s: %s",
+                        adapter_id,
+                        e,
                     )
-
-            logger.info(
-                "Loading adapter from Modal volume: %s (mount: %s)",
-                adapter_id,
-                local_path,
-            )
-            try:
-                data = _load_adapter(local_path)
-                return data
-            except Exception as e:
-                logger.error(
-                    "Failed to load adapter from Modal volume %s: %s",
-                    adapter_id,
-                    e,
-                )
-                raise
+                    raise
+                except Exception as e:
+                    logger.error(
+                        "Failed to load adapter from Modal volume %s: %s",
+                        adapter_id,
+                        e,
+                    )
+                    raise
 
         # For local paths, load directly.  _load_adapter uses the Modal
         # Volume API for hot-checkpoint paths, bypassing FUSE entirely,

@@ -1,13 +1,11 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # From elements -- refactor into shared engrams lib later
-import contextlib
 import fnmatch
 import glob as globlib
 import io
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -88,7 +86,7 @@ class Path:
         raise NotImplementedError
 
     def read(self, mode="r"):
-        assert mode in ["r", "rb"], mode
+        assert mode in "r rb".split(), mode
         with self.open(mode) as f:
             return f.read()
 
@@ -99,7 +97,7 @@ class Path:
         return self.read(mode="rb")
 
     def write(self, content, mode="w"):
-        assert mode in ["w", "a", "wb", "ab"], mode
+        assert mode in "w a wb ab".split(), mode
         with self.open(mode) as f:
             f.write(content)
 
@@ -146,6 +144,14 @@ class Path:
     def move(self, dest, recursive=False):
         self.copy(dest, recursive)
         self.remove(recursive)
+
+    def _optimized_copy_to(self, dest):
+        """Optimized copy to dest. Returns True if handled, False to use fallback."""
+        return False
+
+    def _optimized_copy_from(self, source):
+        """Optimized copy from source. Returns True if handled, False to use fallback."""
+        return False
 
 
 class LocalPath(Path):
@@ -206,6 +212,10 @@ class LocalPath(Path):
         else:
             _copy_across_filesystems(self, dest, recursive)
             self.remove(recursive)
+
+    def _optimized_copy_from(self, source):
+        """Optimized upload from LocalPath to this filesystem."""
+        return False
 
 
 class TFPath(Path):
@@ -292,6 +302,8 @@ def gcs_retry(duration=60):
 GCS_LOCK = threading.RLock()
 GCS_CLIENT = None
 GCS_BUCKETS = {}
+MODAL_VOLUME_LOCKS = {}
+MODAL_VOLUME_LOCKS_GUARD = threading.RLock()
 
 
 class GCSPath(Path):
@@ -388,7 +400,7 @@ class GCSPath(Path):
             raise NotImplementedError(mode)
 
     def write(self, content, mode="w"):
-        assert mode in ["w", "a", "wb", "ab"], mode
+        assert mode in "w a wb ab".split(), mode
         if mode == "a":
             prefix = self.read("r")
             content = prefix + content
@@ -637,8 +649,10 @@ class GCSAppendFile:
         self._wait_until_exists(self.target)
         self._wait_until_exists(self.temp)
         self.target.compose([self.target, self.temp], **gcs_retry())
-        with contextlib.suppress(google.cloud.exceptions.NotFound):
+        try:
             self.temp.delete(**gcs_retry())
+        except google.cloud.exceptions.NotFound:
+            pass
 
     def _wait_until_exists(self, blob, timeout=60):
         start = time.time()
@@ -761,7 +775,7 @@ class S3Path(Path):
             raise NotImplementedError(mode)
 
     def write(self, content, mode="w"):
-        assert mode in ["w", "a", "wb", "ab"], mode
+        assert mode in "w a wb ab".split(), mode
         assert self.bucket_name
         assert self.key
         if mode in ("a", "ab"):
@@ -815,10 +829,9 @@ class S3Path(Path):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
                     relative = key[len(prefix) :] if prefix else key
-                    if (
-                        "/" not in relative.rstrip("/") or pattern.count("/") > 0
-                    ) and fnmatch.fnmatch(relative, pattern):
-                        results.append(key)
+                    if "/" not in relative.rstrip("/") or pattern.count("/") > 0:
+                        if fnmatch.fnmatch(relative, pattern):
+                            results.append(key)
 
         results = sorted(set(results))
         return [type(self)(f"s3://{self.bucket_name}/{key}") for key in results]
@@ -840,7 +853,22 @@ class S3Path(Path):
         try:
             self.client.head_object(Bucket=self.bucket_name, Key=self.key)
             return True
-        except Exception:
+        except self.client.exceptions.NoSuchKey:
+            return False
+        except Exception as e:
+            # 404 errors are expected when checking if paths exist
+            from botocore.exceptions import ClientError
+
+            if isinstance(e, ClientError):
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code in ("404", "NoSuchKey"):
+                    return False
+            # Log only truly unexpected errors
+            import logging
+
+            logging.warning(
+                f"Unexpected error checking if S3 path is file {self}: {type(e).__name__}: {e}"
+            )
             return False
 
     def isdir(self):
@@ -855,12 +883,45 @@ class S3Path(Path):
         try:
             self.client.head_object(Bucket=self.bucket_name, Key=self.key + "/")
             return True
-        except Exception:
+        except self.client.exceptions.NoSuchKey:
             pass
-        response = self.client.list_objects_v2(
-            Bucket=self.bucket_name, Prefix=self.key + "/", MaxKeys=1
-        )
-        return response.get("KeyCount", 0) > 0
+        except Exception as e:
+            # 404 errors are expected when checking if paths exist
+            from botocore.exceptions import ClientError
+
+            if isinstance(e, ClientError):
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code not in ("404", "NoSuchKey"):
+                    import logging
+
+                    logging.warning(
+                        f"Unexpected error in head_object for directory check {self}: {type(e).__name__}: {e}"
+                    )
+            else:
+                import logging
+
+                logging.warning(
+                    f"Unexpected error in head_object for directory check {self}: {type(e).__name__}: {e}"
+                )
+        try:
+            response = self.client.list_objects_v2(
+                Bucket=self.bucket_name, Prefix=self.key + "/", MaxKeys=1
+            )
+            return response.get("KeyCount", 0) > 0
+        except Exception as e:
+            # 404 errors are expected when checking if paths exist
+            from botocore.exceptions import ClientError
+
+            if isinstance(e, ClientError):
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code in ("404", "NoSuchKey"):
+                    return False
+            import logging
+
+            logging.warning(
+                f"Unexpected error in list_objects_v2 for directory check {self}: {type(e).__name__}: {e}"
+            )
+            return False
 
     def mkdir(self, **kwargs):
         assert kwargs.pop("parents", True)
@@ -912,6 +973,59 @@ class S3Path(Path):
             _copy_across_filesystems(self, dest, recursive)
             self.remove(recursive)
 
+    @staticmethod
+    def _progress_callback(total_size: int, path: str):
+        """Create a progress callback for boto3 downloads."""
+
+        class ProgressCallback:
+            def __init__(self):
+                self.total_size = total_size
+                self.downloaded = 0
+                self.path = path
+                self.last_print = 0
+
+            def __call__(self, bytes_transferred: int):
+                self.downloaded += bytes_transferred
+                # Print progress every 5%
+                if self.total_size > 0:
+                    pct = int(100 * self.downloaded / self.total_size)
+                    if pct >= self.last_print + 5:
+                        self.last_print = pct
+                        mb_done = self.downloaded / (1024 * 1024)
+                        mb_total = self.total_size / (1024 * 1024)
+                        print(
+                            f"\r  Downloading: {mb_done:.1f}/{mb_total:.1f} MB ({pct}%)",
+                            end="",
+                            flush=True,
+                        )
+
+        return ProgressCallback()
+
+    def _optimized_copy_to(self, dest):
+        """Optimized download from S3 to dest filesystem."""
+        if isinstance(dest, LocalPath):
+            self.client.download_file(
+                self.bucket_name,
+                self.key,
+                str(dest),
+                Config=self._get_transfer_config(),
+                Callback=self._progress_callback(self.size, str(self)),
+            )
+            return True
+        return False
+
+    def _optimized_copy_from(self, source):
+        """Optimized upload from source filesystem to S3."""
+        if isinstance(source, LocalPath):
+            self.client.upload_file(
+                str(source),
+                self.bucket_name,
+                self.key,
+                Config=self._get_transfer_config(),
+            )
+            return True
+        return False
+
 
 class S3ReadFile:
     def __init__(self, bucket, key, client, mode="r"):
@@ -921,6 +1035,20 @@ class S3ReadFile:
         self.mode = mode
         self.pos = 0
         self.size = None
+
+    @property
+    def s3_path(self) -> str:
+        return f"s3://{self.bucket}/{self.key}"
+
+    def _handle_s3_error(self, e: Exception) -> None:
+        """Convert S3 errors to more readable exceptions."""
+        from botocore.exceptions import ClientError
+
+        if isinstance(e, ClientError):
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code in ("404", "NoSuchKey"):
+                raise FileNotFoundError(f"S3 path not found: {self.s3_path}") from e
+        raise e
 
     def __enter__(self):
         return self
@@ -940,10 +1068,17 @@ class S3ReadFile:
     def tell(self):
         return self.pos
 
+    def _get_size(self) -> int:
+        """Get file size, with proper error handling."""
+        try:
+            response = self.client.head_object(Bucket=self.bucket, Key=self.key)
+            return response["ContentLength"]
+        except Exception as e:
+            self._handle_s3_error(e)
+
     def seek(self, pos, mode=os.SEEK_SET):
         if self.size is None:
-            response = self.client.head_object(Bucket=self.bucket, Key=self.key)
-            self.size = response["ContentLength"]
+            self.size = self._get_size()
 
         if mode == os.SEEK_SET:
             self.pos = pos
@@ -958,8 +1093,7 @@ class S3ReadFile:
 
     def read(self, size=None):
         if self.size is None:
-            response = self.client.head_object(Bucket=self.bucket, Key=self.key)
-            self.size = response["ContentLength"]
+            self.size = self._get_size()
 
         if size is None:
             if self.pos >= self.size:
@@ -1080,29 +1214,401 @@ class S3AppendFile:
         self.buffer.close()
 
 
+class ModalVolumeV2(Path):
+    __slots__ = ("_path", "_volume", "_write_volume")
+
+    SPOOLED_FILE_SIZE = 8 * 1024 * 1024
+
+    def __init__(self, path):
+        super().__init__(path)
+        self._volume = None
+        self._write_volume = None
+
+    @property
+    def volume_name(self):
+        path = str(self)[8:]
+        parts = path.split("/", 1)
+        return parts[0]
+
+    @property
+    def mount_path(self):
+        return f"/{self.volume_name}"
+
+    @property
+    def volume_path(self):
+        path = str(self)[8:]
+        parts = path.split("/", 1)
+        if len(parts) == 1:
+            return ""
+        return parts[1].lstrip("/")
+
+    @property
+    def volume(self):
+        if self._volume is None:
+            import modal
+
+            self._volume = modal.Volume.from_name(
+                self.volume_name, create_if_missing=False, version=2
+            )
+        return self._volume
+
+    @property
+    def write_volume(self):
+        if self._write_volume is None:
+            import modal
+
+            self._write_volume = modal.Volume.from_name(
+                self.volume_name, create_if_missing=True, version=2
+            )
+        return self._write_volume
+
+    def _remote_path(self):
+        if not self.volume_path:
+            return "/"
+        return "/" + self.volume_path
+
+    def _mounted_local_path(self):
+        if not os.path.isdir(self.mount_path):
+            return None
+        local = LocalPath(self.mount_path)
+        if self.volume_path:
+            local = local / self.volume_path
+        return local
+
+    def _volume_lock(self):
+        with MODAL_VOLUME_LOCKS_GUARD:
+            if self.volume_name not in MODAL_VOLUME_LOCKS:
+                MODAL_VOLUME_LOCKS[self.volume_name] = threading.RLock()
+            return MODAL_VOLUME_LOCKS[self.volume_name]
+
+    def _entry_type_name(self, entry):
+        entry_type = entry.type
+        if isinstance(entry_type, str):
+            return entry_type
+        return entry_type.name
+
+    def _reload(self):
+        with self._volume_lock():
+            self.volume.reload()
+
+    def _commit(self):
+        with self._volume_lock():
+            self.write_volume.commit()
+
+    def _list_entries(self, recursive=False):
+        self._reload()
+        path = self.volume_path or "/"
+        return self.volume.listdir(path, recursive=recursive)
+
+    def _exact_entry(self):
+        if not self.volume_path:
+            return None
+        entries = self._list_entries(recursive=False)
+        for entry in entries:
+            if entry.path.rstrip("/") == self.volume_path:
+                return entry
+        return None
+
+    @property
+    def size(self):
+        local = self._mounted_local_path()
+        if local is not None:
+            return local.size
+        entry = self._exact_entry()
+        assert entry is not None, f"Path does not exist: {self}"
+        return entry.size
+
+    def open(self, mode="r"):
+        assert mode in "r rb w wb a ab".split(), mode
+        local = self._mounted_local_path()
+        if local is not None:
+            if "r" in mode and "w" not in mode and "a" not in mode:
+                # Always reload before reading so FUSE reflects the latest
+                # committed state.  Without this, a stale FUSE entry (e.g. an
+                # older, smaller file from a previous training run at the same
+                # path) can be returned, causing safetensors to report
+                # "incomplete metadata, file not fully covered".
+                self._reload()
+                return local.open(mode)
+            else:
+                local.parent.mkdir(parents=True, exist_ok=True)
+                return _ModalMountedWriteFile(self, local.open(mode))
+        if "r" in mode and "w" not in mode and "a" not in mode:
+            return self._open_for_read(mode)
+        return self._open_for_write(mode)
+
+    def _open_for_read(self, mode):
+        self._reload()
+        buffer = tempfile.SpooledTemporaryFile(
+            max_size=self.SPOOLED_FILE_SIZE, mode="w+b"
+        )
+        for chunk in self.volume.read_file(self.volume_path):
+            buffer.write(chunk)
+        buffer.seek(0)
+        if mode == "rb":
+            return buffer
+        return io.TextIOWrapper(buffer, encoding="utf-8")
+
+    def _open_for_write(self, mode):
+        file_obj = _ModalVolumeWriteFile(self, mode)
+        if "b" in mode:
+            return file_obj
+        return io.TextIOWrapper(file_obj, encoding="utf-8")
+
+    def absolute(self):
+        return self
+
+    def glob(self, pattern):
+        local = self._mounted_local_path()
+        if local is not None:
+            root = str(local)
+            results = []
+            for path in local.glob(pattern):
+                relative = str(path)[len(root) :].lstrip("/") if str(path) != root else ""
+                modal_path = f"modal://{self.volume_name}"
+                if self.volume_path:
+                    modal_path += f"/{self.volume_path}"
+                if relative:
+                    modal_path += f"/{relative}"
+                results.append(type(self)(modal_path))
+            return sorted(results)
+        recursive = "**" in pattern
+        entries = self._list_entries(recursive=recursive)
+        results = []
+        prefix = self.volume_path.rstrip("/")
+        for entry in entries:
+            entry_path = entry.path.rstrip("/")
+            if prefix:
+                if not entry_path.startswith(prefix + "/"):
+                    continue
+                relative = entry_path[len(prefix) + 1 :]
+            else:
+                relative = entry_path
+            if fnmatch.fnmatch(relative, pattern):
+                results.append(type(self)(f"modal://{self.volume_name}/{entry_path}"))
+        return sorted(results)
+
+    def exists(self):
+        local = self._mounted_local_path()
+        if local is not None:
+            return local.exists()
+        if not self.volume_path:
+            return True
+        return self.isfile() or self.isdir()
+
+    def isfile(self):
+        local = self._mounted_local_path()
+        if local is not None:
+            return local.isfile()
+        entry = self._exact_entry()
+        if entry is None:
+            return False
+        return self._entry_type_name(entry) == "FILE"
+
+    def isdir(self):
+        local = self._mounted_local_path()
+        if local is not None:
+            return local.isdir()
+        if not self.volume_path:
+            return True
+        entry = self._exact_entry()
+        if entry is not None:
+            return self._entry_type_name(entry) == "DIRECTORY"
+        entries = self._list_entries(recursive=False)
+        return len(entries) > 0
+
+    def mkdir(self, **kwargs):
+        assert kwargs.pop("parents", True)
+        assert kwargs.pop("exist_ok", True)
+        assert not kwargs, kwargs
+        local = self._mounted_local_path()
+        if local is not None:
+            local.mkdir(parents=True, exist_ok=True)
+            self._commit()
+            return
+        self._commit()
+
+    def remove(self, recursive=False):
+        local = self._mounted_local_path()
+        if local is not None:
+            local.remove(recursive=recursive)
+            self._commit()
+            return
+        self.write_volume.remove_file(self._remote_path(), recursive=recursive)
+        self._commit()
+
+    def copy(self, dest, recursive=False):
+        if not isinstance(dest, Path):
+            dest = Path(dest)
+        local = self._mounted_local_path()
+        dest_local = (
+            dest._mounted_local_path()
+            if isinstance(dest, ModalVolumeV2)
+            else None
+        )
+        if local is not None and dest_local is not None:
+            local.copy(dest_local, recursive=recursive)
+            dest._commit()
+            return
+        if isinstance(dest, type(self)) and dest.volume_name == self.volume_name:
+            self._reload()
+            self.write_volume.copy_files(
+                [self._remote_path()], dest._remote_path(), recursive=recursive
+            )
+            dest._commit()
+            return
+        _copy_across_filesystems(self, dest, recursive)
+
+    def move(self, dest, recursive=False):
+        if not isinstance(dest, Path):
+            dest = Path(dest)
+        local = self._mounted_local_path()
+        dest_local = (
+            dest._mounted_local_path()
+            if isinstance(dest, ModalVolumeV2)
+            else None
+        )
+        if local is not None and dest_local is not None:
+            local.move(dest_local, recursive=recursive)
+            dest._commit()
+            return
+        if isinstance(dest, type(self)) and dest.volume_name == self.volume_name:
+            self.copy(dest, recursive)
+            self.remove(recursive)
+            return
+        _copy_across_filesystems(self, dest, recursive)
+        self.remove(recursive)
+
+    def _optimized_copy_to(self, dest):
+        local = self._mounted_local_path()
+        if local is not None:
+            return local._optimized_copy_to(dest)
+        if isinstance(dest, LocalPath):
+            self._reload()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with dest.open("wb") as f:
+                for chunk in self.volume.read_file(self.volume_path):
+                    f.write(chunk)
+            return True
+        return False
+
+    def _optimized_copy_from(self, source):
+        local = self._mounted_local_path()
+        if local is not None:
+            handled = local._optimized_copy_from(source)
+            if handled:
+                self._commit()
+            return handled
+        if isinstance(source, LocalPath):
+            with self.write_volume.batch_upload(force=True) as batch:
+                batch.put_file(str(source), self._remote_path())
+            self._commit()
+            return True
+        return False
+
+    def commit(self):
+        self._commit()
+
+    def reload(self):
+        self._reload()
+
+
+class _ModalVolumeWriteFile:
+    def __init__(self, path, mode):
+        self.path = path
+        self.mode = mode
+        self.buffer = tempfile.SpooledTemporaryFile(
+            max_size=path.SPOOLED_FILE_SIZE, mode="w+b"
+        )
+        self.closed = False
+        if "a" in mode:
+            self.path._reload()
+            for chunk in self.path.volume.read_file(self.path.volume_path):
+                self.buffer.write(chunk)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *e):
+        self.close()
+
+    def readable(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.buffer.tell()
+
+    def seek(self, pos, mode=os.SEEK_SET):
+        return self.buffer.seek(pos, mode)
+
+    def read(self, size=None):
+        raise io.UnsupportedOperation
+
+    def write(self, b):
+        if isinstance(b, str):
+            b = b.encode("utf-8")
+        return self.buffer.write(b)
+
+    def flush(self):
+        self.buffer.flush()
+
+    def close(self):
+        if self.closed:
+            return
+        self.buffer.flush()
+        self.buffer.seek(0)
+        with self.path.write_volume.batch_upload(force=True) as batch:
+            batch.put_file(self.buffer, self.path._remote_path())
+        self.path._commit()
+        self.buffer.close()
+        self.closed = True
+
+
+class _ModalMountedWriteFile:
+    def __init__(self, path, file_obj):
+        self.path = path
+        self.file_obj = file_obj
+        self.closed = False
+
+    def __enter__(self):
+        self.file_obj.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __getattr__(self, name):
+        return getattr(self.file_obj, name)
+
+    def close(self):
+        if self.closed:
+            return
+        self.file_obj.flush()
+        self.file_obj.close()
+        self.path._commit()
+        self.closed = True
+
+
 def _copy_across_filesystems(source, dest, recursive):
     assert isinstance(source, Path), type(source)
     assert isinstance(dest, Path), type(dest)
     if not recursive:
-        assert source.isfile()
-        # Fast path: S3 -> local using boto3 transfer manager
-        # (multi-part parallel download)
-        if isinstance(source, S3Path) and isinstance(dest, LocalPath):
-            from boto3.s3.transfer import TransferConfig
-
-            config = TransferConfig(
-                multipart_threshold=8 * 1024 * 1024,
-                max_concurrency=10,
-                multipart_chunksize=8 * 1024 * 1024,
-                use_threads=True,
-            )
-            source.client.download_file(
-                source.bucket_name, source.key, str(dest), Config=config
-            )
+        assert source.isfile(), "Use .copy(recursive=True) to copy directories"
+        # Try optimized copy methods first
+        if dest._optimized_copy_from(source):
             return
-        # Stream the file to avoid loading large files into memory
-        with source.open("rb") as src, dest.open("wb") as dst:
-            shutil.copyfileobj(src, dst)
+        if source._optimized_copy_to(dest):
+            return
+        # Fallback: Stream the file to avoid loading large files into memory
+        with source.open("rb") as src:
+            with dest.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
         return
     if dest.exists():
         dest = dest / source.name
@@ -1114,162 +1620,21 @@ def _copy_across_filesystems(source, dest, recursive):
         if s.isdir():
             d.mkdir()
         else:
-            # Stream each file to avoid memory issues
-            with s.open("rb") as src, d.open("wb") as dst:
-                shutil.copyfileobj(src, dst)
-
-
-class ModalVolumePath(Path):
-    """Path implementation for Modal Volumes.
-
-    Handles modal:// URIs and translates them to local mount paths.
-    Format: modal://volume-name/path -> /mount-path/path
-
-    Default volume mount mappings:
-    - torchtitan-hot-checkpoints -> /hot-checkpoints
-
-    Custom mappings can be provided via MODAL_VOLUME_MOUNTS environment variable
-    as JSON: {"volume-name": "/mount-path", ...}
-    """
-
-    __slots__ = ("_path", "_local_path")
-
-    # Default volume name to mount path mappings
-    DEFAULT_MOUNTS = {
-        "torchtitan-hot-checkpoints": "/hot-checkpoints",
-        "huggingface-cache-v2": "/root/.cache/huggingface",
-        "vllm-cache-v2": "/root/.cache/vllm",
-    }
-
-    _custom_mounts = None
-
-    @classmethod
-    def _get_mounts(cls):
-        """Get volume mount mappings, including custom ones from environment."""
-        if cls._custom_mounts is None:
-            cls._custom_mounts = dict(cls.DEFAULT_MOUNTS)
-            # Load custom mounts from environment
-            custom_json = os.environ.get("MODAL_VOLUME_MOUNTS")
-            if custom_json:
-                import json
-
-                try:
-                    custom = json.loads(custom_json)
-                    cls._custom_mounts.update(custom)
-                except json.JSONDecodeError:
-                    pass  # Ignore invalid JSON
-        return cls._custom_mounts
-
-    @classmethod
-    def add_mount(cls, volume_name: str, mount_path: str):
-        """Add a volume mount mapping programmatically."""
-        cls._get_mounts()[volume_name] = mount_path
-
-    def __init__(self, path):
-        path = str(path)
-        super().__init__(path)
-
-        # Parse modal://volume-name/path
-        if not path.startswith("modal://"):
-            raise ValueError(f"ModalVolumePath requires modal:// URI, got: {path}")
-
-        # Extract volume name and path
-        without_prefix = path[8:]  # Remove "modal://"
-        if "/" in without_prefix:
-            volume_name, remainder = without_prefix.split("/", 1)
-        else:
-            volume_name = without_prefix
-            remainder = ""
-
-        # Look up mount path
-        mounts = self._get_mounts()
-        if volume_name in mounts:
-            mount_path = mounts[volume_name]
-        else:
-            # Default: use volume name as mount point
-            mount_path = f"/{volume_name}"
-
-        # Build local path
-        if remainder:
-            self._local_path = f"{mount_path}/{remainder}"
-        else:
-            self._local_path = mount_path
-
-    @property
-    def volume_name(self):
-        """Get the volume name from the modal:// URI."""
-        without_prefix = self._path[8:]
-        return without_prefix.split("/", 1)[0]
-
-    @property
-    def local_path(self):
-        """Get the translated local path."""
-        return self._local_path
-
-    def _as_local(self):
-        """Get a LocalPath for the translated path."""
-        return LocalPath(self._local_path)
-
-    # Delegate all operations to LocalPath
-    @property
-    def size(self):
-        return self._as_local().size
-
-    def open(self, mode="r"):
-        return self._as_local().open(mode)
-
-    def absolute(self):
-        return type(self)(self._path)
-
-    def glob(self, pattern):
-        local = self._as_local()
-        for local_match in local.glob(pattern):
-            # Convert back to modal:// path
-            rel_path = str(local_match)[len(self._local_path) :].lstrip("/")
-            yield type(self)(f"{self._path}/{rel_path}" if rel_path else self._path)
-
-    def exists(self):
-        return self._as_local().exists()
-
-    def isfile(self):
-        return self._as_local().isfile()
-
-    def isdir(self):
-        return self._as_local().isdir()
-
-    def mkdir(self, **kwargs):
-        return self._as_local().mkdir(**kwargs)
-
-    def remove(self, recursive=False):
-        return self._as_local().remove(recursive)
-
-    def copy(self, dest, recursive=False):
-        dest = Path(dest)
-        if isinstance(dest, type(self)):
-            # Both are modal paths, use local copy
-            self._as_local().copy(dest._local_path, recursive)
-        elif isinstance(dest, LocalPath):
-            # Copy to local path
-            self._as_local().copy(str(dest), recursive)
-        else:
-            # Cross-filesystem copy
-            _copy_across_filesystems(self, dest, recursive)
-
-    def move(self, dest, recursive=False):
-        dest = Path(dest)
-        if isinstance(dest, type(self)):
-            self._as_local().move(dest._local_path, recursive)
-        elif isinstance(dest, LocalPath):
-            self._as_local().move(str(dest), recursive)
-        else:
-            _copy_across_filesystems(self, dest, recursive)
-            self.remove(recursive)
+            # Try optimized methods for each file
+            if d._optimized_copy_from(s):
+                continue
+            if s._optimized_copy_to(d):
+                continue
+            # Fallback: Stream each file to avoid memory issues
+            with s.open("rb") as src:
+                with d.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
 
 
 Path.filesystems = [
     (S3Path, lambda path: path.startswith("s3://")),
     (GCSPath, lambda path: path.startswith("gs://")),
-    (ModalVolumePath, lambda path: path.startswith("modal://")),
+    (ModalVolumeV2, lambda path: path.startswith("modal://")),
     (TFPath, lambda path: path.startswith("/cns/")),
     (LocalPath, lambda path: True),
 ]

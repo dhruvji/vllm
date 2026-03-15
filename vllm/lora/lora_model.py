@@ -3,7 +3,6 @@
 
 import os
 
-import safetensors
 import torch
 
 from vllm.logger import init_logger
@@ -16,7 +15,10 @@ from vllm.lora.utils import (
 )
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 from vllm.model_executor.models.utils import WeightsMapper
+from vllm.path import Path
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.adapter_manager import _read_file_bytes, _resolve_adapter_file
+from safetensors.torch import load as safetensors_load
 
 logger = init_logger(__name__)
 
@@ -153,14 +155,11 @@ class LoRAModel:
         Returns:
             Loaded LoRA Model.
         """
-        lora_tensor_path = os.path.join(lora_dir, "adapter_model.safetensors")
-        lora_bin_file_path = os.path.join(lora_dir, "adapter_model.bin")
-        lora_pt_file_path = os.path.join(lora_dir, "adapter_model.pt")
-
         tensors: dict[str, torch.Tensor] = {}
         unexpected_modules: list[list[str] | str] = []
 
         def check_unexpected_modules(modules: dict):
+            module_sides: dict[str, set[str]] = {}
             for lora_module in modules.keys():  # noqa
                 if is_base_embeddding_weights(lora_module):
                     continue
@@ -173,7 +172,12 @@ class LoRAModel:
                     lora_module, skip_prefixes
                 ):
                     continue
-                module_name, _ = parse_fine_tuned_lora_name(lora_module, weights_mapper)
+                module_name, is_lora_a = parse_fine_tuned_lora_name(
+                    lora_module, weights_mapper
+                )
+                module_sides.setdefault(module_name, set()).add(
+                    "A" if is_lora_a else "B"
+                )
                 # Case for expert lora weights
                 if ".experts" in module_name:
                     expert_idx = module_name.find(".experts")
@@ -182,7 +186,22 @@ class LoRAModel:
                         unexpected_modules.append(module_name)
 
                 elif module_name.rsplit(".", 1)[-1] not in expected_lora_modules:
-                    unexpected_modules.append(module_name)
+                        unexpected_modules.append(module_name)
+
+            incomplete_modules = sorted(
+                module_name
+                for module_name, sides in module_sides.items()
+                if sides != {"A", "B"}
+            )
+            if incomplete_modules:
+                missing = {
+                    module_name: sorted({"A", "B"} - module_sides[module_name])
+                    for module_name in incomplete_modules
+                }
+                raise ValueError(
+                    f"While loading {lora_dir}, found incomplete LoRA modules "
+                    f"(missing A/B tensor pair): {missing}."
+                )
 
             if unexpected_modules:
                 raise ValueError(
@@ -207,29 +226,23 @@ class LoRAModel:
             )
             check_unexpected_modules(tensors)
 
-        elif os.path.isfile(lora_tensor_path):
-            # Find unexpected modules.
-            # Use safetensor key as a source of truth to find expected modules.
-            # in peft if you have target_modules A, B, C and C does not exist
-            # in the model it won’t error and model will be trained with A, B
-            # loraified. C won’t exist in the safetensor but it will exist in
-            # the target_modules of the adapter_config.json.
-            unexpected_modules = []
-            with safetensors.safe_open(lora_tensor_path, framework="pt") as f:  # type: ignore
-                # Load tensors if there are only expected modules.
-                check_unexpected_modules(f)
-                for module in f.keys():  # noqa
-                    tensors[module] = f.get_tensor(module)
-        elif os.path.isfile(lora_bin_file_path) or os.path.isfile(lora_pt_file_path):
-            lora_file_path = (
-                lora_bin_file_path
-                if os.path.isfile(lora_bin_file_path)
-                else lora_pt_file_path
-            )
-            tensors = torch.load(lora_file_path, map_location=device, weights_only=True)
-            check_unexpected_modules(tensors)
         else:
-            raise ValueError(f"{lora_dir} doesn't contain tensors")
+            # Resolve the best adapter file in the directory
+            resolved_path = _resolve_adapter_file(lora_dir)
+
+            if resolved_path.endswith(".safetensors"):
+                # Avoid mmap on Modal volumes and hot-checkpoint paths:
+                # read bytes first, then load from buffer.
+                tensor_bytes = _read_file_bytes(resolved_path)
+                tensors = safetensors_load(tensor_bytes)
+            elif resolved_path.endswith((".bin", ".pt")):
+                with Path(resolved_path).open("rb") as f:
+                    tensors = torch.load(
+                        f, map_location=device, weights_only=True
+                    )
+            else:
+                raise ValueError(f"{lora_dir} doesn't contain tensors")
+            check_unexpected_modules(tensors)
 
         return cls.from_lora_tensors(
             lora_model_id=get_lora_id() if lora_model_id is None else lora_model_id,

@@ -73,7 +73,7 @@ image = (
     .uv_pip_install(
         "flashinfer-python==0.6.3",
         "flashinfer-cubin==0.6.3",
-        "flashinfer-jit-cache",
+        "flashinfer-jit-cache==0.6.3",
         extra_index_url="https://flashinfer.ai/whl/nightly/cu128",
     )
     .env(

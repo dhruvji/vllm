@@ -199,3 +199,42 @@ def test_get_adapter_absolute_path_huggingface_error(
         response=MagicMock(),
     )
     assert get_adapter_absolute_path(path) == path
+
+
+@patch("vllm.lora.utils.Path")
+def test_get_adapter_absolute_path_modal_passthrough(mock_path_cls):
+    path = "modal://torchtitan-hot-checkpoints-v2/run-1/lora"
+    modal_path = MagicMock()
+    mock_path_cls.return_value = modal_path
+
+    assert get_adapter_absolute_path(path) == path
+    mock_path_cls.assert_not_called()
+
+
+@patch("vllm.lora.utils._resolve_modal_adapter_path")
+def test_get_adapter_absolute_path_modal_strips_whitespace(mock_resolve):
+    path = "  modal://torchtitan-hot-checkpoints-v2/run-1/lora\n"
+    mock_resolve.return_value = "modal://torchtitan-hot-checkpoints-v2/run-1/lora"
+
+    assert get_adapter_absolute_path(path) == mock_resolve.return_value
+    mock_resolve.assert_called_once_with(
+        "modal://torchtitan-hot-checkpoints-v2/run-1/lora"
+    )
+
+
+@patch("vllm.lora.utils.Path")
+def test_get_adapter_absolute_path_modal_glob(mock_path_cls):
+    path = "modal://torchtitan-hot-checkpoints-v2/run-*/lora"
+    latest_txt = MagicMock()
+    latest_txt.isfile.return_value = False
+    glob_root = MagicMock()
+    glob_root.glob.return_value = [
+        "modal://torchtitan-hot-checkpoints-v2/run-older/lora",
+        "modal://torchtitan-hot-checkpoints-v2/run-newer/lora",
+    ]
+    mock_path_cls.side_effect = [latest_txt, glob_root]
+
+    assert (
+        get_adapter_absolute_path(path)
+        == "modal://torchtitan-hot-checkpoints-v2/run-newer/lora"
+    )
