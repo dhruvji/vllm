@@ -698,16 +698,16 @@ class OpenAIServing:
 
             logger.debug("LoRA runtime path: %s", runtime_lora_path)
 
-            # Generate a stable int ID so vLLM reuses loaded LoRA across requests.
-            lora_int_id = hash(resolved_id) & 0x7FFFFFFF
-
-            lora_request = LoRARequest(
-                lora_name=resolved_id,
-                lora_int_id=lora_int_id,
-                lora_path=runtime_lora_path,
-            )
-
-            return lora_request
+            # Route request-body LoRAs through the same synchronized registry
+            # used by the explicit runtime load API so cold replicas do not
+            # race engine mutation during their first generation request.
+            async with self.models.lora_resolver_lock[resolved_id]:
+                return await self.models._ensure_lora_loaded_unlocked(
+                    lora_name=resolved_id,
+                    lora_path=runtime_lora_path,
+                    base_model_name=self.model_config.model,
+                    load_inplace=force_redownload,
+                )
 
         except Exception as e:
             logger.error("Failed to process LoRA adapters: %s", e)

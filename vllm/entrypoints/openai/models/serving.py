@@ -132,25 +132,13 @@ class OpenAIServingModels:
             if error_check_ret is not None:
                 return error_check_ret
 
-            lora_path = request.lora_path
-            lora_int_id = (
-                self.lora_requests[lora_name].lora_int_id
-                if lora_name in self.lora_requests
-                else self.lora_id_counter.inc(1)
-            )
-            lora_request = LoRARequest(
-                lora_name=lora_name,
-                lora_int_id=lora_int_id,
-                lora_path=lora_path,
-                load_inplace=request.load_inplace,
-            )
-            if base_model_name is not None and self.is_base_model(base_model_name):
-                lora_request.base_model_name = base_model_name
-
-            # Validate that the adapter can be loaded into the engine
-            # This will also preload it for incoming requests
             try:
-                await self.engine_client.add_lora(lora_request)
+                await self._ensure_lora_loaded_unlocked(
+                    lora_name=lora_name,
+                    lora_path=request.lora_path,
+                    base_model_name=base_model_name,
+                    load_inplace=request.load_inplace,
+                )
             except Exception as e:
                 error_type = "BadRequestError"
                 status_code = HTTPStatus.BAD_REQUEST
@@ -162,11 +150,44 @@ class OpenAIServingModels:
                     message=str(e), err_type=error_type, status_code=status_code
                 )
 
-            self.lora_requests[lora_name] = lora_request
             logger.info(
-                "Loaded new LoRA adapter: name '%s', path '%s'", lora_name, lora_path
+                "Loaded new LoRA adapter: name '%s', path '%s'",
+                lora_name,
+                request.lora_path,
             )
             return f"Success: LoRA adapter '{lora_name}' added successfully."
+
+    async def _ensure_lora_loaded_unlocked(
+        self,
+        *,
+        lora_name: str,
+        lora_path: str,
+        base_model_name: str | None = None,
+        load_inplace: bool = False,
+    ) -> LoRARequest:
+        existing_request = self.lora_requests.get(lora_name)
+        if existing_request is not None and not load_inplace:
+            return existing_request
+
+        lora_int_id = (
+            existing_request.lora_int_id
+            if existing_request is not None
+            else self.lora_id_counter.inc(1)
+        )
+        lora_request = LoRARequest(
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            lora_path=lora_path,
+            load_inplace=load_inplace,
+        )
+        if base_model_name is not None and self.is_base_model(base_model_name):
+            lora_request.base_model_name = base_model_name
+
+        # Validate that the adapter can be loaded into the engine and register it
+        # so subsequent requests reuse the same loaded LoRA.
+        await self.engine_client.add_lora(lora_request)
+        self.lora_requests[lora_name] = lora_request
+        return lora_request
 
     async def unload_lora_adapter(
         self, request: UnloadLoRAAdapterRequest
