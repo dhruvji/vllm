@@ -63,6 +63,10 @@ def _resolve_adapter_file(path_str: str) -> str:
     return path_str
 
 
+def _looks_like_adapter_file(path_str: str) -> bool:
+    return path_str.endswith((".safetensors", ".pt", ".bin"))
+
+
 def _resolve_adapter_path(path: str | StdPath) -> str:
     """Resolve adapter path, handling directories transparently.
 
@@ -295,7 +299,16 @@ class AdapterManager:
                 t = threading.Thread(target=_log_progress, daemon=True)
                 t.start()
                 try:
-                    source_path.copy(str(cache_path))
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    if _looks_like_adapter_file(adapter_id):
+                        with source_path.open("rb") as src, open(cache_path, "wb") as dst:
+                            while True:
+                                chunk = src.read(8 * 1024 * 1024)
+                                if not chunk:
+                                    break
+                                dst.write(chunk)
+                    else:
+                        source_path.copy(str(cache_path))
                 finally:
                     stop_evt.set()
                 final_size_mb = cache_path.stat().st_size / (1024 * 1024)
