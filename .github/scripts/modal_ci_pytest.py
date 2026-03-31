@@ -24,6 +24,21 @@ BRANCH = os.environ.get("BRANCH", "main")
 GPU_TYPE = os.environ.get("GPU_TYPE", "A100")
 GPU_COUNT = int(os.environ.get("GPU_COUNT", 1))
 SECRETS = os.environ.get("SECRETS", "dev-api-keys")
+VLLM_PRECOMPILED_WHEEL_COMMIT = os.environ.get(
+    "VLLM_PRECOMPILED_WHEEL_COMMIT",
+    "a97954b6a8fa41a162ebf58f80a1460a98e0baf0",
+)
+VLLM_MAIN_CUDA_VERSION = os.environ.get("VLLM_MAIN_CUDA_VERSION", "12.8")
+VLLM_CUDA_VARIANT = os.environ.get("VLLM_CUDA_VARIANT", "cu129")
+VLLM_TORCH_VERSION = os.environ.get("VLLM_TORCH_VERSION", "2.10.0")
+VLLM_TORCHVISION_VERSION = os.environ.get("VLLM_TORCHVISION_VERSION", "0.25.0")
+FLASHINFER_VERSION = os.environ.get("FLASHINFER_VERSION", "0.6.4")
+FLASHINFER_CUDA_INDEX = os.environ.get(
+    "FLASHINFER_CUDA_INDEX", "https://flashinfer.ai/whl/cu128"
+)
+VLLM_NIGHTLY_INDEX = os.environ.get(
+    "VLLM_NIGHTLY_INDEX", "https://wheels.vllm.ai/nightly"
+)
 
 MINUTES = 60  # seconds
 
@@ -33,33 +48,44 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     .entrypoint([])
     .apt_install("git", "rsync")
-    .env({"VLLM_USE_PRECOMPILED": "1", "VLLM_PRECOMPILED_WHEEL_COMMIT": "be7f3d5d2016b326d12ff"})
+    .pip_install("uv")
+    .env(
+        {
+            "VLLM_USE_PRECOMPILED": "1",
+            "VLLM_PRECOMPILED_WHEEL_COMMIT": VLLM_PRECOMPILED_WHEEL_COMMIT,
+            "VLLM_MAIN_CUDA_VERSION": VLLM_MAIN_CUDA_VERSION,
+        }
+    )
     .run_commands(
         f"git clone https://$GITHUB_TOKEN@github.com/engram-lab/vllm.git -b {BRANCH} /tmp/vllm",
         secrets=[secrets],
         force_build=True,
     )
-    .uv_pip_install(
-        "vllm @ file:///tmp/vllm",
-        "huggingface-hub[hf_transfer]==0.36.0",
-        "boto3",
-        "pytest",
-        "pytest-asyncio",
-        "httpx",
-        "openai",
-        "tblib",
-    )
-    # Align torch and flashinfer with the precompiled vLLM wheel (torch 2.10 build).
-    .uv_pip_install(
-        "torch==2.10.0",
-        "torchvision==0.25.0",
-        extra_index_url="https://download.pytorch.org/whl/cu128",
+    .run_commands(
+        "find /tmp/vllm -name '*.txt' -o -name 'pyproject.toml' | "
+        r"xargs -r sed -i 's/flashinfer-python==0\.[0-9]*\.[0-9]*/flashinfer-python/g'",
     )
     .uv_pip_install(
-        "flashinfer-python==0.6.3",
-        "flashinfer-cubin==0.6.3",
-        "flashinfer-jit-cache==0.6.3",
-        extra_index_url="https://flashinfer.ai/whl/nightly/cu128",
+        f"torch=={VLLM_TORCH_VERSION}+{VLLM_CUDA_VARIANT}",
+        f"torchvision=={VLLM_TORCHVISION_VERSION}+{VLLM_CUDA_VARIANT}",
+        index_url=f"https://download.pytorch.org/whl/{VLLM_CUDA_VARIANT}",
+    )
+    .run_commands(
+        "uv pip install --system "
+        "'vllm @ file:///tmp/vllm' "
+        "'huggingface-hub[hf_transfer]' "
+        "fastsafetensors "
+        "boto3 "
+        "pytest "
+        "pytest-asyncio "
+        "httpx "
+        "openai "
+        "tblib "
+        f"flashinfer-python=={FLASHINFER_VERSION} "
+        f"flashinfer-cubin=={FLASHINFER_VERSION} "
+        f"flashinfer-jit-cache=={FLASHINFER_VERSION} "
+        f"--extra-index-url {VLLM_NIGHTLY_INDEX} "
+        f"--extra-index-url {FLASHINFER_CUDA_INDEX}"
     )
     .env(
         {
