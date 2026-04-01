@@ -340,8 +340,6 @@ class MultiprocExecutor(Executor):
         if output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
 
-        shutdown_event = self.shutdown_event
-
         def get_response():
             responses = []
             for mq in response_mqs:
@@ -349,9 +347,7 @@ class MultiprocExecutor(Executor):
                     None if deadline is None else (deadline - time.monotonic())
                 )
                 try:
-                    status, result = mq.dequeue(
-                        timeout=dequeue_timeout, cancel=shutdown_event
-                    )
+                    status, result = mq.dequeue(timeout=dequeue_timeout)
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
                 if status != WorkerProc.ResponseStatus.SUCCESS:
@@ -771,7 +767,7 @@ class WorkerProc:
             ready_writer.close()
             ready_writer = None
 
-            worker.worker_busy_loop(cancel=shutdown_event)
+            worker.worker_busy_loop()
 
         except Exception:
             # NOTE: if an Exception arises in busy_loop, we send
@@ -842,12 +838,12 @@ class WorkerProc:
             output = self.async_output_queue.get()
             self.enqueue_output(output)
 
-    def worker_busy_loop(self, cancel: threading.Event | None = None):
+    def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
         while True:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
-                cancel=cancel, indefinite=True
+                indefinite=True
             )
             try:
                 if isinstance(method, str):
