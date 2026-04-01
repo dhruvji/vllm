@@ -23,6 +23,7 @@ import os
 import re
 import threading
 import time
+import zipfile
 from collections import OrderedDict
 from typing import Any
 
@@ -58,6 +59,12 @@ def _get_shm_path(cartridge_id: str) -> str:
     return os.path.join(SHM_CARTRIDGE_DIR, f"cart_{id_hash}.pt")
 
 
+def _get_shm_lock_path(cartridge_id: str) -> str:
+    """Get a process-shared lock path for cartridge shm writes."""
+    id_hash = hashlib.sha256(cartridge_id.encode()).hexdigest()[:16]
+    return os.path.join(SHM_CARTRIDGE_DIR, f"cart_{id_hash}.lock")
+
+
 def save_cartridge_to_shm(
     cartridge_id: str,
     stacked_kv: list[torch.Tensor],
@@ -73,22 +80,51 @@ def save_cartridge_to_shm(
     """
     os.makedirs(SHM_CARTRIDGE_DIR, exist_ok=True)
     shm_path = _get_shm_path(cartridge_id)
-
-    # Skip if already saved (another request may have saved it)
-    if os.path.exists(shm_path):
-        logger.debug("Cartridge already in shm: %s", shm_path)
-        _active_shm_paths[cartridge_id] = shm_path
-        return shm_path
-
-    # Save tensors to shm
-    torch.save(stacked_kv, shm_path)
-    _active_shm_paths[cartridge_id] = shm_path
-    logger.info(
-        "Saved cartridge to shm: %s (%.2f MB)",
-        shm_path,
-        os.path.getsize(shm_path) / (1024 * 1024),
+    lock_path = _get_shm_lock_path(cartridge_id)
+    tmp_path = (
+        f"{shm_path}.tmp.{os.getpid()}.{threading.get_ident()}"
     )
-    return shm_path
+
+    with open(lock_path, "a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            # Another request may already have finished writing the cartridge.
+            # Because writes are lock-protected and completed via atomic rename,
+            # an existing target path is safe to reuse once we hold the lock.
+            if os.path.exists(shm_path):
+                if zipfile.is_zipfile(shm_path):
+                    logger.debug("Cartridge already in shm: %s", shm_path)
+                    _active_shm_paths[cartridge_id] = shm_path
+                    return shm_path
+
+                logger.warning(
+                    "Found invalid cartridge shm file, rewriting: %s",
+                    shm_path,
+                )
+                os.unlink(shm_path)
+
+            # Write to a unique temp path and atomically publish once complete
+            # so concurrent readers never observe a partial torch archive.
+            with open(tmp_path, "wb") as tmp_file:
+                torch.save(stacked_kv, tmp_file)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+
+            os.replace(tmp_path, shm_path)
+            _active_shm_paths[cartridge_id] = shm_path
+            logger.info(
+                "Saved cartridge to shm: %s (%.2f MB)",
+                shm_path,
+                os.path.getsize(shm_path) / (1024 * 1024),
+            )
+            return shm_path
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def load_cartridge_from_shm(shm_path: str) -> list[torch.Tensor] | None:

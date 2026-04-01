@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from multiprocessing import Process, connection
 from multiprocessing.process import BaseProcess
+from multiprocessing.queues import Queue
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -773,17 +774,50 @@ class CoreEngineActorManager:
             ray.util.remove_placement_group(pg)
 
 
+def get_engine_zmq_addresses(
+    vllm_config: VllmConfig,
+    num_api_servers: int = 1,
+) -> EngineZmqAddresses:
+    """Allocate ZMQ addresses for engine-client communication."""
+    parallel_config = vllm_config.parallel_config
+    local_engine_count = parallel_config.data_parallel_size_local
+    local_start_index = parallel_config.data_parallel_rank_local
+    dp_size = parallel_config.data_parallel_size
+    host = parallel_config.data_parallel_master_ip
+    local_engines_only = parallel_config.local_engines_only
+
+    offline_mode = local_start_index is not None
+    client_local_only = (
+        offline_mode or local_engines_only or (local_engine_count == dp_size)
+    )
+    if parallel_config.enable_elastic_ep:
+        client_local_only = False
+
+    return EngineZmqAddresses(
+        inputs=[
+            get_engine_client_zmq_addr(client_local_only, host)
+            for _ in range(num_api_servers)
+        ],
+        outputs=[
+            get_engine_client_zmq_addr(client_local_only, host)
+            for _ in range(num_api_servers)
+        ],
+    )
+
+
 @contextlib.contextmanager
 def launch_core_engines(
     vllm_config: VllmConfig,
     executor_class: type[Executor],
     log_stats: bool,
+    addresses: EngineZmqAddresses | None = None,
     num_api_servers: int = 1,
 ) -> Iterator[
     tuple[
         CoreEngineProcManager | CoreEngineActorManager | None,
         DPCoordinator | None,
         EngineZmqAddresses,
+        Queue | None,
     ]
 ]:
     """Launch engine and DP coordinator processes as needed."""
@@ -801,23 +835,13 @@ def launch_core_engines(
     # examples/offline_inference/data_parallel.py.
     offline_mode = local_start_index is not None
 
-    # client_local_only = True for cases where this front-end
-    # sends requests only to colocated engines.
-    client_local_only = (
-        offline_mode or local_engines_only or (local_engine_count == dp_size)
-    )
+    if addresses is None:
+        addresses = get_engine_zmq_addresses(vllm_config, num_api_servers)
 
-    # Set up input and output addresses.
-    addresses = EngineZmqAddresses(
-        inputs=[
-            get_engine_client_zmq_addr(client_local_only, host)
-            for _ in range(num_api_servers)
-        ],
-        outputs=[
-            get_engine_client_zmq_addr(client_local_only, host)
-            for _ in range(num_api_servers)
-        ],
-    )
+    tensor_queue: Queue | None = None
+    multimodal_config = vllm_config.model_config.multimodal_config
+    if multimodal_config is not None and multimodal_config.mm_tensor_ipc == "torch_shm":
+        tensor_queue = get_mp_context().Queue()
 
     # Run the DP Coordinator process with rank 0 when in online DP mode.
     # The coordinator is needed for:
@@ -854,7 +878,7 @@ def launch_core_engines(
             log_stats=log_stats,
         )
 
-        yield engine_actor_manager, coordinator, addresses
+        yield engine_actor_manager, coordinator, addresses, tensor_queue
         return
 
     if offline_mode:
@@ -884,6 +908,8 @@ def launch_core_engines(
     # their co-located frontend and also the rank 0 front-end, and hence this
     # will be False.
     handshake_local_only = offline_mode or local_engine_count == dp_size
+    if parallel_config.enable_elastic_ep:
+        handshake_local_only = False
 
     handshake_address = get_engine_client_zmq_addr(
         handshake_local_only, host, parallel_config.data_parallel_rpc_port
@@ -919,7 +945,7 @@ def launch_core_engines(
         else:
             local_engine_manager = None
 
-        yield local_engine_manager, coordinator, addresses
+        yield local_engine_manager, coordinator, addresses, tensor_queue
 
         # Now wait for engines to start.
         wait_for_engine_startup(

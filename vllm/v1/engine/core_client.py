@@ -497,6 +497,7 @@ class MPClient(EngineCoreClient):
                     engine_manager,
                     coordinator,
                     addresses,
+                    _tensor_queue,
                 ):
                     self.resources.coordinator = coordinator
                     self.resources.engine_manager = engine_manager
