@@ -58,7 +58,9 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.spec_decode import init_speculator
-from vllm.v1.worker.gpu.spec_decode.rejection_sample import rejection_sample
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+    strict_rejection_sample,
+)
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -154,7 +156,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logprobs_mode=self.model_config.logprobs_mode,
             num_speculative_tokens=self.num_speculative_steps + 1,
         )
+        self.rejection_sampler = None
         self.prompt_logprobs_worker = PromptLogprobsWorker(self.max_num_reqs)
+        if self.do_spec_decode:
+            self.rejection_sampler = strict_rejection_sample
 
         # CUDA graphs.
         self.cudagraph_manager = CudaGraphManager(
@@ -723,7 +728,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         else:
             # Rejection sampling for spec decoding.
-            sampled_tokens, num_sampled = rejection_sample(
+            assert self.rejection_sampler is not None
+            sampled_tokens, num_sampled = self.rejection_sampler(
                 sampler_output.sampled_token_ids,
                 input_ids,
                 input_batch.cu_num_logits,

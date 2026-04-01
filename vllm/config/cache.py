@@ -3,7 +3,7 @@
 
 import math
 from dataclasses import field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import Field, SkipValidation, field_validator
 
@@ -22,6 +22,7 @@ logger = init_logger(__name__)
 BlockSize = Literal[1, 8, 16, 32, 64, 128, 256]
 CacheDType = Literal[
     "auto",
+    "float16",
     "bfloat16",
     "fp8",
     "fp8_e4m3",
@@ -39,6 +40,8 @@ KVOffloadingBackend = Literal["native", "lmcache"]
 class CacheConfig:
     """Configuration for the KV cache."""
 
+    DEFAULT_BLOCK_SIZE: ClassVar[int] = 16
+
     block_size: SkipValidation[BlockSize] = None  # type: ignore
     """Size of a contiguous cache block in number of tokens. On CUDA devices,
     only block sizes up to 32 are supported.
@@ -46,6 +49,8 @@ class CacheConfig:
     This config has no static default. If left unspecified by the user, it will
     be set in `Platform.check_and_update_config()` based on the current
     platform."""
+    user_specified_block_size: bool = field(default=False, init=False)
+    """Whether block_size was explicitly provided by the user."""
     gpu_memory_utilization: float = Field(default=0.9, gt=0, le=1)
     """The fraction of GPU memory to be used for the model executor, which can
     range from 0 to 1. For example, a value of 0.5 would imply 50% GPU memory
@@ -105,6 +110,9 @@ class CacheConfig:
     """This enables dynamic calculation of `k_scale` and `v_scale` when
     kv_cache_dtype is fp8. If `False`, the scales will be loaded from the model
     checkpoint if available. Otherwise, the scales will default to 1.0."""
+    kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
+    """Layer patterns to skip KV cache quantization. Accepts layer indices
+    (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
     cpu_kvcache_space_bytes: int | None = None
     """(CPU backend only) CPU key-value cache space."""
     mamba_page_size_padded: int | None = None
@@ -114,6 +122,8 @@ class CacheConfig:
     """Size of a contiguous cache block in number of tokens for mamba cache.
     Can be set only when prefix caching is enabled.
     Value must be a multiple of 8 to align with causal_conv1d kernel."""
+    user_specified_mamba_block_size: bool = field(default=False, init=False)
+    """Whether mamba_block_size was explicitly provided by the user."""
     mamba_cache_dtype: MambaDType = "auto"
     """The data type to use for the Mamba cache (both the conv as well as the
     ssm state). If set to 'auto', the data type will be inferred from the model
@@ -131,6 +141,14 @@ class CacheConfig:
     - "align": only cache the mamba state of the last token of each scheduler step and
            when the token is at position i * block_size.
     """
+    enable_mamba_cache_stochastic_rounding: bool = False
+    """Enable stochastic rounding when writing SSM state to fp16 cache.
+    Uses random bits to unbias the rounding error, which can improve
+    numerical stability for long sequences."""
+    mamba_cache_philox_rounds: int = 0
+    """Number of Philox PRNG rounds for stochastic rounding random number
+    generation. 0 uses the Triton default. Higher values improve randomness
+    quality at the cost of compute."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
@@ -190,6 +208,8 @@ class CacheConfig:
             "prefix_caching_hash_algo",
             "cpu_kvcache_space_bytes",
             "mamba_page_size_padded",
+            "user_specified_block_size",
+            "user_specified_mamba_block_size",
             # Post-init/derived counters
             "num_gpu_blocks",
             "num_cpu_blocks",
@@ -206,6 +226,37 @@ class CacheConfig:
         # convert cache_config to dict(key: str, value: str) for prometheus
         # metrics info
         return {key: str(value) for key, value in self.__dict__.items()}
+
+    def __post_init__(self):
+        if self.block_size is not None:
+            self.user_specified_block_size = True
+        if self.mamba_block_size is not None:
+            self.user_specified_mamba_block_size = True
+        if self.enable_mamba_cache_stochastic_rounding:
+            from vllm.platforms import current_platform
+
+            if not current_platform.is_cuda():
+                raise ValueError(
+                    "Stochastic rounding for Mamba cache is only supported "
+                    "on NVIDIA CUDA platforms. Please do not specify "
+                    "`--enable-mamba-cache-stochastic-rounding`."
+                )
+            if not current_platform.is_device_capability_family(100):
+                raise ValueError(
+                    "Stochastic rounding for Mamba cache requires compute "
+                    "capability 10.0 (data center Blackwell). The `cvt.rs` "
+                    "PTX instruction is not supported on your GPU. Please do "
+                    "not specify "
+                    "`--enable-mamba-cache-stochastic-rounding`."
+                )
+            if self.mamba_ssm_cache_dtype != "float16":
+                raise ValueError(
+                    "Stochastic rounding for Mamba cache requires "
+                    "the SSM cache to be float16. Please set it explicitly, "
+                    "by specifying `--mamba-ssm-cache-dtype float16`, or "
+                    "disable stochastic rounding by not specifying "
+                    "`--enable-mamba-cache-stochastic-rounding`."
+                )
 
     @field_validator("cache_dtype", mode="after")
     @classmethod

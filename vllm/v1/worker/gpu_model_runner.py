@@ -1949,9 +1949,6 @@ class GPUModelRunner(
                     positions_np[token_idx : token_idx + n_tokens] += offset
                 token_idx += n_tokens
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
-
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
@@ -1960,6 +1957,16 @@ class GPUModelRunner(
         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
+
+        self.input_batch.block_table.compute_slot_mapping(
+            num_reqs,
+            query_start_loc,
+            torch.from_numpy(positions_np).to(
+                device=self.device,
+                dtype=torch.int64,
+                non_blocking=True,
+            ),
+        )
 
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens

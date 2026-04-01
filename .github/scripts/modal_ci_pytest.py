@@ -19,85 +19,121 @@ import sys
 
 import modal
 
+try:
+    from modal_ci_image import build_ci_image, get_commit_hash
+except ModuleNotFoundError:
+    CUDA_IMAGE = "nvidia/cuda:12.8.0-devel-ubuntu22.04"
+    PYTHON_VERSION = "3.12"
+    REPO_URL = "https://$GITHUB_TOKEN@github.com/engram-lab/vllm.git"
+    REPO_DIR = "/tmp/vllm"
+    PRECOMPILED_WHEEL_COMMIT = os.environ.get(
+        "VLLM_PRECOMPILED_WHEEL_COMMIT",
+        "2b465570e6dd327e8422ef9c87e9b2b1454ceaed",
+    )
+    BASE_ENV = {
+        "VLLM_USE_PRECOMPILED": "1",
+        "VLLM_PRECOMPILED_WHEEL_COMMIT": PRECOMPILED_WHEEL_COMMIT,
+    }
+    RUNTIME_ENV = {
+        "HF_XET_HIGH_PERFORMANCE": "1",
+        "XFORMERS_ENABLE_TRITON": "1",
+        "VLLM_SERVER_DEV_MODE": "1",
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "300",
+        "VLLM_PASSTHROUGH_ERRORS": "1",
+    }
+    TORCH_PACKAGES = ("torch==2.10.0", "torchvision==0.25.0")
+    FLASHINFER_PACKAGES = (
+        "flashinfer-python==0.6.7",
+        "flashinfer-cubin==0.6.7",
+        "flashinfer-jit-cache==0.6.7",
+    )
+
+    def get_commit_hash() -> str | None:
+        return os.environ.get("COMMIT_HASH") or os.environ.get("GITHUB_SHA")
+
+    def _clone_commands(branch: str, commit_hash: str | None) -> list[str]:
+        clone_cmd = f"git clone --depth 1 -b {branch} {REPO_URL} {REPO_DIR}"
+        if not commit_hash:
+            return [clone_cmd]
+
+        return [
+            clone_cmd,
+            "cd /tmp/vllm && "
+            f"git fetch --depth 1 origin {commit_hash} && "
+            f"git checkout {commit_hash} && "
+            f"echo 'vllm@{commit_hash}'",
+        ]
+
+    def _as_tuple(packages):
+        if packages is None:
+            return ()
+        return tuple(packages)
+
+    def build_ci_image(
+        *,
+        branch: str,
+        commit_hash: str | None,
+        secrets: list[modal.Secret],
+        apt_packages=(),
+        pre_repo_packages=(),
+        post_repo_packages=(),
+        additional_env: dict[str, str] | None = None,
+    ) -> modal.Image:
+        apt_pkgs = ("git",) + _as_tuple(apt_packages)
+        image = (
+            modal.Image.from_registry(CUDA_IMAGE, add_python=PYTHON_VERSION)
+            .entrypoint([])
+            .apt_install(*apt_pkgs)
+            .env(BASE_ENV)
+            .uv_pip_install(
+                *TORCH_PACKAGES,
+                extra_index_url="https://download.pytorch.org/whl/cu128",
+            )
+            .uv_pip_install(
+                *FLASHINFER_PACKAGES,
+                extra_index_url="https://flashinfer.ai/whl/cu128",
+            )
+        )
+
+        if pre_repo_packages:
+            image = image.uv_pip_install(*_as_tuple(pre_repo_packages))
+
+        image = image.run_commands(
+            *_clone_commands(branch, commit_hash),
+            secrets=secrets,
+        ).uv_pip_install("vllm @ file:///tmp/vllm")
+
+        if post_repo_packages:
+            image = image.uv_pip_install(*_as_tuple(post_repo_packages))
+
+        return image.env({**RUNTIME_ENV, **(additional_env or {})})
+
 # --- Configuration ---
 BRANCH = os.environ.get("BRANCH", "main")
+COMMIT_HASH = get_commit_hash()
 GPU_TYPE = os.environ.get("GPU_TYPE", "A100")
 GPU_COUNT = int(os.environ.get("GPU_COUNT", 1))
 SECRETS = os.environ.get("SECRETS", "dev-api-keys")
-VLLM_PRECOMPILED_WHEEL_COMMIT = os.environ.get(
-    "VLLM_PRECOMPILED_WHEEL_COMMIT",
-    "a97954b6a8fa41a162ebf58f80a1460a98e0baf0",
-)
-VLLM_MAIN_CUDA_VERSION = os.environ.get("VLLM_MAIN_CUDA_VERSION", "12.8")
-VLLM_CUDA_VARIANT = os.environ.get("VLLM_CUDA_VARIANT", "cu129")
-VLLM_TORCH_VERSION = os.environ.get("VLLM_TORCH_VERSION", "2.10.0")
-VLLM_TORCHVISION_VERSION = os.environ.get("VLLM_TORCHVISION_VERSION", "0.25.0")
-FLASHINFER_VERSION = os.environ.get("FLASHINFER_VERSION", "0.6.4")
-FLASHINFER_CUDA_INDEX = os.environ.get(
-    "FLASHINFER_CUDA_INDEX", "https://flashinfer.ai/whl/cu128"
-)
-VLLM_NIGHTLY_INDEX = os.environ.get(
-    "VLLM_NIGHTLY_INDEX", "https://wheels.vllm.ai/nightly"
-)
 
 MINUTES = 60  # seconds
 
 secrets = modal.Secret.from_name(SECRETS)
-
-image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
-    .entrypoint([])
-    .apt_install("git", "rsync")
-    .pip_install("uv")
-    .env(
-        {
-            "VLLM_USE_PRECOMPILED": "1",
-            "VLLM_PRECOMPILED_WHEEL_COMMIT": VLLM_PRECOMPILED_WHEEL_COMMIT,
-            "VLLM_MAIN_CUDA_VERSION": VLLM_MAIN_CUDA_VERSION,
-        }
-    )
-    .run_commands(
-        f"git clone https://$GITHUB_TOKEN@github.com/engram-lab/vllm.git -b {BRANCH} /tmp/vllm",
-        secrets=[secrets],
-        force_build=True,
-    )
-    .run_commands(
-        "find /tmp/vllm -name '*.txt' -o -name 'pyproject.toml' | "
-        r"xargs -r sed -i 's/flashinfer-python==0\.[0-9]*\.[0-9]*/flashinfer-python/g'",
-    )
-    .uv_pip_install(
-        f"torch=={VLLM_TORCH_VERSION}+{VLLM_CUDA_VARIANT}",
-        f"torchvision=={VLLM_TORCHVISION_VERSION}+{VLLM_CUDA_VARIANT}",
-        index_url=f"https://download.pytorch.org/whl/{VLLM_CUDA_VARIANT}",
-    )
-    .run_commands(
-        "uv pip install --system "
-        "'vllm @ file:///tmp/vllm' "
-        "'huggingface-hub[hf_transfer]' "
-        "fastsafetensors "
-        "boto3 "
-        "pytest "
-        "pytest-asyncio "
-        "httpx "
-        "openai "
-        "tblib "
-        f"flashinfer-python=={FLASHINFER_VERSION} "
-        f"flashinfer-cubin=={FLASHINFER_VERSION} "
-        f"flashinfer-jit-cache=={FLASHINFER_VERSION} "
-        f"--extra-index-url {VLLM_NIGHTLY_INDEX} "
-        f"--extra-index-url {FLASHINFER_CUDA_INDEX}"
-    )
-    .env(
-        {
-            "HF_XET_HIGH_PERFORMANCE": "1",
-            "HF_HUB_ENABLE_HF_TRANSFER": "1",
-            "XFORMERS_ENABLE_TRITON": "1",
-            "VLLM_SERVER_DEV_MODE": "1",
-            "TORCHINDUCTOR_COMPILE_THREADS": "1",
-            "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "300",
-            "VLLM_PASSTHROUGH_ERRORS": "1",
-        }
-    )
+image = build_ci_image(
+    branch=BRANCH,
+    commit_hash=COMMIT_HASH,
+    secrets=[secrets],
+    apt_packages=("rsync",),
+    pre_repo_packages=(
+        "huggingface-hub[hf_transfer]==0.36.0",
+        "boto3",
+        "pytest",
+        "pytest-asyncio",
+        "httpx",
+        "openai",
+        "tblib",
+    ),
+    additional_env={"HF_HUB_ENABLE_HF_TRANSFER": "1"},
 )
 
 # Overlay local tests directory onto the image
@@ -163,6 +199,13 @@ def run_pytest(test_path: str, pytest_args: str = "", env_vars: str = ""):
                 key, value = pair.split("=", 1)
                 env[key.strip()] = value.strip()
                 print(f"Set env: {key.strip()}={value.strip()}")
+
+    if (
+        env.get("VLLM_TEST_ENABLE_CARTRIDGE")
+        and "VLLM_ADAPTER_FORCE_REDOWNLOAD" not in env
+    ):
+        env["VLLM_ADAPTER_FORCE_REDOWNLOAD"] = "1"
+        print("Set env: VLLM_ADAPTER_FORCE_REDOWNLOAD=1")
 
     # Overlay local test files onto cloned repo using rsync
     # This allows running local test files that haven't been pushed yet

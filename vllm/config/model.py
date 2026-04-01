@@ -287,6 +287,10 @@ class ModelConfig:
     definitions"""
     io_processor_plugin: str | None = None
     """IOProcessor plugin name to load at model startup"""
+    renderer_num_workers: int = 1
+    """Number of worker threads in the renderer thread pool. This pool
+    handles async tokenization, chat template rendering, and multimodal
+    preprocessing."""
 
     # Pooler config
     pooler_config: PoolerConfig | None = None
@@ -662,6 +666,18 @@ class ModelConfig:
                 f"max_model_len must be a positive integer, "
                 f"got {type(self.max_model_len).__name__}: {self.max_model_len!r}. "
                 "Example: max_model_len=2048"
+            )
+        if (
+            self.multimodal_config is not None
+            and self.renderer_num_workers > 1
+            and self.multimodal_config.mm_processor_cache_gb > 0
+        ):
+            raise ValueError(
+                "Cannot use --renderer-num-workers > 1 with the multimodal "
+                "processor cache enabled. The MM processor cache is not "
+                "thread-safe across renderer workers. Please set "
+                "--renderer-num-workers 1 (the default), or disable the "
+                "MM processor cache with --mm-processor-cache-gb 0."
             )
         return self
 

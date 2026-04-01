@@ -27,6 +27,7 @@ jobs:
       TPOT_THRESHOLD_MS: "10.0"
       VLLM_PRECOMPILED_WHEEL_COMMIT: "a97954b6a8fa41a162ebf58f80a1460a98e0baf0"
       BRANCH: ${{ github.head_ref || github.ref_name }}
+      COMMIT_HASH: ${{ github.event.pull_request.head.sha || github.sha }}
 
     steps:
       - name: Checkout code

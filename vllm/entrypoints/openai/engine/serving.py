@@ -1,42 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import hashlib
+import contextlib
 import json
-import os
-import shutil
-import sys
-import tempfile
-import threading
 import time
-import traceback
-from collections import OrderedDict
-from pathlib import Path
-from collections.abc import AsyncGenerator, Callable, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, ClassVar, Generic, Protocol, TypeAlias, TypeVar
 
 import numpy as np
-import torch
 from fastapi import Request
-from openai.types.responses import (
-    ToolChoiceFunction,
-)
-from pydantic import ConfigDict, TypeAdapter
+from openai.types.responses import ToolChoiceFunction
+from pydantic import ConfigDict, TypeAdapter, ValidationError
 from starlette.datastructures import Headers
 
 import vllm.envs as envs
 from vllm.beam_search import BeamSearchSequence, create_sort_beams_key_function
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.chat_utils import (
-    ChatCompletionMessageParam,
-    ChatTemplateContentFormatOption,
-    ConversationMessage,
-)
+from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.chat_completion.protocol import (
+    BatchChatCompletionRequest,
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -46,54 +32,23 @@ from vllm.entrypoints.openai.completion.protocol import (
     CompletionResponse,
 )
 from vllm.entrypoints.openai.engine.protocol import (
-    ErrorInfo,
     ErrorResponse,
     FunctionCall,
     FunctionDefinition,
+    GenerationError,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.openai.responses.context import (
-    ConversationContext,
-    HarmonyContext,
-    ParsableContext,
-    StreamingHarmonyContext,
-)
-from vllm.entrypoints.openai.responses.protocol import (
-    ResponseInputOutputItem,
-    ResponsesRequest,
-)
-from vllm.entrypoints.openai.responses.utils import (
-    construct_input_messages,
-)
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.openai.speech_to_text.protocol import (
     TranscriptionRequest,
     TranscriptionResponse,
     TranslationRequest,
-)
-from vllm.entrypoints.pooling.classify.protocol import (
-    ClassificationChatRequest,
-    ClassificationCompletionRequest,
-    ClassificationResponse,
-)
-from vllm.entrypoints.pooling.embed.protocol import (
-    EmbeddingBytesResponse,
-    EmbeddingChatRequest,
-    EmbeddingCompletionRequest,
-    EmbeddingResponse,
 )
 from vllm.entrypoints.pooling.pooling.protocol import (
     IOProcessorRequest,
     PoolingChatRequest,
     PoolingCompletionRequest,
     PoolingResponse,
-)
-from vllm.entrypoints.pooling.score.protocol import (
-    RerankRequest,
-    ScoreDataRequest,
-    ScoreQueriesDocumentsRequest,
-    ScoreRequest,
-    ScoreResponse,
-    ScoreTextRequest,
 )
 from vllm.entrypoints.serve.disagg.protocol import GenerateRequest, GenerateResponse
 from vllm.entrypoints.serve.tokenize.protocol import (
@@ -102,22 +57,17 @@ from vllm.entrypoints.serve.tokenize.protocol import (
     TokenizeCompletionRequest,
     TokenizeResponse,
 )
-from vllm.entrypoints.utils import get_max_tokens, sanitize_message
-from vllm.exceptions import VLLMValidationError
-from vllm.inputs.data import PromptType, SingletonPrompt, TokensPrompt
+from vllm.entrypoints.utils import create_error_response
+from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
 from vllm.lora.request import LoRARequest
-from vllm.multimodal import MultiModalDataDict
 from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
-from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
-from vllm.renderers.inputs import TokPrompt
+from vllm.renderers import ChatParams, TokenizeParams
 from vllm.renderers.inputs.preprocess import (
     extract_prompt_components,
     extract_prompt_len,
-    parse_model_prompt,
-    prompt_to_seq,
 )
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
@@ -132,33 +82,13 @@ from vllm.utils.async_utils import (
     collect_from_async_generator,
     merge_async_iterators,
 )
-
-
-class GenerationError(Exception):
-    """raised when finish_reason indicates internal server error (500)"""
-
-    def __init__(self, message: str = "Internal server error"):
-        super().__init__(message)
-        self.status_code = HTTPStatus.INTERNAL_SERVER_ERROR
-
+from vllm.v1.cartridge_loader import (
+    load_cartridges_from_request,
+    save_cartridge_to_shm,
+)
+from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
-
-_REMOTE_LORA_SCHEMES = ("s3://", "gs://")
-_LORA_WEIGHT_SUFFIXES = (".safetensors", ".pt", ".bin")
-
-
-def _normalize_lora_runtime_path(path: str) -> str:
-    """Return the directory path that the worker-side PEFT loader expects."""
-    normalized = path.rstrip("/")
-    if normalized.endswith(_LORA_WEIGHT_SUFFIXES):
-        return normalized.rsplit("/", 1)[0] if "/" in normalized else "."
-    return normalized
-
-
-def _requires_staged_lora_dir(path: str) -> bool:
-    """Return True when the worker cannot consume the source path directly."""
-    return path.startswith(_REMOTE_LORA_SCHEMES)
 
 
 class RendererRequest(Protocol):
@@ -179,18 +109,13 @@ CompletionLikeRequest: TypeAlias = (
     CompletionRequest
     | TokenizeCompletionRequest
     | DetokenizeRequest
-    | EmbeddingCompletionRequest
-    | ClassificationCompletionRequest
-    | RerankRequest
-    | ScoreRequest
     | PoolingCompletionRequest
 )
 
 ChatLikeRequest: TypeAlias = (
     ChatCompletionRequest
+    | BatchChatCompletionRequest
     | TokenizeChatRequest
-    | EmbeddingChatRequest
-    | ClassificationChatRequest
     | PoolingChatRequest
 )
 
@@ -208,16 +133,11 @@ AnyRequest: TypeAlias = (
 AnyResponse: TypeAlias = (
     CompletionResponse
     | ChatCompletionResponse
-    | EmbeddingResponse
-    | EmbeddingBytesResponse
     | TranscriptionResponse
     | TokenizeResponse
     | PoolingResponse
-    | ClassificationResponse
-    | ScoreResponse
     | GenerateResponse
 )
-
 
 RequestT = TypeVar("RequestT", bound=AnyRequest)
 
@@ -230,7 +150,7 @@ class ServeContext(Generic[RequestT]):
     request_id: str
     created_time: int = field(default_factory=lambda: int(time.time()))
     lora_request: LoRARequest | None = None
-    engine_prompts: list[TokPrompt] | None = None
+    engine_inputs: list[EngineInput] | None = None
 
     result_generator: AsyncGenerator[tuple[int, PoolingRequestOutput], None] | None = (
         None
@@ -242,8 +162,7 @@ class ServeContext(Generic[RequestT]):
 
 class OpenAIServing:
     request_id_prefix: ClassVar[str] = """
-    A short string prepended to every request’s ID (e.g. "embd", "classify")
-    so you can easily tell “this ID came from Embedding vs Classification.”
+    A short string prepended to every request’s ID.
     """
 
     def __init__(
@@ -253,7 +172,6 @@ class OpenAIServing:
         *,
         request_logger: RequestLogger | None,
         return_tokens_as_token_ids: bool = False,
-        log_error_stack: bool = False,
     ):
         super().__init__()
 
@@ -264,458 +182,14 @@ class OpenAIServing:
         self.request_logger = request_logger
         self.return_tokens_as_token_ids = return_tokens_as_token_ids
 
-        self.log_error_stack = log_error_stack
-
-        self.input_processor = self.models.input_processor
-        self.io_processor = self.models.io_processor
-        self.renderer = self.models.renderer
-        self.model_config = self.models.model_config
-        self.max_model_len = self.model_config.max_model_len
-        # Track cartridges that have already sent KV to engine core.
-        # Bounded to prevent unbounded memory growth with frequent checkpoint updates.
-        self._sent_cartridge_ids: OrderedDict[str, str | None] = OrderedDict()
-        self._sent_cartridge_ids_max_size: int = 8
-        # Track prepared LoRA directories to avoid repeatedly loading and
-        # re-serializing the same adapter on every request.
-        self._prepared_lora_dirs: OrderedDict[str, str] = OrderedDict()
-        self._prepared_lora_dirs_max_size: int = 8
-        # Per-adapter locks to prevent concurrent threads from racing to
-        # stage the same adapter simultaneously (shutil.rmtree race).
-        self._lora_staging_locks: dict[str, threading.Lock] = {}
-        self._lora_staging_locks_meta = threading.Lock()
-
-    async def _process_adapters(
-        self,
-        adapters_config: dict[str, Any] | None,
-        prompt_token_ids: list[int],
-        request_id: str | None = None,
-    ) -> tuple[
-        list[int],
-        list["torch.Tensor"] | None,
-        str | None,
-        int | None,
-        str | None,
-        bool | None,
-        LoRARequest | None,
-    ]:
-        """
-        Process all adapters (prefix, lora) from the request.
-
-        Args:
-            adapters_config: New adapters config with 'prefix' and 'lora' keys
-            prompt_token_ids: Original prompt token IDs
-            request_id: Request ID to associate with adapters
-
-        Returns:
-            Tuple of:
-            - Combined token IDs with prefix tokens prepended (for pre-computed),
-              or original prompt_token_ids (for learned prefix)
-            - Stacked prefix KV tensors [keys, values] for learned prefix,
-              or None if using shm
-            - Prefix ID for deduplication, or None if no learned prefix
-            - Prefix sequence length, or None if no learned prefix
-            - Path to prefix KV in shared memory, or None if not saved
-            - Whether this request allows cartridge pipelining
-            - LoRARequest object if LoRA adapters specified, or None
-        """
-        if not adapters_config:
-            return prompt_token_ids, None, None, None, None, None, None
-
-        # Process prefix adapters (cartridges)
-        prefix_specs = adapters_config.get("prefix")
-        (
-            prompt_token_ids,
-            prefix_kv,
-            prefix_id,
-            prefix_seq_len,
-            prefix_shm_path,
-            allow_pipelining,
-        ) = await self._process_cartridges(
-            cartridges=prefix_specs,
-            prompt_token_ids=prompt_token_ids,
-            request_id=request_id,
-        )
-
-        # Process LoRA adapters
-        lora_specs = adapters_config.get("lora")
-        lora_request = await self._process_lora(
-            lora_specs=lora_specs,
-            request_id=request_id,
-        )
-
-        return (
-            prompt_token_ids,
-            prefix_kv,
-            prefix_id,
-            prefix_seq_len,
-            prefix_shm_path,
-            allow_pipelining,
-            lora_request,
-        )
-
-    async def _process_cartridges(
-        self,
-        cartridges: list[dict[str, Any]] | None,
-        prompt_token_ids: list[int],
-        request_id: str | None = None,
-    ) -> tuple[
-        list[int],
-        list["torch.Tensor"] | None,
-        str | None,
-        int | None,
-        str | None,
-        bool | None,
-    ]:
-        """
-        Load cartridges and process them for the request.
-
-        For pre-computed cartridges (with token_ids): prepend token IDs to prompt.
-        For learned cartridges (soft prompts): saves KV to shared memory for fast IPC.
-
-        Args:
-            cartridges: List of cartridge specifications from the request
-            prompt_token_ids: Original prompt token IDs
-            request_id: Request ID to associate with learned cartridges
-
-        Returns:
-            Tuple of:
-            - Combined token IDs with cartridge tokens prepended (for pre-computed),
-              or original prompt_token_ids (for learned cartridges)
-            - Stacked cartridge KV tensors [keys, values] for learned cartridges,
-              or None (use shm_path instead for zero-copy)
-            - Cartridge ID for deduplication, or None if no learned cartridge
-            - Cartridge sequence length, or None if no learned cartridge
-            - Path to cartridge KV in shared memory, or None if not saved
-            - Whether this request allows cartridge pipelining
-        """
-        import asyncio
-
-        import torch
-
-        if not cartridges:
-            return prompt_token_ids, None, None, None, None, None
-
-        from vllm.logger import init_logger
-        from vllm.v1.cartridge_loader import (
-            load_cartridges_from_request,
-            save_cartridge_to_shm,
-        )
-
-        logger = init_logger(__name__)
-
-        try:
-            # Load cartridges in a thread to avoid blocking the event loop
-            # during volume reloads, file locks, and torch.load().
-            loaded_cartridges = await asyncio.to_thread(
-                load_cartridges_from_request, cartridges
-            )
-
-            # Separate learned and pre-computed cartridges
-            learned_cartridges = []
-            learned_cartridge_ids = []
-            learned_cartridge_allow_pipelining = []
-            precomputed_cartridges = []
-
-            for i, cartridge_data in enumerate(loaded_cartridges):
-                if cartridge_data.is_learned:
-                    learned_cartridges.append(cartridge_data)
-                    # Get cartridge ID from original spec
-                    learned_cartridge_ids.append(
-                        cartridges[i].get("id", f"unknown_{i}")
-                    )
-                    learned_cartridge_allow_pipelining.append(
-                        bool(cartridges[i].get("allow_pipelining", False))
-                    )
-                elif cartridge_data.has_valid_token_ids():
-                    precomputed_cartridges.append(cartridge_data)
-                else:
-                    logger.warning(
-                        "Skipping cartridge with no valid token_ids "
-                        "and not marked as learned"
-                    )
-
-            # Handle learned cartridges - save to shm for zero-copy IPC
-            stacked_cartridge_kv: list[torch.Tensor] | None = None
-            cartridge_id: str | None = None
-            cartridge_seq_len: int | None = None
-            cartridge_shm_path: str | None = None
-            allow_pipelining: bool | None = None
-            if learned_cartridges:
-                # Currently only supports one learned cartridge per request
-                if len(learned_cartridges) > 1:
-                    logger.warning(
-                        "Multiple learned cartridges detected. "
-                        "Only the first one will be used."
-                    )
-
-                cartridge_data = learned_cartridges[0]
-                cartridge_id = learned_cartridge_ids[0]
-                cartridge_seq_len = cartridge_data.num_tokens
-                allow_pipelining = learned_cartridge_allow_pipelining[0]
-                assert cartridge_id is not None  # Guaranteed by learned_cartridge_ids
-
-                # Get stacked KV tensors and save to shared storage for zero-copy IPC.
-                # Use volume-backed storage instead of /dev/shm for Modal compatibility.
-                # Only save once per cartridge to avoid repeated disk writes.
-                if cartridge_id in self._sent_cartridge_ids:
-                    self._sent_cartridge_ids.move_to_end(cartridge_id)  # LRU touch
-                    # Already saved to shared storage — re-send the shm path
-                    # so engine core can reload if it evicted from its LRU cache.
-                    stacked_cartridge_kv = None
-                    cartridge_shm_path = self._sent_cartridge_ids[cartridge_id]
-                else:
-                    stacked_cartridge_kv = cartridge_data.get_stacked_kv()
-                    if stacked_cartridge_kv is not None:
-                        # Validate cartridge is compatible with this model
-                        stacked_keys = stacked_cartridge_kv[0]
-                        _, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
-                        expected_kv_heads = self.model_config.get_total_num_kv_heads()
-                        expected_head_size = self.model_config.get_head_size()
-                        if cart_kv_heads != expected_kv_heads:
-                            raise ValueError(
-                                f"Cartridge incompatible with model "
-                                f"{self.model_config.model}: cartridge has "
-                                f"{cart_kv_heads} KV heads but model expects "
-                                f"{expected_kv_heads}. The cartridge may have "
-                                f"been trained on a different model."
-                            )
-                        if cart_head_dim != expected_head_size:
-                            raise ValueError(
-                                f"Cartridge incompatible with model "
-                                f"{self.model_config.model}: cartridge has "
-                                f"head_dim={cart_head_dim} but model expects "
-                                f"{expected_head_size}. The cartridge may have "
-                                f"been trained on a different model."
-                            )
-
-                        # Save to shared storage (Modal volume) for zero-copy IPC
-                        cartridge_shm_path = save_cartridge_to_shm(
-                            cartridge_id, stacked_cartridge_kv
-                        )
-                        # Don't send tensors via IPC, engine core will load from shared storage
-                        stacked_cartridge_kv = None
-                        self._sent_cartridge_ids[cartridge_id] = cartridge_shm_path
-                        # LRU eviction
-                        while len(self._sent_cartridge_ids) > self._sent_cartridge_ids_max_size:
-                            self._sent_cartridge_ids.popitem(last=False)
-                    else:
-                        # No KV data available
-                        cartridge_shm_path = None
-
-            # Handle pre-computed cartridges (token prepending for prefix caching)
-            cartridge_token_ids = []
-            for cartridge_data in precomputed_cartridges:
-                cartridge_token_ids.extend(cartridge_data.token_ids.tolist())
-
-            if cartridge_token_ids:
-                logger.info(
-                    "Prepending %d tokens from %d pre-computed cartridge(s) to prompt",
-                    len(cartridge_token_ids),
-                    len(precomputed_cartridges),
-                )
-                return (
-                    cartridge_token_ids + prompt_token_ids,
-                    stacked_cartridge_kv,
-                    cartridge_id,
-                    cartridge_seq_len,
-                    cartridge_shm_path,
-                    allow_pipelining,
-                )
-            else:
-                return (
-                    prompt_token_ids,
-                    stacked_cartridge_kv,
-                    cartridge_id,
-                    cartridge_seq_len,
-                    cartridge_shm_path,
-                    allow_pipelining,
-                )
-
-        except Exception as e:
-            logger.error("Failed to process cartridges: %s", e)
-            raise RuntimeError(f"Failed to process cartridges: {e}") from e
-
-    def _prepare_staged_lora_dir(
-        self,
-        lora_id: str,
-        force_redownload: bool,
-    ) -> str:
-        from safetensors.torch import save_file as safetensors_save_file
-
-        from vllm.utils.adapter_manager import get_adapter_manager
-
-        lora_hash = hashlib.sha256(lora_id.encode()).hexdigest()[:16]
-        lora_cache_dir = envs.VLLM_LORA_RESOLVER_CACHE_DIR or tempfile.gettempdir()
-        local_lora_dir = Path(lora_cache_dir) / lora_hash
-        adapter_model_path = local_lora_dir / "adapter_model.safetensors"
-        adapter_config_path = local_lora_dir / "adapter_config.json"
-
-        def _can_reuse() -> bool:
-            cached = self._prepared_lora_dirs.get(lora_id)
-            return (
-                not force_redownload
-                and cached == str(local_lora_dir)
-                and adapter_model_path.exists()
-                and adapter_config_path.exists()
-            )
-
-        # Fast path: reuse already-staged adapter without acquiring the lock.
-        if _can_reuse():
-            self._prepared_lora_dirs.move_to_end(lora_id)  # LRU touch
-            logger.debug(
-                "[LoRA] reusing prepared adapter directory: %s",
-                local_lora_dir,
-            )
-            return str(local_lora_dir)
-
-        # Acquire a per-adapter lock so concurrent threads for the same
-        # lora_id serialize instead of racing to rmtree + re-stage.
-        with self._lora_staging_locks_meta:
-            if lora_id not in self._lora_staging_locks:
-                self._lora_staging_locks[lora_id] = threading.Lock()
-            lock = self._lora_staging_locks[lora_id]
-
-        with lock:
-            # Double-check after acquiring lock: a sibling thread may have
-            # already staged the adapter while we were waiting.
-            if _can_reuse():
-                self._prepared_lora_dirs.move_to_end(lora_id)
-                logger.debug(
-                    "[LoRA] reusing prepared adapter directory (post-lock): %s",
-                    local_lora_dir,
-                )
-                return str(local_lora_dir)
-
-            if lora_id in self._prepared_lora_dirs:
-                self._prepared_lora_dirs.pop(lora_id, None)
-
-            manager = get_adapter_manager()
-            logger.info(
-                "[LoRA] staging adapter_id=%s force=%s",
-                lora_id,
-                force_redownload,
-            )
-            lora_data = manager.get_adapter(
-                adapter_id=lora_id,
-                force_redownload=force_redownload,
-            )
-            logger.info(
-                "[LoRA] got %d keys: %s, shapes: %s",
-                len(lora_data),
-                list(lora_data.keys())[:5],
-                {k: v.shape for k, v in list(lora_data.items())[:5]},
-            )
-
-            if local_lora_dir.exists():
-                shutil.rmtree(local_lora_dir)
-            local_lora_dir.mkdir(parents=True, exist_ok=True)
-
-            safetensors_save_file(lora_data, str(adapter_model_path))
-
-            source_dir = _normalize_lora_runtime_path(lora_id)
-            config_ids = [
-                os.path.join(source_dir, "adapter_config.json"),
-                os.path.join(source_dir, "lora_config.json"),
-            ]
-            last_error = None
-            for config_id in config_ids:
-                try:
-                    manager.download_json(
-                        json_id=config_id,
-                        target_path=adapter_config_path,
-                    )
-                    break
-                except Exception as e:
-                    last_error = e
-            else:
-                raise RuntimeError(
-                    "Failed to download LoRA config from any known path "
-                    f"{config_ids}: {last_error}"
-                ) from last_error
-
-            self._prepared_lora_dirs[lora_id] = str(local_lora_dir)
-            self._prepared_lora_dirs.move_to_end(lora_id)  # LRU touch
-            while len(self._prepared_lora_dirs) > self._prepared_lora_dirs_max_size:
-                self._prepared_lora_dirs.popitem(last=False)
-            return str(local_lora_dir)
-
-    async def _process_lora(
-        self,
-        lora_specs: list[dict[str, Any]] | None,
-        request_id: str | None = None,
-    ) -> LoRARequest | None:
-        """
-        Process LoRA adapter specifications and create a LoRARequest.
-
-        Args:
-            lora_specs: List of LoRA adapter specifications from the request
-            request_id: Request ID to associate with the LoRA adapter
-
-        Returns:
-            LoRARequest object if LoRA adapters are specified, None otherwise
-        """
-        if not lora_specs:
-            return None
-
-        from vllm.logger import init_logger
-        from vllm.v1.cartridge_loader import _resolve_glob
-
-        logger = init_logger(__name__)
-
-        try:
-            # Only support one LoRA adapter per request
-            if len(lora_specs) > 1:
-                logger.warning(
-                    "Multiple LoRA adapters detected (%d). "
-                    "Only the first one will be used.",
-                    len(lora_specs),
-                )
-
-            lora_spec = lora_specs[0]
-            lora_id = lora_spec.get("id")
-            # lora_source is available but not yet used for different backends
-            _ = lora_spec.get("source", "s3")
-            force_redownload = lora_spec.get("force_redownload", False)
-
-            if not lora_id:
-                logger.error("LoRA adapter spec missing 'id' field")
-                return None
-
-            resolved_id = await asyncio.to_thread(_resolve_glob, lora_id)
-            if resolved_id is None:
-                raise RuntimeError(f"Could not resolve LoRA glob: {lora_id}")
-            if resolved_id != lora_id:
-                logger.info("Using LoRA: %s -> %s", lora_id, resolved_id)
-
-            if _requires_staged_lora_dir(resolved_id):
-                runtime_lora_path = await asyncio.to_thread(
-                    self._prepare_staged_lora_dir,
-                    resolved_id,
-                    force_redownload,
-                )
-            else:
-                runtime_lora_path = _normalize_lora_runtime_path(resolved_id)
-
-            logger.debug("LoRA runtime path: %s", runtime_lora_path)
-
-            # Route request-body LoRAs through the same synchronized registry
-            # used by the explicit runtime load API so cold replicas do not
-            # race engine mutation during their first generation request.
-            async with self.models.lora_resolver_lock[resolved_id]:
-                return await self.models._ensure_lora_loaded_unlocked(
-                    lora_name=resolved_id,
-                    lora_path=runtime_lora_path,
-                    base_model_name=self.model_config.model,
-                    load_inplace=force_redownload,
-                )
-
-        except Exception as e:
-            logger.error("Failed to process LoRA adapters: %s", e)
-            raise RuntimeError(f"Failed to process LoRA adapters: {e}") from e
+        self.model_config = engine_client.model_config
+        self.renderer = engine_client.renderer
+        self.io_processor = engine_client.io_processor
+        self.input_processor = engine_client.input_processor
 
     async def beam_search(
         self,
-        prompt: TokPrompt,
+        prompt: EngineInput,
         request_id: str,
         params: BeamSearchParams,
         lora_request: LoRARequest | None = None,
@@ -728,86 +202,54 @@ class OpenAIServing:
         length_penalty = params.length_penalty
         include_stop_str_in_output = params.include_stop_str_in_output
 
-        input_processor = self.input_processor
-        tokenizer = input_processor.tokenizer
-        if tokenizer is None:
-            raise VLLMValidationError(
-                "You cannot use beam search when `skip_tokenizer_init=True`",
-                parameter="skip_tokenizer_init",
-                value=True,
-            )
+        tokenizer = self.renderer.get_tokenizer()
+        eos_token_id = tokenizer.eos_token_id
+        sort_beams_key = create_sort_beams_key_function(eos_token_id, length_penalty)
 
-        eos_token_id: int = tokenizer.eos_token_id  # type: ignore
+        if prompt["type"] == "embeds":
+            raise NotImplementedError("Embedding prompt not supported for beam search")
 
-        if isinstance(prompt, dict) and "encoder_prompt" in prompt:
-            raise NotImplementedError("Encoder-decoder prompt not supported")
-
-        prompt_text: str | None = prompt.get("prompt")  # type: ignore
-        prompt_token_ids: list[int] = prompt.get("prompt_token_ids", [])  # type: ignore
-        multi_modal_data: MultiModalDataDict | None = prompt.get("multi_modal_data")  # type: ignore
-
-        mm_processor_kwargs: dict[str, Any] | None = None
-
-        # This is a workaround to fix multimodal beam search; this is a
-        # bandaid fix for 2 small problems:
-        # 1. Multi_modal_data on the processed_inputs currently resolves to
-        #    `None`.
-        # 2. preprocessing above expands the multimodal placeholders. However,
-        #    this happens again in generation, so the double expansion causes
-        #    a mismatch.
-        # TODO - would be ideal to handle this more gracefully.
+        # Extract prompt tokens and text based on model type
+        decoder_prompt = (
+            prompt if prompt["type"] != "enc_dec" else prompt["decoder_prompt"]
+        )
+        prompt_text = decoder_prompt.get("prompt")
+        prompt_token_ids = decoder_prompt["prompt_token_ids"]
 
         tokenized_length = len(prompt_token_ids)
 
-        sort_beams_key = create_sort_beams_key_function(eos_token_id, length_penalty)
-
         logprobs_num = 2 * beam_width
-        beam_search_params = SamplingParams(
+        sampling_params = SamplingParams(
             logprobs=logprobs_num,
             max_tokens=1,
             temperature=temperature,
         )
         all_beams = [
             BeamSearchSequence(
+                orig_prompt=prompt,
                 tokens=prompt_token_ids,
                 cum_logprob=0,
                 logprobs=[],
-                multi_modal_data=multi_modal_data,
-                mm_processor_kwargs=mm_processor_kwargs,
                 lora_request=lora_request,
             )
         ]
         completed = []
 
         for _ in range(max_tokens):
-            prompts_batch, lora_req_batch = zip(
-                *[
-                    (
-                        TokensPrompt(
-                            prompt_token_ids=beam.tokens,
-                            multi_modal_data=beam.multi_modal_data,
-                            mm_processor_kwargs=beam.mm_processor_kwargs,
-                        ),
-                        beam.lora_request,
-                    )
-                    for beam in all_beams
-                ]
-            )
-
             tasks = []
             request_id_batch = f"{request_id}-{random_uuid()}"
 
-            for i, (individual_prompt, lora_req) in enumerate(
-                zip(prompts_batch, lora_req_batch)
-            ):
+            for i, beam in enumerate(all_beams):
+                prompt_item = beam.get_prompt()
+                lora_request_item = beam.lora_request
                 request_id_item = f"{request_id_batch}-beam-{i}"
                 task = asyncio.create_task(
                     collect_from_async_generator(
                         self.engine_client.generate(
-                            individual_prompt,
-                            beam_search_params,
+                            prompt_item,
+                            sampling_params,
                             request_id_item,
-                            lora_request=lora_req,
+                            lora_request=lora_request_item,
                             trace_headers=trace_headers,
                         )
                     )
@@ -872,6 +314,7 @@ class OpenAIServing:
                     logprobs_entry = result.outputs[0].logprobs[0]
                     completed.append(
                         BeamSearchSequence(
+                            orig_prompt=prompt,
                             tokens=current_beam.tokens + [eos_token_id]
                             if include_stop_str_in_output
                             else current_beam.tokens,
@@ -899,12 +342,11 @@ class OpenAIServing:
                 logprobs_entry = result.outputs[0].logprobs[0]
                 new_beams.append(
                     BeamSearchSequence(
+                        orig_prompt=prompt,
                         tokens=current_beam.tokens + [token_id],
                         logprobs=current_beam.logprobs + [logprobs_entry],
                         lora_request=current_beam.lora_request,
                         cum_logprob=float(all_beams_logprob[idx]),
-                        multi_modal_data=current_beam.multi_modal_data,
-                        mm_processor_kwargs=current_beam.mm_processor_kwargs,
                     )
                 )
 
@@ -949,8 +391,7 @@ class OpenAIServing:
         ctx: ServeContext,
     ) -> ErrorResponse | None:
         """
-        Default preprocessing hook. Subclasses may override
-        to prepare `ctx` (classification, embedding, etc.).
+        Default preprocessing hook. Subclasses may override to prepare `ctx`.
         """
         return None
 
@@ -1002,12 +443,12 @@ class OpenAIServing:
 
         if (
             truncate_prompt_tokens is not None
-            and truncate_prompt_tokens > self.max_model_len
+            and truncate_prompt_tokens > self.model_config.max_model_len
         ):
             return self.create_error_response(
                 "truncate_prompt_tokens value is "
                 "greater than max_model_len."
-                " Please, select a smaller truncation size."
+                " Please request a smaller truncation size."
             )
         return None
 
@@ -1029,133 +470,79 @@ class OpenAIServing:
         """Schedule the request and get the result generator."""
         generators: list[AsyncGenerator[PoolingRequestOutput, None]] = []
 
-        try:
-            trace_headers = (
-                None
-                if ctx.raw_request is None
-                else await self._get_trace_headers(ctx.raw_request.headers)
+        trace_headers = (
+            None
+            if ctx.raw_request is None
+            else await self._get_trace_headers(ctx.raw_request.headers)
+        )
+
+        pooling_params = self._create_pooling_params(ctx)
+        if isinstance(pooling_params, ErrorResponse):
+            return pooling_params
+
+        if ctx.engine_inputs is None:
+            return self.create_error_response("Engine prompts not available")
+
+        for i, engine_input in enumerate(ctx.engine_inputs):
+            request_id_item = f"{ctx.request_id}-{i}"
+
+            self._log_inputs(
+                request_id_item,
+                engine_input,
+                params=pooling_params,
+                lora_request=ctx.lora_request,
             )
 
-            pooling_params = self._create_pooling_params(ctx)
-            if isinstance(pooling_params, ErrorResponse):
-                return pooling_params
+            generator = self.engine_client.encode(
+                engine_input,
+                pooling_params,
+                request_id_item,
+                lora_request=ctx.lora_request,
+                trace_headers=trace_headers,
+                priority=getattr(ctx.request, "priority", 0),
+            )
 
-            if ctx.engine_prompts is None:
-                return self.create_error_response("Engine prompts not available")
+            generators.append(generator)
 
-            for i, engine_prompt in enumerate(ctx.engine_prompts):
-                request_id_item = f"{ctx.request_id}-{i}"
+        ctx.result_generator = merge_async_iterators(*generators)
 
-                self._log_inputs(
-                    request_id_item,
-                    engine_prompt,
-                    params=pooling_params,
-                    lora_request=ctx.lora_request,
-                )
-
-                generator = self.engine_client.encode(
-                    engine_prompt,
-                    pooling_params,
-                    request_id_item,
-                    lora_request=ctx.lora_request,
-                    trace_headers=trace_headers,
-                    priority=getattr(ctx.request, "priority", 0),
-                )
-
-                generators.append(generator)
-
-            ctx.result_generator = merge_async_iterators(*generators)
-
-            return None
-
-        except Exception as e:
-            return self.create_error_response(e)
+        return None
 
     async def _collect_batch(
         self,
         ctx: ServeContext,
     ) -> ErrorResponse | None:
         """Collect batch results from the result generator."""
-        try:
-            if ctx.engine_prompts is None:
-                return self.create_error_response("Engine prompts not available")
+        if ctx.engine_inputs is None:
+            return self.create_error_response("Engine prompts not available")
 
-            num_prompts = len(ctx.engine_prompts)
-            final_res_batch: list[PoolingRequestOutput | None]
-            final_res_batch = [None] * num_prompts
+        num_prompts = len(ctx.engine_inputs)
+        final_res_batch: list[PoolingRequestOutput | None]
+        final_res_batch = [None] * num_prompts
 
-            if ctx.result_generator is None:
-                return self.create_error_response("Result generator not available")
+        if ctx.result_generator is None:
+            return self.create_error_response("Result generator not available")
 
-            async for i, res in ctx.result_generator:
-                final_res_batch[i] = res
+        async for i, res in ctx.result_generator:
+            final_res_batch[i] = res
 
-            if None in final_res_batch:
-                return self.create_error_response(
-                    "Failed to generate results for all prompts"
-                )
+        if None in final_res_batch:
+            return self.create_error_response(
+                "Failed to generate results for all prompts"
+            )
 
-            ctx.final_res_batch = [res for res in final_res_batch if res is not None]
+        ctx.final_res_batch = [res for res in final_res_batch if res is not None]
 
-            return None
+        return None
 
-        except Exception as e:
-            return self.create_error_response(e)
-
+    @staticmethod
     def create_error_response(
-        self,
         message: str | Exception,
         err_type: str = "BadRequestError",
         status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
         param: str | None = None,
     ) -> ErrorResponse:
-        exc: Exception | None = None
-
-        if isinstance(message, Exception):
-            exc = message
-
-            from vllm.exceptions import VLLMValidationError
-
-            if isinstance(exc, VLLMValidationError):
-                err_type = "BadRequestError"
-                status_code = HTTPStatus.BAD_REQUEST
-                param = exc.parameter
-            elif isinstance(exc, (ValueError, TypeError, RuntimeError, OverflowError)):
-                # Common validation errors from user input
-                err_type = "BadRequestError"
-                status_code = HTTPStatus.BAD_REQUEST
-                param = None
-            elif isinstance(exc, NotImplementedError):
-                err_type = "NotImplementedError"
-                status_code = HTTPStatus.NOT_IMPLEMENTED
-                param = None
-            elif exc.__class__.__name__ == "TemplateError":
-                # jinja2.TemplateError (avoid importing jinja2)
-                err_type = "BadRequestError"
-                status_code = HTTPStatus.BAD_REQUEST
-                param = None
-            else:
-                err_type = "InternalServerError"
-                status_code = HTTPStatus.INTERNAL_SERVER_ERROR
-                param = None
-
-            message = str(exc)
-
-        if self.log_error_stack:
-            exc_type, _, _ = sys.exc_info()
-            if exc_type is not None:
-                traceback.print_exc()
-            else:
-                traceback.print_stack()
-
-        return ErrorResponse(
-            error=ErrorInfo(
-                message=sanitize_message(message),
-                type=err_type,
-                code=status_code.value,
-                param=param,
-            )
-        )
+        return create_error_response(message, err_type, status_code, param)
 
     def create_streaming_error_response(
         self,
@@ -1182,16 +569,6 @@ class OpenAIServing:
                 request_id,
             )
             raise GenerationError("Internal server error")
-
-    def _convert_generation_error_to_response(
-        self, e: GenerationError
-    ) -> ErrorResponse:
-        """Convert GenerationError to ErrorResponse."""
-        return self.create_error_response(
-            str(e),
-            err_type="InternalServerError",
-            status_code=e.status_code,
-        )
 
     def _convert_generation_error_to_streaming_response(
         self, e: GenerationError
@@ -1302,90 +679,6 @@ class OpenAIServing:
                         message_types.add(content_dict["type"].split("_")[0])
         return message_types
 
-    def _validate_input(
-        self,
-        request: object,
-        input_ids: list[int],
-        input_text: str,
-    ) -> TokensPrompt:
-        token_num = len(input_ids)
-
-        # Note: EmbeddingRequest, ClassificationRequest,
-        # and ScoreRequest doesn't have max_tokens
-        if isinstance(
-            request,
-            (
-                EmbeddingChatRequest,
-                EmbeddingCompletionRequest,
-                ScoreDataRequest,
-                ScoreTextRequest,
-                ScoreQueriesDocumentsRequest,
-                RerankRequest,
-                ClassificationCompletionRequest,
-                ClassificationChatRequest,
-            ),
-        ):
-            # Note: input length can be up to the entire model context length
-            # since these requests don't generate tokens.
-            if token_num > self.max_model_len:
-                operations: dict[type[AnyRequest], str] = {
-                    ScoreDataRequest: "score",
-                    ScoreTextRequest: "score",
-                    ScoreQueriesDocumentsRequest: "score",
-                    ClassificationCompletionRequest: "classification",
-                    ClassificationChatRequest: "classification",
-                }
-                operation = operations.get(type(request), "embedding generation")
-                raise VLLMValidationError(
-                    f"This model's maximum context length is "
-                    f"{self.max_model_len} tokens. However, you requested "
-                    f"{token_num} tokens in the input for {operation}. "
-                    f"Please reduce the length of the input.",
-                    parameter="input_tokens",
-                    value=token_num,
-                )
-            return TokensPrompt(prompt=input_text, prompt_token_ids=input_ids)
-
-        # Note: TokenizeRequest and DetokenizeRequest doesn't have max_tokens
-        # and does not require model context length validation
-        if isinstance(
-            request,
-            (TokenizeCompletionRequest, TokenizeChatRequest, DetokenizeRequest),
-        ):
-            return TokensPrompt(prompt=input_text, prompt_token_ids=input_ids)
-
-        # chat completion endpoint supports max_completion_tokens
-        if isinstance(request, ChatCompletionRequest):
-            # TODO(#9845): remove max_tokens when field dropped from OpenAI API
-            max_tokens = request.max_completion_tokens or request.max_tokens
-        else:
-            max_tokens = getattr(request, "max_tokens", None)
-
-        # Note: input length can be up to model context length - 1 for
-        # completion-like requests.
-        if token_num >= self.max_model_len:
-            raise VLLMValidationError(
-                f"This model's maximum context length is "
-                f"{self.max_model_len} tokens. However, your request has "
-                f"{token_num} input tokens. Please reduce the length of "
-                "the input messages.",
-                parameter="input_tokens",
-                value=token_num,
-            )
-
-        if max_tokens is not None and token_num + max_tokens > self.max_model_len:
-            raise VLLMValidationError(
-                "'max_tokens' or 'max_completion_tokens' is too large: "
-                f"{max_tokens}. This model's maximum context length is "
-                f"{self.max_model_len} tokens and your request has "
-                f"{token_num} input tokens ({max_tokens} > {self.max_model_len}"
-                f" - {token_num}).",
-                parameter="max_tokens",
-                value=max_tokens,
-            )
-
-        return TokensPrompt(prompt=input_text, prompt_token_ids=input_ids)
-
     def _validate_chat_template(
         self,
         request_chat_template: str | None,
@@ -1418,229 +711,79 @@ class OpenAIServing:
         # Apply server defaults first, then request kwargs override.
         return default_chat_template_kwargs | request_chat_template_kwargs
 
-    async def _preprocess_completion(
-        self,
-        request: RendererRequest,
-        prompt_input: str | list[str] | list[int] | list[list[int]] | None,
-        prompt_embeds: bytes | list[bytes] | None,
-    ) -> list[TokPrompt]:
-        renderer = self.renderer
-        model_config = self.model_config
-
-        prompts = list[SingletonPrompt | bytes]()
-        if prompt_embeds is not None:  # embeds take higher priority
-            prompts.extend(prompt_to_seq(prompt_embeds))
-        if prompt_input is not None:
-            prompts.extend(prompt_to_seq(prompt_input))
-
-        parsed_prompts = [
-            (
-                prompt
-                if isinstance(prompt, bytes)
-                else parse_model_prompt(model_config, prompt)
-            )
-            for prompt in prompts
-        ]
-        tok_params = request.build_tok_params(model_config)
-
-        return await renderer.render_cmpl_async(
-            parsed_prompts,
-            tok_params,
-            prompt_extras={
-                k: v
-                for k in ("mm_processor_kwargs", "cache_salt")
-                if (v := getattr(request, k, None)) is not None
-            },
-        )
-
-    async def _preprocess_chat(
-        self,
-        request: RendererChatRequest,
-        messages: list[ChatCompletionMessageParam],
-        default_template: str | None,
-        default_template_content_format: ChatTemplateContentFormatOption,
-        default_template_kwargs: dict[str, Any] | None,
-        tool_dicts: list[dict[str, Any]] | None = None,
-        tool_parser: Callable[[TokenizerLike], ToolParser] | None = None,
-    ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
-        from vllm.tokenizers.mistral import MistralTokenizer
-
-        renderer = self.renderer
-
-        default_template_kwargs = merge_kwargs(
-            default_template_kwargs,
-            dict(
-                tools=tool_dicts,
-                tokenize=isinstance(renderer.tokenizer, MistralTokenizer),
-            ),
-        )
-
-        tok_params = request.build_tok_params(self.model_config)
-        chat_params = request.build_chat_params(
-            default_template, default_template_content_format
-        ).with_defaults(default_template_kwargs)
-
-        (conversation,), (engine_prompt,) = await renderer.render_chat_async(
-            [messages],
-            chat_params,
-            tok_params,
-            prompt_extras={
-                k: v
-                for k in ("mm_processor_kwargs", "cache_salt")
-                if (v := getattr(request, k, None)) is not None
-            },
-        )
-
-        # tool parsing is done only if a tool_parser has been set and if
-        # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
-        # is set, we want to prevent parsing a tool_call hallucinated by the LLM
-        if tool_parser is not None:
-            tool_choice = getattr(request, "tool_choice", "none")
-            if tool_choice != "none":
-                if not isinstance(request, ChatCompletionRequest | ResponsesRequest):
-                    msg = (
-                        "Tool usage is only supported for Chat Completions API "
-                        "or Responses API requests."
-                    )
-                    raise NotImplementedError(msg)
-
-                # TODO: Update adjust_request to accept ResponsesRequest
-                tokenizer = renderer.get_tokenizer()
-                request = tool_parser(tokenizer).adjust_request(request=request)  # type: ignore[arg-type]
-
-        return conversation, [engine_prompt]
-
-    def _extract_prompt_components(self, prompt: object):
+    def _extract_prompt_components(self, prompt: PromptType | EngineInput):
         return extract_prompt_components(self.model_config, prompt)
 
-    def _extract_prompt_text(self, prompt: object):
+    def _extract_prompt_text(self, prompt: PromptType | EngineInput):
         return self._extract_prompt_components(prompt).text
 
-    def _extract_prompt_len(self, prompt: object):
+    def _extract_prompt_len(self, prompt: EngineInput):
         return extract_prompt_len(self.model_config, prompt)
 
-    async def _render_next_turn(
+    async def _maybe_build_engine_request_with_cartridge(
         self,
-        request: ResponsesRequest,
-        messages: list[ResponseInputOutputItem],
-        tool_dicts: list[dict[str, Any]] | None,
-        tool_parser: Callable[[TokenizerLike], ToolParser] | None,
-        chat_template: str | None,
-        chat_template_content_format: ChatTemplateContentFormatOption,
-    ):
-        new_messages = construct_input_messages(
-            request_input=messages,
-        )
-
-        _, engine_prompts = await self._preprocess_chat(
-            request,
-            new_messages,
-            default_template=chat_template,
-            default_template_content_format=chat_template_content_format,
-            default_template_kwargs=None,
-            tool_dicts=tool_dicts,
-            tool_parser=tool_parser,
-        )
-        return engine_prompts
-
-    async def _generate_with_builtin_tools(
-        self,
+        request: AnyRequest,
+        engine_input: EngineInput,
         request_id: str,
-        engine_prompt: TokPrompt,
-        sampling_params: SamplingParams,
-        tok_params: TokenizeParams,
-        context: ConversationContext,
-        lora_request: LoRARequest | None = None,
-        priority: int = 0,
-        trace_headers: Mapping[str, str] | None = None,
-    ):
-        prompt_text = self._extract_prompt_text(engine_prompt)
+        params: SamplingParams | PoolingParams,
+        lora_request: LoRARequest | None,
+        trace_headers: Mapping[str, str] | None,
+        priority: int,
+        data_parallel_rank: int | None,
+    ) -> EngineInput | EngineCoreRequest:
+        adapters = getattr(request, "adapters", None)
+        if not isinstance(adapters, dict):
+            return engine_input
 
-        orig_priority = priority
-        sub_request = 0
-        while True:
-            # Ensure that each sub-request has a unique request id.
-            sub_request_id = f"{request_id}_{sub_request}"
+        prefix_specs = adapters.get("prefix")
+        if not prefix_specs:
+            return engine_input
+        if not isinstance(prefix_specs, list):
+            raise ValueError("`adapters.prefix` must be a list.")
+        if len(prefix_specs) != 1:
+            raise ValueError("Exactly one prefix cartridge is currently supported.")
 
-            self._log_inputs(
-                sub_request_id,
-                engine_prompt,
-                params=sampling_params,
-                lora_request=lora_request,
+        cartridge_spec = prefix_specs[0]
+        if not isinstance(cartridge_spec, dict):
+            raise ValueError("Each prefix cartridge spec must be an object.")
+
+        loaded_cartridges = load_cartridges_from_request(prefix_specs)
+        if len(loaded_cartridges) != 1:
+            raise ValueError("Failed to load prefix cartridge.")
+
+        cartridge = loaded_cartridges[0]
+        stacked_kv = cartridge.get_stacked_kv()
+        if stacked_kv is None:
+            raise ValueError(
+                "Only learned prefix cartridges with KV tensors are currently supported."
             )
 
-            tokenization_kwargs = tok_params.get_encode_kwargs()
-            engine_request = self.input_processor.process_inputs(
-                sub_request_id,
-                engine_prompt,
-                sampling_params,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-            )
+        cartridge_id = cartridge_spec.get("id")
+        if not cartridge_id:
+            raise ValueError("Prefix cartridge spec must include `id`.")
 
-            generator = self.engine_client.generate(
-                engine_request,
-                sampling_params,
-                sub_request_id,
-                lora_request=lora_request,
-                trace_headers=trace_headers,
-                priority=priority,
-                prompt_text=prompt_text,
-                tokenization_kwargs=tokenization_kwargs,
-            )
-
-            async for res in generator:
-                context.append_output(res)
-                # NOTE(woosuk): The stop condition is handled by the engine.
-                yield context
-
-            if not context.need_builtin_tool_call():
-                # The model did not ask for a tool call, so we're done.
-                break
-
-            # Call the tool and update the context with the result.
-            tool_output = await context.call_tool()
-            context.append_tool_output(tool_output)
-
-            # TODO: uncomment this and enable tool output streaming
-            # yield context
-
-            # Create inputs for the next turn.
-            # Render the next prompt token ids and update sampling_params.
-            if isinstance(context, (HarmonyContext, StreamingHarmonyContext)):
-                token_ids = context.render_for_completion()
-                engine_prompt = TokensPrompt(prompt_token_ids=token_ids)
-
-                sampling_params.max_tokens = self.max_model_len - len(token_ids)
-            elif isinstance(context, ParsableContext):
-                engine_prompts = await self._render_next_turn(
-                    context.request,
-                    context.parser.response_messages,
-                    context.tool_dicts,
-                    context.tool_parser_cls,
-                    context.chat_template,
-                    context.chat_template_content_format,
-                )
-                engine_prompt = engine_prompts[0]
-                prompt_text = self._extract_prompt_text(engine_prompt)
-
-                sampling_params.max_tokens = get_max_tokens(
-                    self.max_model_len,
-                    context.request.max_output_tokens,
-                    self._extract_prompt_len(engine_prompt),
-                    self.default_sampling_params,  # type: ignore
-                )
-
-            # OPTIMIZATION
-            priority = orig_priority - 1
-            sub_request += 1
+        shm_path = save_cartridge_to_shm(cartridge_id, stacked_kv)
+        return self.input_processor.process_inputs(
+            request_id,
+            engine_input,
+            params,
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+            supported_tasks=await self.engine_client.get_supported_tasks(),
+            cartridge_id=cartridge_id,
+            cartridge_seq_len=cartridge.num_tokens,
+            cartridge_shm_path=shm_path,
+            cartridge_allow_pipelining=bool(
+                cartridge_spec.get("allow_pipelining", False)
+            ),
+        )
 
     def _log_inputs(
         self,
         request_id: str,
-        inputs: PromptType | TokPrompt,
+        inputs: PromptType | EngineInput,
         params: SamplingParams | PoolingParams | BeamSearchParams | None,
         lora_request: LoRARequest | None,
     ) -> None:
@@ -1704,7 +847,7 @@ class OpenAIServing:
         request: ResponsesRequest | ChatCompletionRequest,
         tokenizer: TokenizerLike | None,
         enable_auto_tools: bool,
-        tool_parser_cls: Callable[[TokenizerLike], ToolParser] | None,
+        tool_parser_cls: type[ToolParser] | None,
         content: str | None = None,
     ) -> tuple[list[FunctionCall] | None, str | None]:
         function_calls = list[FunctionCall]()
@@ -1725,17 +868,19 @@ class OpenAIServing:
             )
             content = None  # Clear content since tool is called.
         elif request.tool_choice == "required":
-            assert content is not None
-            tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(content)
-            function_calls.extend(
-                [
+            tool_calls = []
+            with contextlib.suppress(ValidationError):
+                content = content or ""
+                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
+                    content
+                )
+            for tool_call in tool_calls:
+                function_calls.append(
                     FunctionCall(
                         name=tool_call.name,
                         arguments=json.dumps(tool_call.parameters, ensure_ascii=False),
                     )
-                    for tool_call in tool_calls
-                ]
-            )
+                )
             content = None  # Clear content since tool is called.
         elif (
             tool_parser_cls
@@ -1749,7 +894,7 @@ class OpenAIServing:
 
             # Automatic Tool Call Parsing
             try:
-                tool_parser = tool_parser_cls(tokenizer)
+                tool_parser = tool_parser_cls(tokenizer, request.tools)
             except RuntimeError as e:
                 logger.exception("Error in tool parser creation.")
                 raise e

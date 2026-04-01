@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import sys
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from pydantic import ValidationError
 
 from vllm.compilation.counter import compilation_counter
@@ -83,6 +86,44 @@ def test_custom_op():
 
     with pytest.raises(ValueError, match="Invalid syntax '"):
         _ = CompilationConfig(custom_ops=["quant_fp8"])
+
+
+def test_init_backend_forwards_prefix_and_encoder(monkeypatch):
+    compilation_config = CompilationConfig(mode=CompilationMode.VLLM_COMPILE)
+    calls: list[tuple[object, str, bool]] = []
+
+    class FakeBackend:
+        def __init__(
+            self,
+            vllm_config: object,
+            prefix: str = "",
+            is_encoder: bool = False,
+        ) -> None:
+            calls.append((vllm_config, prefix, is_encoder))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.compilation.backends",
+        SimpleNamespace(VllmBackend=FakeBackend),
+    )
+
+    vllm_config = object()
+    backend = compilation_config.init_backend(
+        vllm_config,
+        prefix="Qwen3Model",
+        is_encoder=True,
+    )
+
+    assert isinstance(backend, FakeBackend)
+    assert calls == [(vllm_config, "Qwen3Model", True)]
+
+
+def test_pass_config_restores_rope_and_sequence_parallel_fields():
+    pass_config = PassConfig()
+
+    assert pass_config.fuse_rope_kvcache is None
+    assert pass_config.rope_kvcache_fusion_max_token_num == 256
+    assert pass_config.sp_min_token_num is None
 
 
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
@@ -411,18 +452,23 @@ def test_cudagraph_sizes_post_init(
 
     with (
         ctx,
-        patch("vllm.config.parallel.cuda_device_count_stateless", return_value=tp_size),
+        patch.object(current_platform, "device_count", return_value=tp_size),
     ):
+        kwargs = {}
+        if cudagraph_capture_sizes is not None:
+            kwargs["cudagraph_capture_sizes"] = cudagraph_capture_sizes
+        if max_cudagraph_capture_size is not None:
+            kwargs["max_cudagraph_capture_size"] = max_cudagraph_capture_size
         compilation_config = CompilationConfig(
-            cudagraph_capture_sizes=cudagraph_capture_sizes,
-            max_cudagraph_capture_size=max_cudagraph_capture_size,
             pass_config=PassConfig(
                 enable_sp=enable_sp,
                 fuse_norm_quant=True,
                 fuse_act_quant=True,
                 eliminate_noops=True,
+                sp_min_token_num=512 if enable_sp else None,
             ),
             cudagraph_mode=cudagraph_mode,
+            **kwargs,
         )
         engine_args = EngineArgs(
             model="facebook/opt-125m",
@@ -569,3 +615,58 @@ def test_compile_sizes_padding_validation():
     assert sorted(config.compile_sizes) == [3, 5, 7]
     dispatcher = CudagraphDispatcher(_create_vllm_config_for_validation(config))
     dispatcher.initialize_cudagraph_keys(CUDAGraphMode.NONE)  # Should not raise
+
+
+def test_inductor_asserts_default_disabled(monkeypatch):
+    """Test that inductor runtime asserts are disabled by default
+    (INFO logging level) on torch < 2.12."""
+    monkeypatch.setenv("VLLM_LOGGING_LEVEL", "INFO")
+
+    import importlib
+
+    import vllm.envs
+
+    importlib.reload(vllm.envs)
+
+    config = CompilationConfig()
+    if not _is_torch_equal_or_newer(torch.__version__, "2.12.0.dev"):
+        assert config.inductor_compile_config.get("size_asserts") is False
+        assert config.inductor_compile_config.get("alignment_asserts") is False
+        assert config.inductor_compile_config.get("scalar_asserts") is False
+
+
+def test_inductor_asserts_enabled_in_debug(monkeypatch):
+    """Test that VLLM_LOGGING_LEVEL=DEBUG enables inductor runtime asserts
+    on torch < 2.12."""
+    monkeypatch.setenv("VLLM_LOGGING_LEVEL", "DEBUG")
+
+    import importlib
+
+    import vllm.envs
+
+    importlib.reload(vllm.envs)
+
+    config = CompilationConfig()
+    if not _is_torch_equal_or_newer(torch.__version__, "2.12.0.dev"):
+        assert config.inductor_compile_config.get("size_asserts") is True
+        assert config.inductor_compile_config.get("alignment_asserts") is True
+        assert config.inductor_compile_config.get("scalar_asserts") is True
+
+
+def test_inductor_asserts_user_override(monkeypatch):
+    """Test that explicit inductor_compile_config overrides the
+    debug-logging default."""
+    monkeypatch.setenv("VLLM_LOGGING_LEVEL", "INFO")
+
+    import importlib
+
+    import vllm.envs
+
+    importlib.reload(vllm.envs)
+
+    config = CompilationConfig(
+        inductor_compile_config={"size_asserts": True},
+    )
+    assert config.inductor_compile_config.get("size_asserts") is True
+    if not _is_torch_equal_or_newer(torch.__version__, "2.12.0.dev"):
+        assert config.inductor_compile_config.get("alignment_asserts") is False

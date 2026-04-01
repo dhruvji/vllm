@@ -21,7 +21,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
-from vllm.renderers import BaseRenderer
+from vllm.renderers import BaseRenderer, renderer_from_config
 from vllm.renderers.inputs import DictPrompt, TokPrompt
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.sampling_params import SamplingParams
@@ -87,9 +87,11 @@ class LLMEngine:
             self.dp_group = None
         self.should_execute_dummy_batch = False
 
-        self.input_processor = InputProcessor(self.vllm_config)
+        renderer = renderer_from_config(self.vllm_config)
+        self.input_processor = InputProcessor(self.vllm_config, renderer)
         self.io_processor = get_io_processor(
             self.vllm_config,
+            renderer,
             self.model_config.io_processor_plugin,
         )
 

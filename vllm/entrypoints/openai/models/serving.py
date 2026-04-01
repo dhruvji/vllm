@@ -5,9 +5,9 @@ from asyncio import Lock
 from collections import defaultdict
 from http import HTTPStatus
 
+from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.engine.protocol import (
-    ErrorInfo,
     ErrorResponse,
     ModelCard,
     ModelList,
@@ -18,13 +18,59 @@ from vllm.entrypoints.serve.lora.protocol import (
     LoadLoRAAdapterRequest,
     UnloadLoRAAdapterRequest,
 )
-from vllm.entrypoints.utils import sanitize_message
+from vllm.entrypoints.utils import create_error_response
+from vllm.exceptions import LoRAAdapterNotFoundError
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.lora.resolver import LoRAResolver, LoRAResolverRegistry
 from vllm.utils.counter import AtomicCounter
 
 logger = init_logger(__name__)
+
+
+class OpenAIModelRegistry:
+    """Read-only view of the loaded base models with no engine dependency.
+
+    Suitable for CPU-only / render-only contexts that have no engine client
+    and no LoRA support.
+    """
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        base_model_paths: list[BaseModelPath],
+    ) -> None:
+        self.model_config = model_config
+        self.base_model_paths = base_model_paths
+
+    def is_base_model(self, model_name: str) -> bool:
+        return any(model.name == model_name for model in self.base_model_paths)
+
+    async def check_model(self, model_name: str | None) -> ErrorResponse | None:
+        """Return an ErrorResponse if model_name is not served, else None."""
+        if not model_name or self.is_base_model(model_name):
+            return None
+        return create_error_response(
+            message=f"The model `{model_name}` does not exist.",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+            param="model",
+        )
+
+    async def show_available_models(self) -> ModelList:
+        """Show available models (base models only)."""
+        max_model_len = self.model_config.max_model_len
+        return ModelList(
+            data=[
+                ModelCard(
+                    id=base_model.name,
+                    max_model_len=max_model_len,
+                    root=base_model.model_path,
+                    permission=[ModelPermission()],
+                )
+                for base_model in self.base_model_paths
+            ]
+        )
 
 
 class OpenAIServingModels:
@@ -45,6 +91,11 @@ class OpenAIServingModels:
     ):
         super().__init__()
 
+        self.registry = OpenAIModelRegistry(
+            model_config=engine_client.model_config,
+            base_model_paths=base_model_paths,
+        )
+
         self.engine_client = engine_client
         self.base_model_paths = base_model_paths
 
@@ -59,11 +110,10 @@ class OpenAIServingModels:
             )
         self.lora_resolver_lock: dict[str, Lock] = defaultdict(Lock)
 
-        self.input_processor = self.engine_client.input_processor
-        self.io_processor = self.engine_client.io_processor
-        self.renderer = self.engine_client.renderer
         self.model_config = self.engine_client.model_config
-        self.max_model_len = self.model_config.max_model_len
+        self.renderer = self.engine_client.renderer
+        self.io_processor = self.engine_client.io_processor
+        self.input_processor = self.engine_client.input_processor
 
     async def init_static_loras(self):
         """Loads all static LoRA modules.
@@ -80,33 +130,18 @@ class OpenAIServingModels:
             if isinstance(load_result, ErrorResponse):
                 raise ValueError(load_result.error.message)
 
-    def is_base_model(self, model_name) -> bool:
-        return any(model.name == model_name for model in self.base_model_paths)
+    def is_base_model(self, model_name: str) -> bool:
+        return self.registry.is_base_model(model_name)
 
     def model_name(self, lora_request: LoRARequest | None = None) -> str:
-        """Returns the appropriate model name depending on the availability
-        and support of the LoRA or base model.
-        Parameters:
-        - lora: LoRARequest that contain a base_model_name.
-        Returns:
-        - str: The name of the base model or the first available model path.
-        """
         if lora_request is not None:
             return lora_request.lora_name
         return self.base_model_paths[0].name
 
     async def show_available_models(self) -> ModelList:
         """Show available models. This includes the base model and all
-        adapters"""
-        model_cards = [
-            ModelCard(
-                id=base_model.name,
-                max_model_len=self.max_model_len,
-                root=base_model.model_path,
-                permission=[ModelPermission()],
-            )
-            for base_model in self.base_model_paths
-        ]
+        adapters."""
+        model_list = await self.registry.show_available_models()
         lora_cards = [
             ModelCard(
                 id=lora.lora_name,
@@ -118,8 +153,8 @@ class OpenAIServingModels:
             )
             for lora in self.lora_requests.values()
         ]
-        model_cards.extend(lora_cards)
-        return ModelList(data=model_cards)
+        model_list.data.extend(lora_cards)
+        return model_list
 
     async def load_lora_adapter(
         self, request: LoadLoRAAdapterRequest, base_model_name: str | None = None
@@ -132,62 +167,41 @@ class OpenAIServingModels:
             if error_check_ret is not None:
                 return error_check_ret
 
+            lora_path = request.lora_path
+            lora_int_id = (
+                self.lora_requests[lora_name].lora_int_id
+                if lora_name in self.lora_requests
+                else self.lora_id_counter.inc(1)
+            )
+            lora_request = LoRARequest(
+                lora_name=lora_name,
+                lora_int_id=lora_int_id,
+                lora_path=lora_path,
+                load_inplace=request.load_inplace,
+            )
+            if base_model_name is not None and self.is_base_model(base_model_name):
+                lora_request.base_model_name = base_model_name
+
+            # Validate that the adapter can be loaded into the engine
+            # This will also preload it for incoming requests
             try:
-                await self._ensure_lora_loaded_unlocked(
-                    lora_name=lora_name,
-                    lora_path=request.lora_path,
-                    base_model_name=base_model_name,
-                    load_inplace=request.load_inplace,
-                )
+                await self.engine_client.add_lora(lora_request)
             except Exception as e:
-                error_type = "BadRequestError"
-                status_code = HTTPStatus.BAD_REQUEST
-                if "No adapter found" in str(e):
-                    error_type = "NotFoundError"
-                    status_code = HTTPStatus.NOT_FOUND
+                if str(
+                    LoRAAdapterNotFoundError(
+                        lora_request.lora_name, lora_request.lora_path
+                    )
+                ) in str(e):
+                    raise LoRAAdapterNotFoundError(
+                        lora_request.lora_name, lora_request.lora_path
+                    ) from e
+                raise
 
-                return create_error_response(
-                    message=str(e), err_type=error_type, status_code=status_code
-                )
-
+            self.lora_requests[lora_name] = lora_request
             logger.info(
-                "Loaded new LoRA adapter: name '%s', path '%s'",
-                lora_name,
-                request.lora_path,
+                "Loaded new LoRA adapter: name '%s', path '%s'", lora_name, lora_path
             )
             return f"Success: LoRA adapter '{lora_name}' added successfully."
-
-    async def _ensure_lora_loaded_unlocked(
-        self,
-        *,
-        lora_name: str,
-        lora_path: str,
-        base_model_name: str | None = None,
-        load_inplace: bool = False,
-    ) -> LoRARequest:
-        existing_request = self.lora_requests.get(lora_name)
-        if existing_request is not None and not load_inplace:
-            return existing_request
-
-        lora_int_id = (
-            existing_request.lora_int_id
-            if existing_request is not None
-            else self.lora_id_counter.inc(1)
-        )
-        lora_request = LoRARequest(
-            lora_name=lora_name,
-            lora_int_id=lora_int_id,
-            lora_path=lora_path,
-            load_inplace=load_inplace,
-        )
-        if base_model_name is not None and self.is_base_model(base_model_name):
-            lora_request.base_model_name = base_model_name
-
-        # Validate that the adapter can be loaded into the engine and register it
-        # so subsequent requests reuse the same loaded LoRA.
-        await self.engine_client.add_lora(lora_request)
-        self.lora_requests[lora_name] = lora_request
-        return lora_request
 
     async def unload_lora_adapter(
         self, request: UnloadLoRAAdapterRequest
@@ -313,17 +327,3 @@ class OpenAIServingModels:
                     err_type="NotFoundError",
                     status_code=HTTPStatus.NOT_FOUND,
                 )
-
-
-def create_error_response(
-    message: str,
-    err_type: str = "BadRequestError",
-    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
-) -> ErrorResponse:
-    return ErrorResponse(
-        error=ErrorInfo(
-            message=sanitize_message(message),
-            type=err_type,
-            code=status_code.value,
-        )
-    )

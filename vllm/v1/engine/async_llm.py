@@ -19,13 +19,14 @@ from vllm.distributed.weight_transfer.base import (
     WeightTransferUpdateRequest,
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.engine.protocol import EngineClient
-from vllm.inputs import PromptType, StreamingInput
+from vllm.engine.protocol import EngineClient, StreamingInput
+from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
 from vllm.plugins.io_processors import get_io_processor
+from vllm.renderers import renderer_from_config
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import DictPrompt, TokPrompt
@@ -131,9 +132,11 @@ class AsyncLLM(EngineClient):
                 "enabling logging without default stat loggers."
             )
 
-        self.input_processor = InputProcessor(self.vllm_config)
+        renderer = renderer_from_config(self.vllm_config)
+        self.input_processor = InputProcessor(self.vllm_config, renderer)
         self.io_processor = get_io_processor(
             self.vllm_config,
+            renderer,
             self.model_config.io_processor_plugin,
         )
 
@@ -269,10 +272,19 @@ class AsyncLLM(EngineClient):
         shutdown_prometheus()
 
         if engine_core := getattr(self, "engine_core", None):
-            engine_core.shutdown()
+            shutdown = getattr(engine_core, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
 
-        if input_processor := getattr(self, "input_processor", None):
-            input_processor.close()
+        for attr_name in ("input_processor", "output_processor", "io_processor"):
+            resource = getattr(self, attr_name, None)
+            if resource is None:
+                continue
+            for method_name in ("close", "shutdown"):
+                cleanup = getattr(resource, method_name, None)
+                if callable(cleanup):
+                    cleanup()
+                    break
 
         handler = getattr(self, "output_handler", None)
         if handler is not None:
@@ -301,6 +313,7 @@ class AsyncLLM(EngineClient):
         priority: int = 0,
         data_parallel_rank: int | None = None,
         prompt_text: str | None = None,
+        reasoning_ended: bool | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
@@ -320,7 +333,8 @@ class AsyncLLM(EngineClient):
                 "prompt logprobs"
             )
 
-        if params.truncate_prompt_tokens is not None:
+        truncate_prompt_tokens = getattr(params, "truncate_prompt_tokens", None)
+        if truncate_prompt_tokens is not None:
             params_type = type(params).__name__
             warnings.warn(
                 f"The `truncate_prompt_tokens` parameter in `{params_type}` "
@@ -332,10 +346,13 @@ class AsyncLLM(EngineClient):
 
             tokenization_kwargs = merge_kwargs(
                 tokenization_kwargs,
-                dict(truncate_prompt_tokens=params.truncate_prompt_tokens),
+                dict(truncate_prompt_tokens=truncate_prompt_tokens),
             )
 
         if isinstance(prompt, AsyncGenerator):
+            if reasoning_ended is not None:
+                raise NotImplementedError
+
             # Streaming input case.
             return await self._add_streaming_input_request(
                 request_id,
@@ -376,6 +393,9 @@ class AsyncLLM(EngineClient):
                 supported_tasks=await self.get_supported_tasks(),
             )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+
+        if reasoning_ended is not None:
+            request.reasoning_ended = reasoning_ended
 
         self.input_processor.assign_request_id(request)
 
@@ -552,6 +572,7 @@ class AsyncLLM(EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        reasoning_ended: bool | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -580,6 +601,7 @@ class AsyncLLM(EngineClient):
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
                 prompt_text=prompt_text,
+                reasoning_ended=reasoning_ended,
             )
 
             # The output_handler task pushes items into the queue.

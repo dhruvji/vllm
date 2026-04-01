@@ -124,9 +124,18 @@ class PassConfig:
     fuse_allreduce_rms: bool = Field(default=None)
     """Enable flashinfer allreduce fusion."""
 
+    fuse_rope_kvcache: bool = Field(default=None)
+    """Enable RoPE + KV-cache update fusion."""
+
     # ROCm/AITER specific fusions
     fuse_act_padding: bool = Field(default=None)
     """Fuse the custom RMSNorm + padding ops."""
+
+    rope_kvcache_fusion_max_token_num: int = 256
+    """Maximum token count at which RoPE + KV-cache fusion is applied."""
+
+    sp_min_token_num: int | None = None
+    """Minimum token threshold for enabling sequence parallelism."""
 
     fi_allreduce_fusion_max_size_mb: float | None = None
     """The threshold of the communicated tensor sizes under which
@@ -197,6 +206,7 @@ class PassConfig:
         "enable_sp",
         "fuse_gemm_comms",
         "fuse_allreduce_rms",
+        "fuse_rope_kvcache",
         "fuse_act_padding",
         mode="wrap",
     )
@@ -226,6 +236,11 @@ class PassConfig:
                     "Fusion enabled but reshape elimination disabled. "
                     "Allreduce + rms norm + quant (fp8) fusion might not work"
                 )
+            if self.fuse_rope_kvcache:
+                logger.warning_once(
+                    "Fusion enabled but reshape elimination disabled. "
+                    "RoPE + KV-cache fusion might not work"
+                )
             if self.fuse_act_padding:
                 logger.warning_once(
                     "Fusion enabled but reshape elimination disabled. "
@@ -243,6 +258,12 @@ class PassConfig:
                 "The fusion will be disabled."
             )
             self.fuse_act_padding = False
+        if self.fuse_rope_kvcache and not current_platform.is_rocm():
+            logger.warning_once(
+                "RoPE + KV-cache fusion enabled but the current platform is "
+                "not ROCm. The fusion will be disabled."
+            )
+            self.fuse_rope_kvcache = False
 
 
 class DynamicShapesType(str, enum.Enum):
@@ -869,11 +890,19 @@ class CompilationConfig:
         if self.backend == "":
             self.backend = current_platform.get_compile_backend()
 
-    def init_backend(self, vllm_config: "VllmConfig") -> str | Callable:
+    def init_backend(
+        self,
+        vllm_config: "VllmConfig",
+        prefix: str = "",
+        is_encoder: bool = False,
+    ) -> str | Callable:
         """
         Initialize the backend for the compilation config from a vllm config.
         Arguments:
             vllm_config: The vllm config to initialize the backend from.
+            prefix: Optional cache/backend prefix used to namespace
+                compilation artifacts for submodules.
+            is_encoder: Whether the compiled module belongs to an encoder path.
         Returns:
             The backend for the compilation config.
         """
@@ -903,9 +932,11 @@ class CompilationConfig:
 
         from vllm.compilation.backends import VllmBackend
 
-        # TODO[@lucaskabela]: See if we can forward prefix
-        # https://github.com/vllm-project/vllm/issues/27045
-        return VllmBackend(vllm_config)
+        return VllmBackend(
+            vllm_config,
+            prefix=prefix,
+            is_encoder=is_encoder,
+        )
 
     def post_init_cudagraph_sizes(self) -> None:
         """To complete the initialization after cudagraph related

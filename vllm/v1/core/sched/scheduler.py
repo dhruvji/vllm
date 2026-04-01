@@ -39,7 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.sched.interface import SchedulerInterface
+from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -276,6 +276,8 @@ class Scheduler(SchedulerInterface):
                 max_num_kv_tokens=self.max_num_kv_tokens,
                 vllm_config=self.vllm_config,
             )
+
+        self._pause_state: PauseState = PauseState.UNPAUSED
 
     def _mamba_block_aligned_split(
         self,
@@ -594,7 +596,12 @@ class Scheduler(SchedulerInterface):
 
                 # Skip request if the structured output request is still waiting
                 # for FSM compilation.
-                if request.status == RequestStatus.WAITING_FOR_FSM:
+                waiting_for_fsm = getattr(
+                    RequestStatus,
+                    "WAITING_FOR_FSM",
+                    RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
+                )
+                if request.status == waiting_for_fsm:
                     structured_output_req = request.structured_output_request
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
@@ -1899,6 +1906,13 @@ class Scheduler(SchedulerInterface):
 
     def has_finished_requests(self) -> bool:
         return len(self.finished_req_ids) > 0
+
+    @property
+    def pause_state(self) -> PauseState:
+        return self._pause_state
+
+    def set_pause_state(self, pause_state: PauseState) -> None:
+        self._pause_state = pause_state
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

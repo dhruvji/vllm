@@ -52,9 +52,16 @@ elif current_platform.is_rocm():
     reshape_and_cache_flash = ops.reshape_and_cache_flash
 
 
-def get_flash_attn_version(requires_alibi: bool = False) -> int | None:
+def get_flash_attn_version(
+    requires_alibi: bool = False,
+    head_size: int | None = None,
+) -> int | None:
     # import here to avoid circular dependencies
     from vllm.platforms import current_platform
+
+    # `head_size` is accepted for compatibility with newer call sites.
+    # This branch does not yet vary FA version selection on head size.
+    _ = head_size
 
     if current_platform.is_xpu():
         return 2

@@ -5,9 +5,8 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
-import jinja2
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -34,15 +33,17 @@ from vllm.entrypoints.openai.engine.serving import (
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.exceptions import VLLMValidationError
+from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
-from vllm.renderers.inputs import TokPrompt
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
-from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
+
+if TYPE_CHECKING:
+    from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
 
@@ -53,38 +54,43 @@ class OpenAIServingCompletion(OpenAIServing):
         engine_client: EngineClient,
         models: OpenAIServingModels,
         *,
+        openai_serving_render: "OpenAIServingRender",
         request_logger: RequestLogger | None,
         return_tokens_as_token_ids: bool = False,
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
-        log_error_stack: bool = False,
     ):
         super().__init__(
             engine_client=engine_client,
             models=models,
             request_logger=request_logger,
             return_tokens_as_token_ids=return_tokens_as_token_ids,
-            log_error_stack=log_error_stack,
         )
 
-        # set up logits processors
-        self.logits_processors = self.model_config.logits_processors
-
+        self.openai_serving_render = openai_serving_render
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        mc = self.model_config
+        self.override_max_tokens = (
+            self.default_sampling_params.get("max_tokens")
+            if mc.generation_config not in ("auto", "vllm")
+            else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
+        )
 
     async def render_completion_request(
         self,
         request: CompletionRequest,
-    ) -> list[TokPrompt] | ErrorResponse:
+    ) -> list[EngineInput] | ErrorResponse:
         """
-        render completion request by validating and preprocessing inputs.
+        Validate the model and preprocess a completion request.
+
+        Delegates preprocessing logic to OpenAIServingRender, adding the
+        engine-aware checks (LoRA model validation, engine health).
 
         Returns:
-            A list of engine_prompts on success,
-            or an ErrorResponse on failure.
+            A list of engine_inputs on success, or an ErrorResponse on failure.
         """
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
@@ -96,29 +102,7 @@ class OpenAIServingCompletion(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        # Return error for unsupported features.
-        if request.suffix is not None:
-            return self.create_error_response("suffix is not currently supported")
-
-        if request.echo and request.prompt_embeds is not None:
-            return self.create_error_response("Echo is unsupported with prompt embeds.")
-
-        if request.prompt_logprobs is not None and request.prompt_embeds is not None:
-            return self.create_error_response(
-                "prompt_logprobs is not compatible with prompt embeds."
-            )
-
-        try:
-            engine_prompts = await self._preprocess_completion(
-                request,
-                prompt_input=request.prompt,
-                prompt_embeds=request.prompt_embeds,
-            )
-        except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
-            logger.exception("Error in preprocessing prompt inputs")
-            return self.create_error_response(e)
-
-        return engine_prompts
+        return await self.openai_serving_render.render_completion(request)
 
     async def create_completion(
         self,
@@ -134,11 +118,16 @@ class OpenAIServingCompletion(OpenAIServing):
             - suffix (the language models we currently support do not support
             suffix)
         """
+        if request.stream and request.use_beam_search:
+            return self.create_error_response(
+                "Streaming is not currently supported with beam search"
+            )
+
         result = await self.render_completion_request(request)
         if isinstance(result, ErrorResponse):
             return result
 
-        engine_prompts = result
+        engine_inputs = result
 
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
         created_time = int(time.time())
@@ -147,158 +136,103 @@ class OpenAIServingCompletion(OpenAIServing):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        try:
-            lora_request = self._maybe_get_adapters(request)
-        except (ValueError, TypeError, RuntimeError) as e:
-            logger.exception("Error preparing request components")
-            return self.create_error_response(e)
+        lora_request = self._maybe_get_adapters(request)
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
 
         # Schedule the request and get the result generator.
+        max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
-        cartridge_id: str | None = None
-        try:
-            for i, engine_prompt in enumerate(engine_prompts):
-                prompt_text = self._extract_prompt_text(engine_prompt)
+        for i, engine_input in enumerate(engine_inputs):
+            max_tokens = get_max_tokens(
+                max_model_len,
+                request.max_tokens,
+                self._extract_prompt_len(engine_input),
+                self.default_sampling_params,
+                self.override_max_tokens,
+            )
 
-                max_tokens = get_max_tokens(
-                    self.max_model_len,
-                    request.max_tokens,
-                    self._extract_prompt_len(engine_prompt),
+            sampling_params: SamplingParams | BeamSearchParams
+            if request.use_beam_search:
+                sampling_params = request.to_beam_search_params(
+                    max_tokens, self.default_sampling_params
+                )
+            else:
+                sampling_params = request.to_sampling_params(
+                    max_tokens,
                     self.default_sampling_params,
                 )
 
-                sampling_params: SamplingParams | BeamSearchParams
-                if request.use_beam_search:
-                    sampling_params = request.to_beam_search_params(
-                        max_tokens, self.default_sampling_params
-                    )
-                else:
-                    sampling_params = request.to_sampling_params(
-                        max_tokens,
-                        self.model_config.logits_processor_pattern,
-                        self.default_sampling_params,
-                    )
-                    validate_logits_processors_parameters(
-                        self.logits_processors,
-                        sampling_params,
-                    )
+            request_id_item = f"{request_id}-{i}"
 
-                request_id_item = f"{request_id}-{i}"
+            self._log_inputs(
+                request_id_item,
+                engine_input,
+                params=sampling_params,
+                lora_request=lora_request,
+            )
 
-                self._log_inputs(
-                    request_id_item,
-                    engine_prompt,
+            trace_headers = (
+                None
+                if raw_request is None
+                else await self._get_trace_headers(raw_request.headers)
+            )
+
+            try:
+                engine_prompt = await self._maybe_build_engine_request_with_cartridge(
+                    request=request,
+                    engine_input=engine_input,
+                    request_id=request_id_item,
                     params=sampling_params,
                     lora_request=lora_request,
+                    trace_headers=trace_headers,
+                    priority=request.priority,
+                    data_parallel_rank=data_parallel_rank,
+                )
+            except Exception as e:
+                logger.error("Failed to process cartridges: %s", e)
+                return self.create_error_response(
+                    f"Failed to process cartridges: {e}"
                 )
 
-                trace_headers = (
-                    None
-                    if raw_request is None
-                    else await self._get_trace_headers(raw_request.headers)
+            if isinstance(sampling_params, BeamSearchParams):
+                if engine_prompt is not engine_input:
+                    return self.create_error_response(
+                        "Beam search is not currently supported with cartridges."
+                    )
+                generator = self.beam_search(
+                    prompt=engine_input,
+                    request_id=request_id,
+                    params=sampling_params,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                )
+            else:
+                generator = self.engine_client.generate(
+                    engine_prompt,
+                    sampling_params,
+                    request_id_item,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                    priority=request.priority,
+                    data_parallel_rank=data_parallel_rank,
                 )
 
-                # Process adapters (prefix/lora) if present
-                cartridge_kv = None
-                cartridge_id = None
-                cartridge_seq_len = None
-                cartridge_shm_path = None
-                cartridge_allow_pipelining = None
-                dynamic_lora_request = None
-
-                if "prompt_token_ids" in engine_prompt:
-                    # Convert adapters config to dict if present
-                    adapters_dict = None
-                    request_adapters = getattr(request, "adapters", None)
-                    if request_adapters:
-                        # Handle both Pydantic models and dicts
-                        if isinstance(request_adapters, dict):
-                            adapters_dict = request_adapters
-                        else:
-                            adapters_dict = request_adapters.model_dump()
-
-                    # Process all adapters (prefix + lora)
-                    if adapters_dict:
-                        (
-                            engine_prompt["prompt_token_ids"],
-                            cartridge_kv,
-                            cartridge_id,
-                            cartridge_seq_len,
-                            cartridge_shm_path,
-                            cartridge_allow_pipelining,
-                            dynamic_lora_request,
-                        ) = await self._process_adapters(
-                            adapters_config=adapters_dict,
-                            prompt_token_ids=engine_prompt["prompt_token_ids"],
-                            request_id=request_id_item,
-                        )
-
-                # Override with dynamic LoRA request if created
-                if dynamic_lora_request:
-                    lora_request = dynamic_lora_request
-
-                if isinstance(sampling_params, BeamSearchParams):
-                    generator = self.beam_search(
-                        prompt=engine_prompt,
-                        request_id=request_id,
-                        params=sampling_params,
-                        lora_request=lora_request,
-                        trace_headers=trace_headers,
-                    )
-                else:
-                    tok_params = request.build_tok_params(self.model_config)
-                    tokenization_kwargs = tok_params.get_encode_kwargs()
-
-                    engine_request = self.input_processor.process_inputs(
-                        request_id_item,
-                        engine_prompt,
-                        sampling_params,
-                        lora_request=lora_request,
-                        tokenization_kwargs=tokenization_kwargs,
-                        trace_headers=trace_headers,
-                        priority=request.priority,
-                        cartridge_kv=cartridge_kv,
-                        cartridge_id=cartridge_id,
-                        cartridge_seq_len=cartridge_seq_len,
-                        cartridge_shm_path=cartridge_shm_path,
-                        cartridge_allow_pipelining=cartridge_allow_pipelining,
-                        data_parallel_rank=data_parallel_rank,
-                    )
-
-                    generator = self.engine_client.generate(
-                        engine_request,
-                        sampling_params,
-                        request_id_item,
-                        lora_request=lora_request,
-                        trace_headers=trace_headers,
-                        priority=request.priority,
-                        prompt_text=prompt_text,
-                        tokenization_kwargs=tokenization_kwargs,
-                        data_parallel_rank=data_parallel_rank,
-                    )
-
-                generators.append(generator)
-        except ValueError as e:
-            return self.create_error_response(e)
+            generators.append(generator)
 
         result_generator = merge_async_iterators(*generators)
 
         model_name = self.models.model_name(lora_request)
-        num_prompts = len(engine_prompts)
-
-        # We do not stream the results when using beam search.
-        stream = request.stream and not request.use_beam_search
+        num_prompts = len(engine_inputs)
 
         # Streaming response
         tokenizer = self.renderer.tokenizer
 
-        if stream:
+        if request.stream:
             return self.completion_stream_generator(
                 request,
-                engine_prompts,
+                engine_inputs,
                 result_generator,
                 request_id,
                 created_time,
@@ -321,8 +255,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 # We did not pass it into vLLM engine to avoid being redundant
                 # with the inputs token IDs
                 if final_res.prompt is None:
-                    engine_prompt = engine_prompts[i]
-                    final_res.prompt = self._extract_prompt_text(engine_prompt)
+                    final_res.prompt = self._extract_prompt_text(engine_inputs[i])
 
             final_res_batch_checked = cast(list[RequestOutput], final_res_batch)
 
@@ -334,14 +267,9 @@ class OpenAIServingCompletion(OpenAIServing):
                 model_name,
                 tokenizer,
                 request_metadata,
-                cartridge_id=cartridge_id,
             )
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
-        except GenerationError as e:
-            return self._convert_generation_error_to_response(e)
-        except ValueError as e:
-            return self.create_error_response(e)
 
         # When user requests streaming but we don't stream, we still need to
         # return a streaming response with a single event.
@@ -359,7 +287,7 @@ class OpenAIServingCompletion(OpenAIServing):
     async def completion_stream_generator(
         self,
         request: CompletionRequest,
-        engine_prompts: list[TokPrompt],
+        engine_inputs: list[EngineInput],
         result_generator: AsyncIterator[tuple[int, RequestOutput]],
         request_id: str,
         created_time: int,
@@ -392,8 +320,8 @@ class OpenAIServingCompletion(OpenAIServing):
 
                 prompt_text = res.prompt
                 if prompt_text is None:
-                    engine_prompt = engine_prompts[prompt_idx]
-                    prompt_text = self._extract_prompt_text(engine_prompt)
+                    engine_input = engine_inputs[prompt_idx]
+                    prompt_text = self._extract_prompt_text(engine_input)
 
                 # Prompt details are excluded from later streamed outputs
                 if prompt_token_ids is not None:
@@ -552,7 +480,6 @@ class OpenAIServingCompletion(OpenAIServing):
         model_name: str,
         tokenizer: TokenizerLike | None,
         request_metadata: RequestResponseMetadata,
-        cartridge_id: str | None = None,
     ) -> CompletionResponse:
         choices: list[CompletionResponseChoice] = []
         num_prompt_tokens = 0
@@ -657,7 +584,6 @@ class OpenAIServingCompletion(OpenAIServing):
             choices=choices,
             usage=usage,
             kv_transfer_params=kv_transfer_params,
-            cartridge_id=cartridge_id,
         )
 
     def _create_completion_logprobs(
@@ -674,12 +600,6 @@ class OpenAIServingCompletion(OpenAIServing):
         out_token_logprobs: list[float | None] = []
         out_tokens: list[str] = []
         out_top_logprobs: list[dict[str, float] | None] = []
-
-        # Flat-packed arrays: avoid string formatting + dict building + client parsing.
-        # Only populated when returning token IDs (no string conversion needed).
-        flat_top_ids: list[int] = []
-        flat_top_lps: list[float] = []
-        top_k = num_output_top_logprobs + 1  # OpenAI convention: top N+1
 
         last_token_len = 0
 
@@ -707,9 +627,6 @@ class OpenAIServingCompletion(OpenAIServing):
                 out_tokens.append(token)
                 out_token_logprobs.append(None)
                 out_top_logprobs.append(None)
-                if should_return_as_token_id:
-                    flat_top_ids.extend([-1] * top_k)
-                    flat_top_lps.extend([-9999.0] * top_k)
             else:
                 step_token = step_top_logprobs[token_id]
 
@@ -724,33 +641,24 @@ class OpenAIServingCompletion(OpenAIServing):
                 out_tokens.append(token)
                 out_token_logprobs.append(token_logprob)
 
-                # Build both dict (backward compat) and flat arrays (fast path)
-                top_dict: dict[str, float] = {}
-                j = 0
-                for top_lp_idx, (tid, lp_info) in enumerate(
-                    step_top_logprobs.items()
-                ):
-                    if top_lp_idx >= top_k:
-                        break
-                    lp_val = max(lp_info.logprob, -9999.0)
-                    top_dict[
+                # makes sure to add the top num_output_top_logprobs + 1
+                # logprobs, as defined in the openai API
+                # (cf. https://github.com/openai/openai-openapi/blob/
+                # 893ba52242dbd5387a97b96444ee1c742cfce9bd/openapi.yaml#L7153)
+                out_top_logprobs.append(
+                    {
+                        # Convert float("-inf") to the
+                        # JSON-serializable float that OpenAI uses
                         self._get_decoded_token(
-                            lp_info,
-                            tid,
+                            top_lp[1],
+                            top_lp[0],
                             tokenizer,
                             return_as_token_id=should_return_as_token_id,
-                        )
-                    ] = lp_val
-                    if should_return_as_token_id:
-                        flat_top_ids.append(tid)
-                        flat_top_lps.append(lp_val)
-                    j += 1
-                # Pad if fewer than top_k entries
-                if should_return_as_token_id:
-                    for _ in range(top_k - j):
-                        flat_top_ids.append(-1)
-                        flat_top_lps.append(-9999.0)
-                out_top_logprobs.append(top_dict)
+                        ): max(top_lp[1].logprob, -9999.0)
+                        for i, top_lp in enumerate(step_top_logprobs.items())
+                        if num_output_top_logprobs >= i
+                    }
+                )
 
             if len(out_text_offset) == 0:
                 out_text_offset.append(initial_text_offset)
@@ -763,7 +671,4 @@ class OpenAIServingCompletion(OpenAIServing):
             token_logprobs=out_token_logprobs,
             tokens=out_tokens,
             top_logprobs=out_top_logprobs,
-            top_k=top_k if should_return_as_token_id else None,
-            flat_top_token_ids=flat_top_ids if should_return_as_token_id else None,
-            flat_top_logprobs=flat_top_lps if should_return_as_token_id else None,
         )

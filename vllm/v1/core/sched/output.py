@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
-from vllm._bc_linter import bc_linter_include
-
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -29,7 +27,6 @@ else:
     Request = object
 
 
-@bc_linter_include
 @dataclass
 class NewRequestData:
     req_id: str
@@ -132,7 +129,6 @@ class NewRequestData:
         )
 
 
-@bc_linter_include
 @dataclass
 class CachedRequestData:
     req_ids: list[str]
@@ -202,7 +198,6 @@ class CachedRequestData:
         )
 
 
-@bc_linter_include
 @dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.

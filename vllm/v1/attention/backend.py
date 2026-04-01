@@ -188,6 +188,15 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
+    def supports_per_head_quant_scales(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        """Check if backend supports non-causal decoder attention."""
+        return False
+
+    @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
         """Check if backend supports a given attention type.
 
@@ -206,7 +215,7 @@ class AttentionBackend(ABC):
         head_size: int,
         dtype: torch.dtype,
         kv_cache_dtype: "CacheDType | None",
-        block_size: int,
+        block_size: int | None,
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
@@ -225,8 +234,10 @@ class AttentionBackend(ABC):
         has_sink: bool,
         use_sparse: bool,
         use_mm_prefix: bool,
+        use_per_head_quant_scales: bool,
         device_capability: "DeviceCapability",
         attn_type: str,
+        use_non_causal: bool,
     ) -> list[str]:
         invalid_reasons = []
         if not cls.supports_head_size(head_size):
@@ -241,6 +252,8 @@ class AttentionBackend(ABC):
             invalid_reasons.append(
                 "partial multimodal token full attention not supported"
             )
+        if use_per_head_quant_scales and not cls.supports_per_head_quant_scales():
+            invalid_reasons.append("per-head quant scales not supported")
         if use_mla != cls.is_mla():
             if use_mla:
                 invalid_reasons.append("MLA not supported")
@@ -257,6 +270,8 @@ class AttentionBackend(ABC):
             invalid_reasons.append("compute capability not supported")
         if not cls.supports_attn_type(attn_type):
             invalid_reasons.append(f"attention type {attn_type} not supported")
+        if use_non_causal and not cls.supports_non_causal():
+            invalid_reasons.append("non-causal attention not supported")
         combination_reason = cls.supports_combination(
             head_size,
             dtype,

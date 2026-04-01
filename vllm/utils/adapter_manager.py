@@ -126,6 +126,7 @@ def _read_file_bytes(path: str) -> bytes:
 logger = logging.getLogger(__name__)
 
 MODAL_LOAD_RETRY_DELAY_SECONDS = 5.0
+FORCE_REDOWNLOAD_ENV_VAR = "VLLM_ADAPTER_FORCE_REDOWNLOAD"
 
 
 def _normalize_adapter_id(adapter_id: str) -> str:
@@ -222,6 +223,9 @@ class AdapterManager:
             RuntimeError: If download or loading fails
         """
         adapter_id = _normalize_adapter_id(adapter_id)
+        force_redownload = force_redownload or os.environ.get(
+            FORCE_REDOWNLOAD_ENV_VAR
+        ) == "1"
         source_path = Path(adapter_id)
 
         # For S3 paths, use caching (need to download)
