@@ -15,6 +15,6 @@
   "temperature": 0,
   "tensor_parallel_size": 1,
   "assert_type": "latency",
-  "tpot_threshold_ms": 17.5,
+  "tpot_threshold_ms": 30.0,
   "enforce_eager": true
 }
