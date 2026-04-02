@@ -1,6 +1,6 @@
 {
   "name": "ci_latency_eager",
-  "description": "CI benchmark for eager latency - asserts TPOT < 10ms",
+  "description": "CI benchmark for eager latency with prefix adapter and greedy decode",
   "model_name": "Qwen/Qwen3-8B",
   "dataset_name": "random",
   "extra_body": {
@@ -22,6 +22,7 @@
   "stream": false,
   "num_warmups": 10,
   "seed": 42,
+  "temperature": 0,
   "tensor_parallel_size": 1,
   "assert_type": "latency",
   "tpot_threshold_ms": 25.0,

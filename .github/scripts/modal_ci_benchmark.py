@@ -359,6 +359,21 @@ def run_benchmarks_with_server(
                 if config.get("max_concurrency"):
                     bench_cmd.extend(["--max-concurrency", str(config["max_concurrency"])])
 
+                # Add optional sampling arguments so CI can pin deterministic
+                # decode settings across upstream benchmark behavior changes.
+                for arg_name in (
+                    "temperature",
+                    "top_p",
+                    "top_k",
+                    "min_p",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "repetition_penalty",
+                ):
+                    value = config.get(arg_name)
+                    if value is not None:
+                        bench_cmd.extend([f"--{arg_name.replace('_', '-')}", str(value)])
+
                 # Add extra body parameters
                 if extra_body:
                     bench_cmd.extend(["--extra-body", json.dumps(extra_body)])
