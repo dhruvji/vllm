@@ -105,6 +105,34 @@ async def test_dynamic_lora_lineage(client: openai.AsyncOpenAI, qwen3_lora_files
 
 
 @pytest.mark.asyncio
+async def test_request_body_lora_adapter(
+    client: openai.AsyncOpenAI, qwen3_meowing_lora_files
+):
+    completion = await client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {
+                "content": "Follow the instructions to make animal noises",
+                "role": "system",
+            },
+            {"content": "Make your favorite animal noise.", "role": "user"},
+        ],
+        max_tokens=10,
+        extra_body={
+            "adapters": {
+                "lora": [
+                    {
+                        "id": qwen3_meowing_lora_files,
+                        "type": "lora",
+                    }
+                ]
+            }
+        },
+    )
+    assert "Meow Meow Meow" in completion.choices[0].message.content
+
+
+@pytest.mark.asyncio
 async def test_load_lora_adapter_with_same_name_replaces_inplace(
     client: openai.AsyncOpenAI, qwen3_meowing_lora_files, qwen3_woofing_lora_files
 ):

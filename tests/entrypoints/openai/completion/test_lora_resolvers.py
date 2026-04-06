@@ -190,6 +190,30 @@ async def test_serving_completion_with_lora_resolver(mock_serving_setup, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_serving_completion_with_request_body_lora(mock_serving_setup):
+    mock_engine, serving_completion = mock_serving_setup
+
+    req = CompletionRequest(
+        model=MODEL_NAME,
+        prompt="Generate with request-body LoRA",
+        adapters={
+            "lora": [{"id": "/fake/path/request-body-lora"}],
+        },
+    )
+
+    with suppress(Exception):
+        await serving_completion.create_completion(req)
+
+    mock_engine.add_lora.assert_not_awaited()
+
+    mock_engine.generate.assert_called_once()
+    generated_lora_request = mock_engine.generate.call_args[1]["lora_request"]
+    assert isinstance(generated_lora_request, LoRARequest)
+    assert generated_lora_request.lora_name == "/fake/path/request-body-lora"
+    assert generated_lora_request.lora_path == "/fake/path/request-body-lora"
+
+
+@pytest.mark.asyncio
 async def test_serving_completion_resolver_not_found(mock_serving_setup, monkeypatch):
     monkeypatch.setenv("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "true")
 

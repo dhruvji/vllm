@@ -1968,9 +1968,10 @@ class GPUModelRunner(
             ),
         )
 
-        self.seq_lens.np[:num_reqs] = (
+        logical_seq_lens = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
         )
+        self.seq_lens.np[:num_reqs] = logical_seq_lens
         # Add cartridge lengths to seq_lens so attention covers
         # cartridge + input tokens.
         if self.cartridge_position_offsets:
@@ -1988,7 +1989,7 @@ class GPUModelRunner(
         # Record which requests should not be sampled,
         # so that we could clear the sampled tokens before returning
         self.discard_request_mask.np[:num_reqs] = (
-            self.seq_lens.np[:num_reqs] < num_tokens_np
+            logical_seq_lens < num_tokens_np
         )
         self.discard_request_mask.copy_to_gpu(num_reqs)
 

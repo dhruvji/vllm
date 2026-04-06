@@ -2,11 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
+import hashlib
 import json
+import os
+import shutil
+import tempfile
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, ClassVar, Generic, Protocol, TypeAlias, TypeVar
 
 import numpy as np
@@ -89,6 +96,22 @@ from vllm.v1.cartridge_loader import (
 from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
+
+_REMOTE_LORA_SCHEMES = ("s3://", "gs://")
+_LORA_WEIGHT_SUFFIXES = (".safetensors", ".pt", ".bin")
+
+
+def _normalize_lora_runtime_path(path: str) -> str:
+    """Return the directory path that the worker-side PEFT loader expects."""
+    normalized = path.rstrip("/")
+    if normalized.endswith(_LORA_WEIGHT_SUFFIXES):
+        return normalized.rsplit("/", 1)[0] if "/" in normalized else "."
+    return normalized
+
+
+def _requires_staged_lora_dir(path: str) -> bool:
+    """Return True when the worker cannot consume the source path directly."""
+    return path.startswith(_REMOTE_LORA_SCHEMES)
 
 
 class RendererRequest(Protocol):
@@ -186,6 +209,13 @@ class OpenAIServing:
         self.renderer = engine_client.renderer
         self.io_processor = engine_client.io_processor
         self.input_processor = engine_client.input_processor
+        # Track prepared LoRA directories to avoid repeatedly staging the same
+        # adapter on every request.
+        self._prepared_lora_dirs: OrderedDict[str, str] = OrderedDict()
+        self._prepared_lora_dirs_max_size: int = 8
+        # Serialize staging work per adapter so concurrent requests do not race.
+        self._lora_staging_locks: dict[str, threading.Lock] = {}
+        self._lora_staging_locks_meta = threading.Lock()
 
     async def beam_search(
         self,
@@ -633,13 +663,156 @@ class OpenAIServing:
             return default_mm_loras.pop()
         return None
 
-    def _maybe_get_adapters(
+    def _prepare_staged_lora_dir(
+        self,
+        lora_id: str,
+        force_redownload: bool,
+    ) -> str:
+        from safetensors.torch import save_file as safetensors_save_file
+
+        from vllm.utils.adapter_manager import get_adapter_manager
+
+        lora_hash = hashlib.sha256(lora_id.encode()).hexdigest()[:16]
+        lora_cache_dir = envs.VLLM_LORA_RESOLVER_CACHE_DIR or tempfile.gettempdir()
+        local_lora_dir = Path(lora_cache_dir) / lora_hash
+        adapter_model_path = local_lora_dir / "adapter_model.safetensors"
+        adapter_config_path = local_lora_dir / "adapter_config.json"
+
+        def _can_reuse() -> bool:
+            cached = self._prepared_lora_dirs.get(lora_id)
+            return (
+                not force_redownload
+                and cached == str(local_lora_dir)
+                and adapter_model_path.exists()
+                and adapter_config_path.exists()
+            )
+
+        if _can_reuse():
+            self._prepared_lora_dirs.move_to_end(lora_id)
+            logger.debug("[LoRA] reusing prepared adapter directory: %s",
+                         local_lora_dir)
+            return str(local_lora_dir)
+
+        with self._lora_staging_locks_meta:
+            if lora_id not in self._lora_staging_locks:
+                self._lora_staging_locks[lora_id] = threading.Lock()
+            lock = self._lora_staging_locks[lora_id]
+
+        with lock:
+            if _can_reuse():
+                self._prepared_lora_dirs.move_to_end(lora_id)
+                logger.debug(
+                    "[LoRA] reusing prepared adapter directory (post-lock): %s",
+                    local_lora_dir,
+                )
+                return str(local_lora_dir)
+
+            self._prepared_lora_dirs.pop(lora_id, None)
+
+            manager = get_adapter_manager()
+            logger.info("[LoRA] staging adapter_id=%s force=%s", lora_id,
+                        force_redownload)
+            lora_data = manager.get_adapter(
+                adapter_id=lora_id,
+                force_redownload=force_redownload,
+            )
+
+            if local_lora_dir.exists():
+                shutil.rmtree(local_lora_dir)
+            local_lora_dir.mkdir(parents=True, exist_ok=True)
+
+            safetensors_save_file(lora_data, str(adapter_model_path))
+
+            source_dir = _normalize_lora_runtime_path(lora_id)
+            config_ids = [
+                os.path.join(source_dir, "adapter_config.json"),
+                os.path.join(source_dir, "lora_config.json"),
+            ]
+            last_error = None
+            for config_id in config_ids:
+                try:
+                    manager.download_json(
+                        json_id=config_id,
+                        target_path=adapter_config_path,
+                    )
+                    break
+                except Exception as e:
+                    last_error = e
+            else:
+                raise RuntimeError(
+                    "Failed to download LoRA config from any known path "
+                    f"{config_ids}: {last_error}"
+                ) from last_error
+
+            self._prepared_lora_dirs[lora_id] = str(local_lora_dir)
+            self._prepared_lora_dirs.move_to_end(lora_id)
+            while len(self._prepared_lora_dirs) > self._prepared_lora_dirs_max_size:
+                self._prepared_lora_dirs.popitem(last=False)
+            return str(local_lora_dir)
+
+    async def _process_lora(
+        self,
+        lora_specs: list[dict[str, Any]] | None,
+    ) -> LoRARequest | None:
+        if not lora_specs:
+            return None
+        if not isinstance(lora_specs, list):
+            raise ValueError("`adapters.lora` must be a list.")
+
+        from vllm.v1.cartridge_loader import _resolve_glob
+
+        if len(lora_specs) > 1:
+            logger.warning(
+                "Multiple LoRA adapters detected (%d). Only the first one "
+                "will be used.",
+                len(lora_specs),
+            )
+
+        lora_spec = lora_specs[0]
+        if not isinstance(lora_spec, dict):
+            raise ValueError("Each LoRA adapter spec must be an object.")
+
+        lora_id = lora_spec.get("id")
+        if not lora_id:
+            raise ValueError("LoRA adapter spec missing `id`.")
+
+        force_redownload = bool(lora_spec.get("force_redownload", False))
+
+        resolved_id = await asyncio.to_thread(_resolve_glob, lora_id)
+        if resolved_id is None:
+            raise RuntimeError(f"Could not resolve LoRA glob: {lora_id}")
+        if resolved_id != lora_id:
+            logger.info("Using LoRA: %s -> %s", lora_id, resolved_id)
+
+        if _requires_staged_lora_dir(resolved_id):
+            runtime_lora_path = await asyncio.to_thread(
+                self._prepare_staged_lora_dir,
+                resolved_id,
+                force_redownload,
+            )
+        else:
+            runtime_lora_path = _normalize_lora_runtime_path(resolved_id)
+
+        return LoRARequest(
+            lora_name=resolved_id,
+            lora_int_id=max(1, hash(resolved_id) & 0x7FFFFFFF),
+            lora_path=runtime_lora_path,
+            load_inplace=force_redownload,
+        )
+
+    async def _maybe_get_adapters(
         self,
         request: AnyRequest,
         supports_default_mm_loras: bool = False,
     ) -> LoRARequest | None:
         if request.model in self.models.lora_requests:
             return self.models.lora_requests[request.model]
+
+        adapters = getattr(request, "adapters", None)
+        if isinstance(adapters, dict):
+            lora_request = await self._process_lora(adapters.get("lora"))
+            if lora_request is not None:
+                return lora_request
 
         # Currently only support default modality specific loras
         # if we have exactly one lora matched on the request.

@@ -63,7 +63,7 @@ class OpenAIServingTokenization(OpenAIServing):
 
         request_id = f"tokenize-{self._base_request_id(raw_request)}"
 
-        lora_request = self._maybe_get_adapters(request)
+        lora_request = await self._maybe_get_adapters(request)
 
         if isinstance(request, TokenizeChatRequest):
             tool_dicts = (
@@ -130,7 +130,7 @@ class OpenAIServingTokenization(OpenAIServing):
 
         request_id = f"tokenize-{self._base_request_id(raw_request)}"
 
-        lora_request = self._maybe_get_adapters(request)
+        lora_request = await self._maybe_get_adapters(request)
 
         self._log_inputs(
             request_id,
