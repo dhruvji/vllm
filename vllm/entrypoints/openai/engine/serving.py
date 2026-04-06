@@ -97,7 +97,7 @@ from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
 
-_REMOTE_LORA_SCHEMES = ("s3://", "gs://")
+_REMOTE_LORA_SCHEMES = ("s3://", "gs://", "modal://")
 _LORA_WEIGHT_SUFFIXES = (".safetensors", ".pt", ".bin")
 
 

@@ -13,7 +13,6 @@ from transformers import PretrainedConfig
 from vllm import envs
 from vllm.config.lora import LoRAConfig
 from vllm.logger import init_logger
-from vllm.path import Path
 
 # being imported for _all_lora_classes below
 from vllm.lora.layers import (
@@ -22,7 +21,6 @@ from vllm.lora.layers import (
     ColumnParallelLinearWithShardedLoRA,
     FusedMoE3DWithLoRA,
     FusedMoEWithLoRA,
-    GateLinearWithLoRA,
     LogitsProcessorWithLoRA,
     MergedColumnParallelLinearVariableSliceWithLoRA,
     MergedColumnParallelLinearWithLoRA,
@@ -46,71 +44,6 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
-
-
-def _normalize_lora_path(lora_path: str) -> str:
-    """Trim accidental surrounding whitespace without altering the path body."""
-    normalized = lora_path.strip()
-    if normalized != lora_path:
-        logger.warning(
-            "Normalized LoRA path by trimming surrounding whitespace: %r -> %r",
-            lora_path,
-            normalized,
-        )
-    return normalized
-
-
-def _resolve_modal_adapter_path(lora_path: str) -> str:
-    """Resolve a modal:// LoRA path using the active path backend."""
-    if "*" not in lora_path:
-        return lora_path
-
-    without_prefix = lora_path[8:]
-    volume_name, _, remainder = without_prefix.partition("/")
-
-    pattern_parts = remainder.split("/") if remainder else []
-    base_parts: list[str] = []
-    for part in pattern_parts:
-        if "*" in part:
-            break
-        base_parts.append(part)
-
-    base_prefix = f"modal://{volume_name}"
-    if base_parts:
-        base_prefix = f"{base_prefix}/{'/'.join(base_parts)}"
-
-    latest_txt = f"{base_prefix}/latest.txt"
-    latest_txt_path = Path(latest_txt)
-    if latest_txt_path.isfile():
-        try:
-            latest_path = latest_txt_path.read_text().strip()
-            if latest_path.startswith("modal://"):
-                if Path(latest_path).exists():
-                    return latest_path
-            elif latest_path.startswith("/"):
-                latest_parts = latest_path.strip("/").split("/", 1)
-                rel_path = latest_parts[1] if len(latest_parts) > 1 else ""
-                candidate = (
-                    f"modal://{volume_name}/{rel_path}"
-                    if rel_path
-                    else f"modal://{volume_name}"
-                )
-                if Path(candidate).exists():
-                    return candidate
-            elif latest_path:
-                candidate = f"modal://{volume_name}/{latest_path.lstrip('/')}"
-                if Path(candidate).exists():
-                    return candidate
-        except OSError:
-            pass
-
-    glob_root = Path(base_prefix)
-    relative_pattern = "/".join(pattern_parts[len(base_parts) :]) or "*"
-    matches = [str(path) for path in glob_root.glob(relative_pattern)]
-    if matches:
-        return matches[-1]
-
-    return lora_path
 
 
 def get_captured_lora_counts(max_loras: int, specialize: bool) -> list[int]:
@@ -148,7 +81,6 @@ _all_lora_classes: set[type[BaseLayerWithLoRA]] = {
     MergedQKVParallelLinearWithLoRA,
     RowParallelLinearWithLoRA,
     ReplicatedLinearWithLoRA,
-    GateLinearWithLoRA,
     LogitsProcessorWithLoRA,
     ColumnParallelLinearWithShardedLoRA,
     QKVParallelLinearWithShardedLoRA,
@@ -348,26 +280,20 @@ def is_in_target_modules(
 
 def get_adapter_absolute_path(lora_path: str) -> str:
     """
-    Resolves the given lora_path to a usable local or backend-native path.
+    Resolves the given lora_path to an absolute local path.
 
     If the lora_path is identified as a Hugging Face model identifier,
     it will download the model and return the local snapshot path.
-    Modal volume URIs remain modal:// URIs so the path abstraction can
-    resolve them directly. Otherwise, local filesystem paths are normalized.
+    Otherwise, it treats the lora_path as a local file path and
+    converts it to an absolute path.
 
     Parameters:
     lora_path (str): The path to the lora model, which can be an absolute path,
                      a relative path, or a Hugging Face model identifier.
 
     Returns:
-    str: The resolved path to the lora model.
+    str: The resolved absolute local path to the lora model.
     """
-
-    lora_path = _normalize_lora_path(lora_path)
-
-    # Modal volume URIs are left backend-native for Path(...) consumers.
-    if lora_path.startswith("modal://"):
-        return _resolve_modal_adapter_path(lora_path)
 
     # Check if the path is an absolute path. Return it no matter exists or not.
     if os.path.isabs(lora_path):
