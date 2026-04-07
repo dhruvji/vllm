@@ -101,11 +101,9 @@ class LoRAModelRunnerMixin:
             assert self.lora_manager is not None, "LoRA is not enabled"
 
             num_loras = lora_config.max_loras
-            # Warm up the real configured LoRA shape. Capping dummy warmup to a
-            # tiny rank leaves the first live high-rank adapter to pay the full
-            # pack/merge cost in request time, which can destabilize Flash-backed
-            # replicas during cold start.
-            lora_warmup_rank = lora_config.max_lora_rank
+            lora_warmup_rank = (
+                lora_config.max_lora_rank if lora_config.max_lora_rank < 8 else 8
+            )
             # Make dummy lora requests
             lora_requests: set[LoRARequest] = {
                 LoRARequest(

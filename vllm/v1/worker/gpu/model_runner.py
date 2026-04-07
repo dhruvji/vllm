@@ -153,6 +153,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_reqs=self.max_num_reqs,
             vocab_size=self.vocab_size,
             device=self.device,
+            req_states=self.req_states,
             logprobs_mode=self.model_config.logprobs_mode,
             num_speculative_tokens=self.num_speculative_steps + 1,
         )
@@ -322,25 +323,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         num_reqs = hidden_states.shape[0]
         logits = self.model.compute_logits(hidden_states)
-        idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=self.device)
-        idx_mapping_np = np.arange(num_reqs, dtype=np.int32)
-        pos = torch.zeros(num_reqs, dtype=torch.int64, device=self.device)
-        dummy_input_ids = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
-        expanded_local_pos = torch.zeros(
-            num_reqs, dtype=torch.int32, device=self.device
+        dummy_input_batch = InputBatch.make_dummy(
+            num_reqs, num_reqs, self.input_buffers, self.device
         )
         # NOTE(woosuk): During the initial memory profiling, the sampler may skip
         # top_k, top_p, and logprobs, using less GPU memory than what is possible
         # during actual execution.
-        self.sampler(
-            logits,
-            idx_mapping,
-            idx_mapping_np,
-            idx_mapping_np,
-            pos,
-            dummy_input_ids,
-            expanded_local_pos,
-        )
+        self.sampler(logits, dummy_input_batch)
 
     @torch.inference_mode()
     def profile_run(self) -> None:
@@ -483,11 +472,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
-            self.sampler.apply_staged_writes(
-                self.req_states.prefill_token_ids.gpu,
-                self.req_states.prefill_len.np,
-                self.req_states.prompt_len,
-            )
+            self.sampler.apply_staged_writes()
             if self.uses_mrope:
                 self.mrope_states.apply_staged_writes()
 
@@ -618,6 +603,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping,
             query_start_loc,
             self.input_buffers.positions[:num_tokens],
+            num_tokens_after_padding,
         )
         # Layer name -> slot mapping.
         slot_mappings_by_layer = build_slot_mappings_by_layer(
@@ -711,15 +697,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Sample tokens and compute logprobs (if needed).
-        sampler_output = self.sampler(
-            logits,
-            input_batch.expanded_idx_mapping,
-            input_batch.idx_mapping_np,
-            input_batch.cu_num_logits_np,
-            sample_pos,
-            input_ids,
-            input_batch.expanded_local_pos,
-        )
+        sampler_output = self.sampler(logits, input_batch)
 
         if input_batch.num_draft_tokens == 0:
             # No draft tokens (common case).

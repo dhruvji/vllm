@@ -163,7 +163,7 @@ class EagleSpeculator:
                     self.max_model_len,
                 )
                 self.block_tables.compute_slot_mappings(
-                    idx_mapping, query_start_loc, pos
+                    idx_mapping, query_start_loc, pos, pos.shape[0]
                 )
 
     def capture_model(self) -> None:
@@ -279,7 +279,7 @@ class EagleSpeculator:
         )
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         slot_mappings = self.block_tables.compute_slot_mappings(
-            idx_mapping, query_start_loc, pos
+            idx_mapping, query_start_loc, pos, pos.shape[0]
         )
 
         cudagraph_size = self.cudagraph_manager.get_cudagraph_size(num_reqs)

@@ -793,12 +793,33 @@ class OpenAIServing:
         else:
             runtime_lora_path = _normalize_lora_runtime_path(resolved_id)
 
-        return LoRARequest(
-            lora_name=resolved_id,
-            lora_int_id=max(1, hash(resolved_id) & 0x7FFFFFFF),
-            lora_path=runtime_lora_path,
-            load_inplace=force_redownload,
-        )
+        # Route request-body LoRAs through the same synchronized registry
+        # used by the explicit runtime load API so cold replicas do not
+        # race engine mutation during their first generation request.
+        async with self.models.lora_resolver_lock[resolved_id]:
+            # Already loaded?
+            if resolved_id in self.models.lora_requests:
+                existing = self.models.lora_requests[resolved_id]
+                if not force_redownload:
+                    return existing
+
+            lora_int_id = (
+                self.models.lora_requests[resolved_id].lora_int_id
+                if resolved_id in self.models.lora_requests
+                else self.models.lora_id_counter.inc(1)
+            )
+            lora_request = LoRARequest(
+                lora_name=resolved_id,
+                lora_int_id=lora_int_id,
+                lora_path=runtime_lora_path,
+                load_inplace=force_redownload,
+            )
+            if self.models.is_base_model(self.model_config.model):
+                lora_request.base_model_name = self.model_config.model
+
+            await self.engine_client.add_lora(lora_request)
+            self.models.lora_requests[resolved_id] = lora_request
+            return lora_request
 
     async def _maybe_get_adapters(
         self,
