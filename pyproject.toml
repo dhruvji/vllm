@@ -171,4 +171,5 @@ ser = "ser"
 ure = "ure"
 
 [tool.uv]
+exclude-newer = "2 days"
 no-build-isolation-package = ["torch"]
