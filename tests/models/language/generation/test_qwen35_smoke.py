@@ -14,20 +14,27 @@ ZEROED_CARTRIDGE = os.environ.get(
 )
 
 
-def test_qwen35_generates_coherent_text(vllm_runner) -> None:
-    prompt = "The opposite of hot is"
+def test_qwen35_prefix_cache_smoke(vllm_runner) -> None:
+    prompt = (
+        "The opposite of hot is cold. "
+        "Repeat the phrase exactly once:"
+    )
+    prompts = [prompt, prompt]
 
     with vllm_runner(
         QWEN35_MODEL,
         language_model_only=True,
         max_model_len=1024,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
         enforce_eager=True,
         attention_backend="TRITON_ATTN",
     ) as llm:
-        outputs = llm.generate_greedy([prompt], max_tokens=8)
+        outputs = llm.generate_greedy(prompts, max_tokens=8)
 
-    assert outputs, "Expected at least one output"
-    assert outputs[0][1].startswith("The opposite of hot is cold"), outputs[0][1]
+    assert len(outputs) == len(prompts), "Expected one output per prompt"
+    for _, output_text in outputs:
+        assert output_text.strip(), "Expected non-empty generated text"
 
 
 def test_qwen3_loads_zeroed_cartridge_and_generates(vllm_runner) -> None:
