@@ -20,6 +20,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager, Request
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -1004,6 +1005,16 @@ def test_prefill_hybrid_model_mamba_align():
     blocks = manager.allocate_slots(req0, 55, num_computed_tokens, computed_blocks)
     assert blocks is not None
     assert len(blocks.get_block_ids()) == 2  # full_attn + mamba groups
+    mamba_manager = next(
+        single_type_manager
+        for single_type_manager in manager.coordinator.single_type_managers
+        if isinstance(single_type_manager, MambaManager)
+    )
+    assert all(
+        block.block_hash not in mamba_manager.cached_blocks_this_step
+        for block in mamba_manager.req_to_blocks[req0.request_id]
+        if block.is_null
+    )
 
     manager.free(req0)
 
