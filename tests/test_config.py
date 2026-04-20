@@ -4,7 +4,7 @@
 import logging
 import os
 from dataclasses import MISSING, Field, asdict, dataclass, field
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -1075,6 +1075,20 @@ def test_vllm_config_explicit_overrides():
     # Other fields should still use defaults
     assert config.compilation_config.mode == CompilationMode.VLLM_COMPILE
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+def test_hybrid_models_fall_back_to_piecewise_cudagraphs():
+    model_config = ModelConfig("facebook/opt-125m")
+
+    with patch.object(
+        ModelConfig, "is_hybrid", new_callable=PropertyMock, return_value=True
+    ):
+        config = VllmConfig(
+            model_config=model_config, optimization_level=OptimizationLevel.O2
+        )
+
+    assert config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
 
 
 def test_scheduler_config_init():

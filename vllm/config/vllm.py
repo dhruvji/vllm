@@ -851,6 +851,15 @@ class VllmConfig:
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
                 elif (
+                    self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+                    and model_config.is_hybrid
+                ):
+                    logger.warning_once(
+                        "Hybrid/Mamba models do not support full cudagraphs. "
+                        "Overriding cudagraph_mode to PIECEWISE."
+                    )
+                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                elif (
                     model_config.is_encoder_decoder
                     and self.compilation_config.cudagraph_mode
                     not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY)
