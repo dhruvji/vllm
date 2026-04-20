@@ -80,13 +80,22 @@ def fused_add_rms_norm(
         return rms_norm_batch_invariant(
             x + residual, weight, variance_epsilon
         ), x + residual
-    ops.fused_add_rms_norm(
-        x,
-        residual,
-        weight,
-        variance_epsilon,
-    )
-    return x, residual
+    try:
+        ops.fused_add_rms_norm(
+            x,
+            residual,
+            weight,
+            variance_epsilon,
+        )
+        return x, residual
+    except RuntimeError as exc:
+        if "data pointer of Tensor that doesn't have storage" not in str(exc):
+            raise
+
+        # Some profiling/eager code paths can feed storage-less tensors into
+        # the custom op. Fall back to a functional implementation in that case.
+        merged = x + residual
+        return rms_norm_batch_invariant(merged, weight, variance_epsilon), merged
 
 
 def poly_norm(

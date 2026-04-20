@@ -143,6 +143,10 @@ class AttentionBackend(ABC):
         )
 
     @classmethod
+    def is_ssm(cls) -> bool:
+        return False
+
+    @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
         from vllm.config.cache import BlockSize
 
@@ -166,6 +170,20 @@ class AttentionBackend(ABC):
             if block_size % supported_size == 0:
                 return True
         return False
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        supported_sizes = cls.get_supported_kernel_block_sizes()
+        if not supported_sizes:
+            return default_block_size
+
+        if cls.supports_block_size(default_block_size):
+            return default_block_size
+
+        return min(
+            size.base if isinstance(size, MultipleOf) else size
+            for size in supported_sizes
+        )
 
     @classmethod
     def is_mla(cls) -> bool:

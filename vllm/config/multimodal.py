@@ -45,6 +45,7 @@ class AudioDummyOptions(BaseDummyOptions):
 
 MMEncoderTPMode = Literal["weights", "data"]
 MMCacheType = Literal["shm", "lru"]
+MMTensorIPC = Literal["torch_shm", "none"]
 DummyOptions: TypeAlias = (
     BaseDummyOptions | VideoDummyOptions | ImageDummyOptions | AudioDummyOptions
 )
@@ -135,6 +136,9 @@ class MultiModalConfig:
         DP (which is controlled by `--data-parallel-size`).
         This is only supported on a per-model basis and falls back to
         `"weights"` if the encoder does not support DP."""
+    mm_tensor_ipc: MMTensorIPC = "none"
+    """How to transfer multimodal tensors between processes. If `"torch_shm"`,
+    use torch shared memory for IPC. If `"none"`, disable tensor IPC."""
     mm_encoder_attn_backend: AttentionBackendEnum | None = None
     """Optional override for the multi-modal encoder attention backend when
     using vision transformers. Accepts any value from

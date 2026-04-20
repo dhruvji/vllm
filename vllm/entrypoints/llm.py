@@ -799,7 +799,7 @@ class LLM:
             # on the task and language of their request. Also needed to avoid
             # appending an EOS token to the prompt which disrupts generation.
             add_special_tokens=not model_config.is_encoder_decoder,
-        ).with_kwargs(tokenization_kwargs)
+        ).with_kwargs(**(tokenization_kwargs or {}))
 
     def _preprocess_completion(
         self,
@@ -834,7 +834,7 @@ class LLM:
             max_total_tokens=model_config.max_model_len,
             do_lower_case=encoder_config.get("do_lower_case", False),
             add_special_tokens=False,
-        ).with_kwargs(tokenization_kwargs)
+        ).with_kwargs(**(tokenization_kwargs or {}))
 
     def _preprocess_chat(
         self,
@@ -1721,7 +1721,10 @@ class LLM:
         seq_prompts = prompt_to_seq(prompts)
         seq_params = self._params_to_seq(params, len(seq_prompts))
 
-        if any(param.truncate_prompt_tokens is not None for param in seq_params):
+        if any(
+            getattr(param, "truncate_prompt_tokens", None) is not None
+            for param in seq_params
+        ):
             # TODO: Remove this after deprecating `param.truncate_prompt_tokens`
             # Then, move the code from the `else` block to the top and let
             # `self._preprocess_completion` handle prompt normalization
@@ -1732,7 +1735,11 @@ class LLM:
                     [prompt],
                     tokenization_kwargs=merge_kwargs(
                         tokenization_kwargs,
-                        dict(truncate_prompt_tokens=param.truncate_prompt_tokens),
+                        dict(
+                            truncate_prompt_tokens=getattr(
+                                param, "truncate_prompt_tokens", None
+                            )
+                        ),
                     ),
                 )
             ]
@@ -1854,7 +1861,8 @@ class LLM:
         prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
         request_id = str(next(self.request_counter))
 
-        if params.truncate_prompt_tokens is not None:
+        truncate_prompt_tokens = getattr(params, "truncate_prompt_tokens", None)
+        if truncate_prompt_tokens is not None:
             params_type = type(params).__name__
             warnings.warn(
                 f"The `truncate_prompt_tokens` parameter in `{params_type}` "
@@ -1866,7 +1874,7 @@ class LLM:
 
             tokenization_kwargs = merge_kwargs(
                 tokenization_kwargs,
-                dict(truncate_prompt_tokens=params.truncate_prompt_tokens),
+                dict(truncate_prompt_tokens=truncate_prompt_tokens),
             )
 
         tok_params = self._get_cmpl_tok_params(tokenization_kwargs)

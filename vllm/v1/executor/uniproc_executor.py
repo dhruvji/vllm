@@ -43,9 +43,6 @@ class UniProcExecutor(Executor):
                 max_workers=1, thread_name_prefix="WorkerAsyncOutput"
             )
 
-        # GPUModelRunnerV1 initializes InputBatch during init_device(), so the
-        # backend-derived KV cache block size must be resolved first.
-        current_platform.update_block_size_for_backend(self.vllm_config)
         self.driver_worker.init_worker(all_kwargs=[kwargs])
         self.driver_worker.init_device()
 
@@ -53,6 +50,7 @@ class UniProcExecutor(Executor):
             self.driver_worker.elastic_ep_execute("load_model")
         else:
             self.driver_worker.load_model()
+        current_platform.update_block_size_for_backend(self.vllm_config)
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""

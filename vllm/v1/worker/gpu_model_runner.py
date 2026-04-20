@@ -1016,23 +1016,33 @@ class GPUModelRunner(
         k_scale = torch.ones(1, device=self.device, dtype=torch.float32)
         v_scale = torch.ones(1, device=self.device, dtype=torch.float32)
 
-        # Determine K/V unbind dimension based on backend
+        # Determine K/V unbind dimension and cache writer based on backend.
         # flash_attn: (2, num_blocks, ...) -> unbind(0)
-        # flashinfer: (num_blocks, 2, ...) -> unbind(1)
+        # flashinfer/triton: (num_blocks, 2, ...) -> unbind(1)
         backend_name = self.attn_groups[0][0].backend.__name__
         if "FlashAttention" in backend_name:
             kv_dim = 0
+            # Lazy import to avoid module-level import failures on non-CUDA
+            # platforms.
+            from vllm.v1.attention.backends.fa_utils import (
+                reshape_and_cache_flash as reshape_and_cache,
+            )
         elif "FlashInfer" in backend_name:
             kv_dim = 1
+            from vllm.v1.attention.backends.fa_utils import (
+                reshape_and_cache_flash as reshape_and_cache,
+            )
+        elif "TritonAttention" in backend_name:
+            kv_dim = 1
+            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                triton_reshape_and_cache_flash as reshape_and_cache,
+            )
         else:
             raise NotImplementedError(
                 f"Cartridge prepopulation not supported for backend: "
-                f"{backend_name}. Only FlashAttention and FlashInfer "
+                f"{backend_name}. Only FlashAttention, FlashInfer, and Triton "
                 f"are supported."
             )
-
-        # Lazy import to avoid module-level import failures on non-CUDA platforms
-        from vllm.v1.attention.backends.fa_utils import reshape_and_cache_flash
 
         # Write cartridge KV to each layer's cache
         num_layers = len(layer_kv_list)
@@ -1047,7 +1057,7 @@ class GPUModelRunner(
             layer_keys, layer_values = layer_kv_list[layer_idx]
 
             # Write to cache
-            reshape_and_cache_flash(
+            reshape_and_cache(
                 layer_keys,
                 layer_values,
                 key_cache,
