@@ -89,3 +89,37 @@ def test_save_cartridge_to_shm_serializes_concurrent_writers(tmp_path, monkeypat
     assert loaded is not None
     assert torch.equal(loaded[0], stacked_kv[0])
     assert torch.equal(loaded[1], stacked_kv[1])
+
+
+def test_real_model_layer_indices_stack_in_sorted_attention_order():
+    kv_cache = {}
+    expected_keys = []
+    expected_values = []
+
+    # Qwen 3.5 cartridges use real model layer indices for attention layers,
+    # not dense 0..N-1 numbering. Insert them out of order to verify we sort by
+    # the artifact's layer index before stacking.
+    expected_layer_indices = (3, 7, 11)
+    for layer_idx in (11, 3, 7):
+        keys = torch.full((1, 2, 4, 5), float(layer_idx))
+        values = torch.full((1, 2, 4, 5), float(layer_idx + 100))
+        kv_cache[f"layers.{layer_idx}.attention.prefix.keys"] = keys
+        kv_cache[f"layers.{layer_idx}.attention.prefix.values"] = values
+
+    for layer_idx in expected_layer_indices:
+        expected_keys.append(
+            kv_cache[f"layers.{layer_idx}.attention.prefix.keys"]
+            .squeeze(0)
+            .permute(1, 0, 2)
+        )
+        expected_values.append(
+            kv_cache[f"layers.{layer_idx}.attention.prefix.values"]
+            .squeeze(0)
+            .permute(1, 0, 2)
+        )
+
+    cartridge = cartridge_loader.CartridgeData(kv_cache=kv_cache, is_learned=True)
+    stacked_keys, stacked_values = cartridge.get_stacked_kv()
+
+    assert torch.equal(stacked_keys, torch.stack(expected_keys))
+    assert torch.equal(stacked_values, torch.stack(expected_values))

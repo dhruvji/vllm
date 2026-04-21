@@ -924,8 +924,8 @@ class GPUModelRunner(
         # Validate cartridge dimensions match model architecture
         total_kv_heads = self.model_config.get_total_num_kv_heads()
         expected_head_size = self.model_config.get_head_size()
-        expected_num_layers = self.model_config.get_num_layers(
-            self.parallel_config
+        expected_num_layers = self.model_config.get_num_layers_by_block_type(
+            self.parallel_config, "attention"
         )
         cart_num_layers, cart_kv_heads, cart_seq_len, cart_head_dim = (
             stacked_keys.shape
@@ -933,7 +933,7 @@ class GPUModelRunner(
         if cart_num_layers != expected_num_layers:
             raise ValueError(
                 f"Cartridge incompatible with model: "
-                f"num_layers={cart_num_layers} but model expects "
+                f"num_attention_layers={cart_num_layers} but model expects "
                 f"{expected_num_layers}."
             )
         if cart_kv_heads != total_kv_heads:
@@ -1001,10 +1001,52 @@ class GPUModelRunner(
                           Each tensor has shape (seq_len, num_kv_heads, head_dim).
             cart_seq_len: Length of the cartridge sequence.
         """
-        block_size = self.cache_config.block_size
+        attn_group_ids = [gid for gid, groups in enumerate(self.attn_groups) if groups]
+        if not attn_group_ids:
+            raise RuntimeError("No attention KV cache groups available for cartridge.")
 
-        # Use first KV cache group's block IDs (most common case)
-        block_ids_list = block_ids[0]
+        selected_gid: int | None = None
+        selected_block_size: int | None = None
+        selected_block_ids_list: list[int] | None = None
+        for gid in attn_group_ids:
+            block_table = self.input_batch.block_table[gid]
+            block_size = block_table.block_size
+            group_block_ids = block_ids[gid]
+            if block_table.use_hybrid_blocks:
+                group_block_ids = block_table.map_to_kernel_blocks(
+                    np.asarray(group_block_ids, dtype=np.int32),
+                    block_table.blocks_per_kv_block,
+                    block_table._kernel_block_arange,
+                ).tolist()
+
+            if len(group_block_ids) >= cdiv(cart_seq_len, block_size):
+                selected_gid = gid
+                selected_block_size = block_size
+                selected_block_ids_list = group_block_ids
+                break
+
+        if selected_gid is None or selected_block_size is None or selected_block_ids_list is None:
+            group_debug = []
+            for gid in attn_group_ids:
+                block_table = self.input_batch.block_table[gid]
+                group_block_ids = block_ids[gid]
+                if block_table.use_hybrid_blocks:
+                    group_block_ids = block_table.map_to_kernel_blocks(
+                        np.asarray(group_block_ids, dtype=np.int32),
+                        block_table.blocks_per_kv_block,
+                        block_table._kernel_block_arange,
+                    ).tolist()
+                group_debug.append(
+                    f"gid={gid}: block_size={block_table.block_size}, "
+                    f"num_blocks={len(group_block_ids)}"
+                )
+            raise RuntimeError(
+                "Insufficient attention-group block IDs to prepopulate cartridge KV: "
+                f"seq_len={cart_seq_len}; groups={group_debug}"
+            )
+
+        block_size = selected_block_size
+        block_ids_list = selected_block_ids_list
 
         # Compute slot mapping for all cartridge positions
         positions = torch.arange(cart_seq_len, device=self.device, dtype=torch.long)
@@ -1030,7 +1072,7 @@ class GPUModelRunner(
         # Determine K/V unbind dimension and cache writer based on backend.
         # flash_attn: (2, num_blocks, ...) -> unbind(0)
         # flashinfer/triton: (num_blocks, 2, ...) -> unbind(1)
-        backend_name = self.attn_groups[0][0].backend.__name__
+        backend_name = self.attn_groups[selected_gid][0].backend.__name__
         if "FlashAttention" in backend_name:
             kv_dim = 0
             # Lazy import to avoid module-level import failures on non-CUDA
@@ -1055,17 +1097,26 @@ class GPUModelRunner(
                 f"are supported."
             )
 
-        # Write cartridge KV to each layer's cache
-        num_layers = len(layer_kv_list)
-        for layer_idx in range(num_layers):
-            if layer_idx >= len(self.kv_caches):
-                break
+        layer_indices = sorted(
+            {
+                int(layer_name.split(".layers.")[1].split(".", 1)[0])
+                for attn_group in self.attn_groups[selected_gid]
+                for layer_name in attn_group.layer_names
+            }
+        )
+        if len(layer_indices) < len(layer_kv_list):
+            raise RuntimeError(
+                "Cartridge layer count exceeds available attention KV caches: "
+                f"{len(layer_kv_list)} cartridge layers vs "
+                f"{len(layer_indices)} cache layers."
+            )
 
+        # Write cartridge KV to each selected attention layer's cache.
+        for layer_idx, (layer_keys, layer_values) in zip(
+            layer_indices, layer_kv_list, strict=False
+        ):
             kv_cache = self.kv_caches[layer_idx]
             key_cache, value_cache = kv_cache.unbind(kv_dim)
-
-            # Get precomputed layer tensors (already transposed and on GPU)
-            layer_keys, layer_values = layer_kv_list[layer_idx]
 
             # Write to cache
             reshape_and_cache(

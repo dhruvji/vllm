@@ -292,7 +292,7 @@ class CartridgeData:
         """Get stacked KV tensors for IPC, computing and caching on first call.
 
         Output: [stacked_keys, stacked_values] with shape
-            (num_layers, num_kv_heads, seq_len, head_dim)
+            (num_attention_layers, num_kv_heads, seq_len, head_dim)
         """
         if not self.is_learned or not self.kv_cache:
             return None
@@ -303,12 +303,25 @@ class CartridgeData:
         keys_by_layer, values_by_layer = _parse_kv_cache_to_layers(self.kv_cache)
 
         if keys_by_layer and values_by_layer:
-            num_layers = max(keys_by_layer.keys()) + 1
+            ordered_layers = sorted(set(keys_by_layer) & set(values_by_layer))
+            if len(ordered_layers) != len(keys_by_layer) or len(
+                ordered_layers
+            ) != len(values_by_layer):
+                missing_keys = sorted(set(values_by_layer) - set(keys_by_layer))
+                missing_values = sorted(set(keys_by_layer) - set(values_by_layer))
+                raise ValueError(
+                    "Cartridge has mismatched sparse KV layers: "
+                    f"missing_keys={missing_keys}, missing_values={missing_values}"
+                )
             self._stacked_kv = [
-                torch.stack([keys_by_layer[i] for i in range(num_layers)]),
-                torch.stack([values_by_layer[i] for i in range(num_layers)]),
+                torch.stack([keys_by_layer[i] for i in ordered_layers]),
+                torch.stack([values_by_layer[i] for i in ordered_layers]),
             ]
-            logger.info("Computed stacked cartridge KV: %d layers", num_layers)
+            logger.info(
+                "Computed stacked cartridge KV: %d attention layers (%s)",
+                len(ordered_layers),
+                ordered_layers,
+            )
 
         return self._stacked_kv
 
