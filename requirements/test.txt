@@ -317,7 +317,7 @@ grpcio==1.78.0
     #   tensorboard
 grpcio-reflection==1.78.0
     # via -r requirements/test.in
-h11==0.14.0
+h11==0.16.0
     # via
     #   httpcore
     #   uvicorn
@@ -542,7 +542,7 @@ networkx==3.2.1
     # via
     #   scikit-image
     #   torch
-nltk==3.9.1
+nltk==3.9.3
     # via rouge-score
 num2words==0.5.14
     # via -r requirements/test.in
@@ -969,7 +969,7 @@ rasterio==1.4.3
     #   rioxarray
     #   terratorch
     #   torchgeo
-ray==2.48.0
+ray==2.52.0
     # via -r requirements/test.in
 redis==5.2.0
     # via tensorizer

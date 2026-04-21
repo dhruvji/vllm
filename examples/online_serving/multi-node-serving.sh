@@ -57,7 +57,7 @@ case "$subcommand" in
 
     # Retry until the worker node connects to the head node or the timeout expires.
     for (( i=0; i < $ray_init_timeout; i+=5 )); do
-      if ray start --address="$ray_address":"$ray_port" --block "${start_params[@]}"; then
+      if ray start --address="$ray_address":"$ray_port" --block --include-dashboard=false "${start_params[@]}"; then
         echo "Worker: Ray runtime started with head address $ray_address:$ray_port"
         exit 0
       fi
@@ -93,8 +93,8 @@ case "$subcommand" in
       exit 1
     fi
 
-    # Start the Ray head node.
-    ray start --head --port="$ray_port" "${start_params[@]}"
+    # Start the Ray head node. Dashboard disabled by default because Ray's Jobs API is unauthenticated; pass --include-dashboard=true RAY_AUTH_MODE=token to enable it safely.
+    ray start --head --port="$ray_port" --include-dashboard=false "${start_params[@]}"
 
     # Poll Ray until every worker node is active.
     for (( i=0; i < $ray_init_timeout; i+=5 )); do
