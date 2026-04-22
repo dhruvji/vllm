@@ -167,6 +167,9 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.cartridge_utils import (
+    strip_cartridge_offsets_from_seq_lens,
+)
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -2253,6 +2256,22 @@ class GPUModelRunner(
                 logits_indices
             )
 
+        mamba_seq_lens_cpu = None
+        mamba_seq_lens_gpu = None
+        mamba_max_seq_len = None
+        if self.cartridge_position_offsets:
+            mamba_seq_lens_np = strip_cartridge_offsets_from_seq_lens(
+                self.seq_lens.np[:num_reqs_padded],
+                self.input_batch.req_ids[:num_reqs],
+                self.cartridge_position_offsets,
+            )
+            mamba_seq_lens_cpu = torch.from_numpy(mamba_seq_lens_np)
+            mamba_seq_lens_gpu = mamba_seq_lens_cpu.to(
+                device=self.device,
+                non_blocking=True,
+            )
+            mamba_max_seq_len = int(mamba_seq_lens_np[:num_reqs].max())
+
         # Cache attention metadata builds across hybrid KV-cache groups
         # The only thing that changes between different hybrid KV-cache groups when the
         # same metadata builder and KVCacheSpec is the same is the block table, so we
@@ -2340,6 +2359,19 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+
+            if (
+                isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+                and mamba_seq_lens_cpu is not None
+                and mamba_seq_lens_gpu is not None
+                and mamba_max_seq_len is not None
+            ):
+                # Cartridge prefixes populate attention KV only. Hybrid
+                # recurrent state must continue to index blocks using the
+                # cartridge-free token sequence length.
+                cm.seq_lens = mamba_seq_lens_gpu
+                cm._seq_lens_cpu = mamba_seq_lens_cpu
+                cm.max_seq_len = mamba_max_seq_len
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, EagleProposer):

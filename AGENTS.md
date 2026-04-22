@@ -1,18 +1,19 @@
 # Agent Instructions for vLLM
 
-> These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
+> These instructions apply to **all** AI-assisted contributions in this checkout.
 > Breaching these guidelines can result in automatic banning.
 
 ## 1. Contribution Policy (Mandatory)
 
 ### Duplicate-work checks
 
-Before proposing a PR, run these checks:
+Before proposing a PR, run these checks against `engram-lab/vllm` for this
+checkout unless the user explicitly asks for a different target:
 
 ```bash
-gh issue view <issue_number> --repo vllm-project/vllm --comments
-gh pr list --repo vllm-project/vllm --state open --search "<issue_number> in:body"
-gh pr list --repo vllm-project/vllm --state open --search "<short area keywords>"
+gh issue view <issue_number> --repo engram-lab/vllm --comments
+gh pr list --repo engram-lab/vllm --state open --search "<issue_number> in:body"
+gh pr list --repo engram-lab/vllm --state open --search "<short area keywords>"
 ```
 
 - If an open PR already addresses the same fix, do not open another.
