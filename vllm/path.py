@@ -1,4 +1,6 @@
 # From elements -- refactor into shared engrams lib later
+import asyncio
+import concurrent.futures
 import fnmatch
 import glob as globlib
 import io
@@ -1214,6 +1216,15 @@ class S3AppendFile:
         self.buffer.close()
 
 
+def _run_modal_sync(fn, *args, **kwargs):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return fn(*args, **kwargs)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(fn, *args, **kwargs).result()
+
+
 class ModalVolumeV2(Path):
     __slots__ = ("_path", "_volume", "_write_volume")
 
@@ -1289,11 +1300,11 @@ class ModalVolumeV2(Path):
 
     def _reload(self):
         with self._volume_lock():
-            self.volume.reload()
+            _run_modal_sync(self.volume.reload)
 
     def _commit(self):
         with self._volume_lock():
-            self.write_volume.commit()
+            _run_modal_sync(self.write_volume.commit)
 
     def _list_entries(self, recursive=False):
         self._reload()
