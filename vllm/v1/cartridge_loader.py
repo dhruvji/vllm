@@ -905,6 +905,27 @@ def _resolve_glob(pattern: str) -> str | None:
         return pattern
 
 
+def _spec_sources(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the ranked list of ``{id, source}`` candidates for a spec.
+
+    Accepts the new ``sources`` list and the legacy single ``id``/``source``
+    pair (which is materialised as a single-entry list)."""
+    sources = spec.get("sources")
+    if sources:
+        return list(sources)
+    cartridge_id = spec.get("id")
+    if not cartridge_id:
+        return []
+    logger.warning(
+        "Adapter spec uses deprecated top-level `id`/`source` fields. "
+        "Switch callers to `sources: [{id, source}, ...]` to get ranked "
+        "fallback. Saw: id=%s source=%s",
+        cartridge_id,
+        spec.get("source"),
+    )
+    return [{"id": cartridge_id, "source": spec.get("source")}]
+
+
 def load_cartridges_from_request(
     cartridges_spec: list[dict[str, Any]],
 ) -> list[CartridgeData]:
@@ -912,35 +933,47 @@ def load_cartridges_from_request(
     loaded_cartridges = []
 
     for spec in cartridges_spec:
-        cartridge_id = spec.get("id")
-        if not cartridge_id:
-            logger.warning("Skipping cartridge with missing id: %s", spec)
+        sources = _spec_sources(spec)
+        if not sources:
+            logger.warning("Skipping cartridge with no id/sources: %s", spec)
             continue
 
-        # Resolve glob patterns in cartridge ID (supports s3://, modal://, local)
-        resolved_id = _resolve_glob(cartridge_id)
-        if resolved_id is None:
-            logger.warning("Could not resolve cartridge glob: %s", cartridge_id)
-            continue
+        last_err: Exception | None = None
+        loaded = False
+        for source_ref in sources:
+            cartridge_id = source_ref.get("id")
+            if not cartridge_id:
+                continue
+            resolved_id = _resolve_glob(cartridge_id)
+            if resolved_id is None:
+                logger.warning("Could not resolve cartridge glob: %s", cartridge_id)
+                continue
+            if resolved_id != cartridge_id:
+                logger.info(f"Using cartridge: {cartridge_id} -> {resolved_id}")
+            try:
+                cartridge_data = load_cartridge(
+                    cartridge_id=resolved_id,
+                    force_redownload=spec.get("force_redownload", False),
+                )
+                loaded_cartridges.append(cartridge_data)
+                loaded = True
+                break
+            except FileNotFoundError as e:
+                logger.warning(
+                    "Cartridge source %s not found; trying next: %s",
+                    resolved_id,
+                    e,
+                )
+                last_err = e
+                continue
+            except Exception as e:
+                logger.error("Failed to load cartridge %s: %s", resolved_id, e)
+                raise RuntimeError(f"Failed to load cartridge {resolved_id}: {e}") from e
 
-        # Log which checkpoint is being used for this request
-        if resolved_id != cartridge_id:
-            logger.info(f"Using cartridge: {cartridge_id} -> {resolved_id}")
-
-        try:
-            cartridge_data = load_cartridge(
-                cartridge_id=resolved_id,
-                force_redownload=spec.get("force_redownload", False),
-            )
-            loaded_cartridges.append(cartridge_data)
-        except FileNotFoundError as e:
-            # Normalize to a clear, user-facing error that downstream HTTP layer
-            # will surface as a 400 BadRequest (see create_error_response).
-            msg = f"Cartridge not found: {resolved_id}"
-            logger.error("%s (%s)", msg, e)
-            raise RuntimeError(msg) from e
-        except Exception as e:
-            logger.error("Failed to load cartridge %s: %s", resolved_id, e)
-            raise RuntimeError(f"Failed to load cartridge {resolved_id}: {e}") from e
+        if not loaded:
+            tried = [s.get("id") for s in sources]
+            msg = f"Cartridge not found in any source: {tried}"
+            logger.error("%s (%s)", msg, last_err)
+            raise RuntimeError(msg) from last_err
 
     return loaded_cartridges

@@ -772,26 +772,49 @@ class OpenAIServing:
         if not isinstance(lora_spec, dict):
             raise ValueError("Each LoRA adapter spec must be an object.")
 
-        lora_id = lora_spec.get("id")
-        if not lora_id:
-            raise ValueError("LoRA adapter spec missing `id`.")
+        from vllm.v1.cartridge_loader import _spec_sources
+
+        sources = _spec_sources(lora_spec)
+        if not sources:
+            raise ValueError("LoRA adapter spec missing `id`/`sources`.")
 
         force_redownload = bool(lora_spec.get("force_redownload", False))
 
-        resolved_id = await asyncio.to_thread(_resolve_glob, lora_id)
-        if resolved_id is None:
-            raise RuntimeError(f"Could not resolve LoRA glob: {lora_id}")
-        if resolved_id != lora_id:
-            logger.info("Using LoRA: %s -> %s", lora_id, resolved_id)
-
-        if _requires_staged_lora_dir(resolved_id):
-            runtime_lora_path = await asyncio.to_thread(
-                self._prepare_staged_lora_dir,
-                resolved_id,
-                force_redownload,
-            )
-        else:
-            runtime_lora_path = _normalize_lora_runtime_path(resolved_id)
+        resolved_id: str | None = None
+        runtime_lora_path: str | None = None
+        last_err: Exception | None = None
+        for source_ref in sources:
+            lora_id = source_ref.get("id")
+            if not lora_id:
+                continue
+            try:
+                candidate_resolved = await asyncio.to_thread(_resolve_glob, lora_id)
+                if candidate_resolved is None:
+                    continue
+                if candidate_resolved != lora_id:
+                    logger.info("Using LoRA: %s -> %s", lora_id, candidate_resolved)
+                if _requires_staged_lora_dir(candidate_resolved):
+                    candidate_path = await asyncio.to_thread(
+                        self._prepare_staged_lora_dir,
+                        candidate_resolved,
+                        force_redownload,
+                    )
+                else:
+                    candidate_path = _normalize_lora_runtime_path(candidate_resolved)
+                resolved_id = candidate_resolved
+                runtime_lora_path = candidate_path
+                break
+            except FileNotFoundError as e:
+                logger.warning(
+                    "LoRA source %s not found; trying next: %s", lora_id, e
+                )
+                last_err = e
+                continue
+        if resolved_id is None or runtime_lora_path is None:
+            tried = [s.get("id") for s in sources]
+            raise RuntimeError(
+                f"LoRA not found in any source: {tried}"
+            ) from last_err
 
         # Route request-body LoRAs through the same synchronized registry
         # used by the explicit runtime load API so cold replicas do not
@@ -952,9 +975,16 @@ class OpenAIServing:
                 "Only learned prefix cartridges with KV tensors are currently supported."
             )
 
+        from vllm.v1.cartridge_loader import _spec_sources
+
         cartridge_id = cartridge_spec.get("id")
         if not cartridge_id:
-            raise ValueError("Prefix cartridge spec must include `id`.")
+            spec_sources = _spec_sources(cartridge_spec)
+            cartridge_id = spec_sources[0]["id"] if spec_sources else None
+        if not cartridge_id:
+            raise ValueError(
+                "Prefix cartridge spec must include `id` or `sources[].id`."
+            )
 
         shm_path = save_cartridge_to_shm(cartridge_id, stacked_kv)
         return self.input_processor.process_inputs(
