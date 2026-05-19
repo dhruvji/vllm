@@ -153,6 +153,7 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
@@ -5069,17 +5070,40 @@ class GPUModelRunner(
                 continue
 
             num_prompt_tokens = len(request.prompt_token_ids)
+            sampling_params = request.sampling_params
+            assert sampling_params is not None
+            target_start = sampling_params.prompt_logprobs_start_index or 1
+            target_start = max(target_start, 1)
+            target_end = sampling_params.prompt_logprobs_end_index
+            if target_end is None:
+                target_end = num_prompt_tokens
+            else:
+                target_end = min(target_end, num_prompt_tokens)
+            target_start = min(target_start, target_end)
+            prompt_logprobs_len = target_end - target_start
+            hidden_range_start = target_start - 1
+            hidden_range_end = target_end - 1
             prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
                 self.device, non_blocking=True
             )
 
             # Set up target LogprobsTensors object.
             logprobs_tensors = in_progress_dict.get(req_id)
-            if not logprobs_tensors:
-                # Create empty logprobs CPU tensors for the entire prompt.
+            if logprobs_tensors is None:
+                if (
+                    sampling_params.prompt_logprobs_start_index is not None
+                    and request.num_computed_tokens > hidden_range_start
+                    and prompt_logprobs_len > 0
+                ):
+                    raise ValueError(
+                        "Prefix cache hit overlaps requested prompt-logprobs "
+                        "range. Increase prompt_logprobs_start_index or disable "
+                        "prefix-cache reads for this request."
+                    )
+                # Create empty logprobs CPU tensors for the requested prompt range.
                 # If chunked, we'll copy in slice by slice.
                 logprobs_tensors = LogprobsTensors.empty_cpu(
-                    num_prompt_tokens - 1, num_prompt_logprobs + 1
+                    prompt_logprobs_len, num_prompt_logprobs + 1
                 )
                 in_progress_dict[req_id] = logprobs_tensors
 
@@ -5105,34 +5129,58 @@ class GPUModelRunner(
                 # step. There are no more prompt logprobs to produce.
                 continue
 
+            prompt_pos_start = max(start_idx, hidden_range_start)
+            prompt_pos_end = min(start_idx + num_logits, hidden_range_end)
+            if prompt_pos_start >= prompt_pos_end:
+                continue
+
             # Get the logits corresponding to this req's prompt tokens.
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
+            hidden_start = offset + prompt_pos_start - start_idx
+            hidden_end = offset + prompt_pos_end - start_idx
+            prompt_hidden_states = hidden_states[hidden_start:hidden_end]
 
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+            # Get top-k prompt logprobs in bounded chunks. Materializing
+            # log_softmax for thousands of prompt positions can OOM because it
+            # creates a [tokens, vocab] float32 tensor.
+            logprob_chunk_size = 1024
+            dst_start = prompt_pos_start - hidden_range_start
+            for local_start in range(
+                0, prompt_hidden_states.shape[0], logprob_chunk_size
+            ):
+                local_end = min(
+                    local_start + logprob_chunk_size,
+                    prompt_hidden_states.shape[0],
+                )
+                logits = self.model.compute_logits(
+                    prompt_hidden_states[local_start:local_end]
+                )
 
-            # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
+                # For prompt at index i, token i+1 is the target token whose
+                # logprob we need.
+                tgt_token_ids = prompt_token_ids[
+                    prompt_pos_start + local_start + 1 : prompt_pos_start
+                    + local_end
+                    + 1
+                ]
 
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+                chunk_logprobs = compute_topk_logprobs(
+                    logits, num_prompt_logprobs, tgt_token_ids
+                )
+
+                chunk_slice = slice(dst_start + local_start, dst_start + local_end)
+                logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                    chunk_logprobs.logprob_token_ids, non_blocking=True
+                )
+                logprobs_tensors.logprobs[chunk_slice].copy_(
+                    chunk_logprobs.logprobs, non_blocking=True
+                )
+                logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                    chunk_logprobs.selected_token_ranks, non_blocking=True
+                )
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.

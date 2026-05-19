@@ -17,6 +17,11 @@ class PromptLogprobsWorker:
         self.max_num_reqs = max_num_reqs
 
         self.uses_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=bool)
+        self.prompt_logprobs_start_indices = np.zeros(self.max_num_reqs, dtype=np.int64)
+        self.prompt_logprobs_end_indices = np.full(
+            self.max_num_reqs, -1, dtype=np.int64
+        )
+        self.num_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=np.int64)
         # req_idx -> list of in-progress LogprobsTensors
         self.in_progress_prompt_logprobs: dict[str, list[LogprobsTensors]] = {}
 
@@ -24,6 +29,19 @@ class PromptLogprobsWorker:
         # For now, only support prompt logprobs for the prompt tokens (not top-k).
         uses_prompt_logprobs = sampling_params.prompt_logprobs is not None
         self.uses_prompt_logprobs[req_idx] = uses_prompt_logprobs
+        self.num_prompt_logprobs[req_idx] = (
+            sampling_params.prompt_logprobs
+            if sampling_params.prompt_logprobs is not None
+            else 0
+        )
+        self.prompt_logprobs_start_indices[req_idx] = (
+            sampling_params.prompt_logprobs_start_index or 0
+        )
+        self.prompt_logprobs_end_indices[req_idx] = (
+            sampling_params.prompt_logprobs_end_index
+            if sampling_params.prompt_logprobs_end_index is not None
+            else -1
+        )
         if uses_prompt_logprobs:
             self.in_progress_prompt_logprobs[req_id] = []
 
@@ -73,10 +91,19 @@ class PromptLogprobsWorker:
             all_token_ids,
         )
         # Compute the prompt logprobs.
+        requested_prompt_logprobs = self.num_prompt_logprobs[idx_mapping_np][
+            needs_prompt_logprobs
+        ]
+        num_prompt_logprobs = (
+            -1
+            if np.any(requested_prompt_logprobs == -1)
+            else int(requested_prompt_logprobs.max())
+        )
         prompt_logprobs, prompt_ranks = compute_prompt_logprobs_with_chunking(
             prompt_logprobs_token_ids,
             hidden_states[: input_batch.num_tokens],
             logits_fn,
+            num_prompt_logprobs,
         )
 
         pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
@@ -85,6 +112,8 @@ class PromptLogprobsWorker:
         query_start_loc_np = input_batch.query_start_loc_np
         prompt_token_ids = prompt_logprobs_token_ids.unsqueeze(-1)
         prompt_logprobs_dict: dict[str, LogprobsTensors] = {}
+        prompt_logprobs_starts = self.prompt_logprobs_start_indices[idx_mapping_np]
+        prompt_logprobs_ends = self.prompt_logprobs_end_indices[idx_mapping_np]
         for i, req_id in enumerate(input_batch.req_ids):
             if not needs_prompt_logprobs[i]:
                 continue
@@ -96,13 +125,57 @@ class PromptLogprobsWorker:
             )
             if not is_prompt_chunked[i]:
                 end_idx -= 1
-            logprobs = LogprobsTensors(
-                logprob_token_ids=prompt_token_ids[start_idx:end_idx],
-                logprobs=prompt_logprobs[start_idx:end_idx],
-                selected_token_ranks=prompt_ranks[start_idx:end_idx],
-            )
+            logical_start = computed_prefill[i]
+            logical_end = logical_start + end_idx - start_idx
+            target_start = max(int(prompt_logprobs_starts[i]), 1)
+            target_end = int(prompt_logprobs_ends[i])
+            if target_end < 0:
+                target_end = int(prompt_lens[i])
+            else:
+                target_end = min(target_end, int(prompt_lens[i]))
+            target_start = min(target_start, target_end)
+            range_start = target_start - 1
+            range_end = target_end - 1
 
             prompt_logprobs_list = self.in_progress_prompt_logprobs[req_id]
+            if (
+                prompt_logprobs_starts[i] > 0
+                and not prompt_logprobs_list
+                and logical_start > range_start
+                and range_end > range_start
+            ):
+                raise ValueError(
+                    "Prefix cache hit overlaps requested prompt-logprobs range. "
+                    "Increase prompt_logprobs_start_index or disable prefix-cache "
+                    "reads for this request."
+                )
+
+            overlap_start = max(int(logical_start), range_start)
+            overlap_end = min(int(logical_end), range_end)
+            if overlap_start >= overlap_end:
+                if is_prompt_chunked[i]:
+                    continue
+                if prompt_logprobs_list:
+                    logprobs = LogprobsTensors(
+                        logprob_token_ids=torch.cat(
+                            [x.logprob_token_ids for x in prompt_logprobs_list]
+                        ),
+                        logprobs=torch.cat([x.logprobs for x in prompt_logprobs_list]),
+                        selected_token_ranks=torch.cat(
+                            [x.selected_token_ranks for x in prompt_logprobs_list]
+                        ),
+                    )
+                    prompt_logprobs_list.clear()
+                    prompt_logprobs_dict[req_id] = logprobs
+                continue
+            flat_start = start_idx + overlap_start - int(logical_start)
+            flat_end = start_idx + overlap_end - int(logical_start)
+            logprobs = LogprobsTensors(
+                logprob_token_ids=prompt_token_ids[flat_start:flat_end],
+                logprobs=prompt_logprobs[flat_start:flat_end],
+                selected_token_ranks=prompt_ranks[flat_start:flat_end],
+            )
+
             if is_prompt_chunked[i]:
                 # Prompt is chunked. Do not return the logprobs yet.
                 prompt_logprobs_list.append(logprobs)
@@ -184,6 +257,7 @@ def compute_prompt_logprobs_with_chunking(
     prompt_token_ids: torch.Tensor,
     prompt_hidden_states: torch.Tensor,
     logits_fn: Callable[[torch.Tensor], torch.Tensor],
+    num_prompt_logprobs: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
@@ -197,7 +271,7 @@ def compute_prompt_logprobs_with_chunking(
         prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
         prompt_logprobs = compute_topk_logprobs(
             prompt_logits,
-            0,  # num_logprobs
+            num_prompt_logprobs,
             prompt_token_ids[start_idx:end_idx],
         )
         logprobs.append(prompt_logprobs.logprobs)

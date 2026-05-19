@@ -16,6 +16,7 @@ from vllm.lora.layers import (
     FusedMoE3DWithLoRA,
     LoRAMapping,
     LoRAMappingType,
+    MergedColumnParallelLinearVariableSliceWithLoRA,
 )
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
@@ -554,12 +555,19 @@ class LoRAModelManager:
             else:
                 parts = module_name.split(".")
                 replacements = self.packed_modules_mapping[parts[-1]]
+                if isinstance(module, MergedColumnParallelLinearVariableSliceWithLoRA):
+                    output_dims = module.replacement_output_sizes(replacements)
+                else:
+                    output_dims = [
+                        module.lora_b_stacked[i].shape[-2]
+                        for i in range(len(replacements))
+                    ]
                 subloras: list[LoRALayerWeights | None] = []
                 for i, r in enumerate(replacements):
                     lora = LoRALayerWeights.create_dummy_lora_weights(
                         module_name + "." + r,
                         module.lora_a_stacked[i].shape[-1],
-                        module.lora_b_stacked[i].shape[-2],
+                        output_dims[i],
                         rank,
                         module.lora_a_stacked[i].dtype,
                         "cpu",
@@ -592,6 +600,9 @@ class LoRAModelManager:
         Returns:
             True if LoRA should be applied to this module, False otherwise.
         """
+        for skip_prefix in self.model.lora_skip_prefixes:
+            if module_name.startswith(skip_prefix) or f".{skip_prefix}" in module_name:
+                return False
         if not is_supported_lora_module(module_name, self.supported_lora_modules):
             return False
         return is_in_target_modules(module_name, self.lora_config.target_modules)

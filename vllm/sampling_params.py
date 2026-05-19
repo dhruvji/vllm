@@ -236,6 +236,14 @@ class SamplingParams(
     prompt_logprobs: int | None = None
     """Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities."""
+    prompt_logprobs_start_index: int | None = None
+    """Inclusive prompt-logprobs row index to start returning.
+
+    This is a vLLM extension for continuation scoring. It lets callers score a
+    prompt suffix without returning logprobs for the cached/shared prefix.
+    """
+    prompt_logprobs_end_index: int | None = None
+    """Exclusive prompt-logprobs row index to stop returning."""
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
@@ -327,6 +335,9 @@ class SamplingParams(
         min_tokens: int = 0,
         logprobs: int | None = None,
         prompt_logprobs: int | None = None,
+        prompt_logprobs_start_index: int | None = None,
+        prompt_logprobs_end_index: int | None = None,
+        flat_logprobs: bool = False,
         detokenize: bool = True,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
@@ -368,6 +379,9 @@ class SamplingParams(
             min_tokens=min_tokens,
             logprobs=logprobs,
             prompt_logprobs=prompt_logprobs,
+            prompt_logprobs_start_index=prompt_logprobs_start_index,
+            prompt_logprobs_end_index=prompt_logprobs_end_index,
+            flat_logprobs=flat_logprobs,
             detokenize=detokenize,
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
@@ -428,6 +442,26 @@ class SamplingParams(
         # eos_token_id is added to this by the engine
         self._all_stop_token_ids.update(self.stop_token_ids)
 
+        if self.prompt_logprobs_start_index is not None:
+            if self.prompt_logprobs is None:
+                raise ValueError(
+                    "prompt_logprobs_start_index requires prompt_logprobs."
+                )
+            if self.prompt_logprobs_start_index < 0:
+                raise ValueError("prompt_logprobs_start_index must be non-negative.")
+            if (
+                self.prompt_logprobs_end_index is not None
+                and self.prompt_logprobs_end_index < self.prompt_logprobs_start_index
+            ):
+                raise ValueError(
+                    "prompt_logprobs_end_index must be greater than or equal to "
+                    "prompt_logprobs_start_index."
+                )
+            if (
+                self.prompt_logprobs_start_index > 0
+                and self.skip_reading_prefix_cache is None
+            ):
+                self.skip_reading_prefix_cache = False
         if self.skip_reading_prefix_cache is None:
             # If prefix caching is enabled,
             # the output of prompt logprobs may less than n_prompt_tokens,

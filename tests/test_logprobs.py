@@ -103,6 +103,26 @@ def test_append_logprobs_for_next_position_flat() -> None:
     assert logprobs.decoded_tokens == ["1", "2", "3"]
 
 
+def test_append_logprobs_for_next_position_flat_deduplicates_sampled_token() -> None:
+    logprobs = create_sample_logprobs(flat_logprobs=True)
+    append_logprobs_for_next_position(
+        logprobs,
+        token_ids=[7, 7, 8],
+        logprobs=[0.1, 0.1, 0.2],
+        decoded_tokens=["7", "7", "8"],
+        rank=1,
+        num_logprobs=-1,
+    )
+
+    assert isinstance(logprobs, FlatLogprobs)
+    assert logprobs.start_indices == [0]
+    assert logprobs.end_indices == [2]
+    assert logprobs.token_ids == [7, 8]
+    assert logprobs.logprobs == [0.1, 0.2]
+    assert logprobs.ranks == [1, 2]
+    assert logprobs.decoded_tokens == ["7", "8"]
+
+
 LOGPROBS_ONE_POSITION_0: LogprobsOnePosition = {
     1: Logprob(logprob=0.1, rank=10, decoded_token="10")
 }

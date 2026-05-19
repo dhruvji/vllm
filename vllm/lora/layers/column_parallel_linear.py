@@ -284,10 +284,15 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         packed_modules_list: list,
         model_config: PretrainedConfig | None = None,
     ) -> bool:
-        return (
-            type(source_layer) is MergedColumnParallelLinear
-            and len(packed_modules_list) == 2
+        if type(source_layer) is not MergedColumnParallelLinear:
+            return False
+        if len(packed_modules_list) != 2:
+            return False
+        has_output_sizes = hasattr(source_layer, "output_sizes")
+        has_many_output_slices = (
+            has_output_sizes and len(source_layer.output_sizes) >= 3
         )
+        return not has_many_output_slices
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
@@ -305,10 +310,8 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def __init__(self, base_layer: QKVParallelLinear) -> None:
         super().__init__(base_layer)
-        self.q_proj_total_size = (
-            self.base_layer.total_num_heads * self.base_layer.head_size
-        )
-        self.q_proj_shard_size = self.base_layer.num_heads * self.base_layer.head_size
+        self.q_proj_total_size = self.base_layer.output_sizes[0]
+        self.q_proj_shard_size = divide(self.q_proj_total_size, self.tp_size)
         self.kv_proj_shard_size = (
             self.base_layer.num_kv_heads * self.base_layer.head_size
         )
@@ -369,22 +372,19 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         # There are three LoRA layer.
         self.n_slices = len(self.base_layer.output_sizes)
 
-        self.q_proj_shard_size = self.base_layer.num_heads * self.base_layer.head_size
+        self.q_proj_shard_size = divide(self.base_layer.output_sizes[0], self.tp_size)
         self.kv_proj_shard_size = (
             self.base_layer.num_kv_heads * self.base_layer.head_size
         )
         self.q_shard_id = self.tp_rank
         self.kv_shard_id = self.tp_rank // self.base_layer.num_kv_head_replicas
 
-        self.output_slices = (
-            self.q_proj_shard_size,
-            self.kv_proj_shard_size,
-            self.kv_proj_shard_size,
+        self.output_slices = tuple(
+            [self.q_proj_shard_size]
+            + [self.kv_proj_shard_size] * (self.n_slices - 1)
         )
-        self.output_ids = (
-            self.q_shard_id,
-            self.kv_shard_id,
-            self.kv_shard_id,
+        self.output_ids = tuple(
+            [self.q_shard_id] + [self.kv_shard_id] * (self.n_slices - 1)
         )
 
     def create_lora_weights(
@@ -614,10 +614,11 @@ class MergedColumnParallelLinearVariableSliceWithLoRA(
         if len(packed_modules_list) >= 3:
             return True
 
-        # If packed_modules_list has exactly 2 items, let
-        # MergedColumnParallelLinearWithLoRA handle it
         if len(packed_modules_list) == 2:
-            return False
+            return (
+                hasattr(source_layer, "output_sizes")
+                and len(source_layer.output_sizes) >= 3
+            )
 
         # If packed_modules_list is empty or has 1 item,
         # check the layer's output_sizes.
@@ -627,6 +628,66 @@ class MergedColumnParallelLinearVariableSliceWithLoRA(
             hasattr(source_layer, "output_sizes")
             and len(source_layer.output_sizes) >= 3
         )
+
+    def replacement_output_sizes(self, replacements: list[str]) -> list[int]:
+        """Return LoRA B output dims for replacement names.
+
+        The Qwen3.5 GDN checkpoint names group the first three packed output
+        slices as `in_proj_qkv`, while the runtime layer stores four concrete
+        slices (`q`, `k`, `v`, `z`). Dummy LoRAs used by cudagraph warmup must
+        have the same grouped dimensions as real checkpoint LoRAs, otherwise
+        the grouped expansion path cannot map them back to all concrete slices.
+        """
+        output_sizes = list(self.base_layer.output_sizes)
+        if len(replacements) == len(output_sizes):
+            return output_sizes
+
+        if len(replacements) == 2 and len(output_sizes) == 4:
+            return [sum(output_sizes[:3]), output_sizes[3]]
+
+        raise ValueError(
+            "Unsupported grouped replacement layout for variable-slice LoRA: "
+            f"replacements={replacements}, output_sizes={output_sizes}"
+        )
+
+    def _expand_grouped_loras(
+        self,
+        lora_a: list[torch.Tensor | None],
+        lora_b: list[torch.Tensor | None],
+    ) -> tuple[list[torch.Tensor | None], list[torch.Tensor | None]]:
+        """Expand LoRAs whose replacement names span multiple output slices.
+
+        Qwen3.5 GDN packs `in_proj_qkvz` as four base slices
+        (`q`, `k`, `v`, `z`) but PEFT checkpoints expose two adapter names:
+        `in_proj_qkv` spans the first three slices and `in_proj_z` spans the
+        fourth. Match each replacement tensor to as many consecutive base
+        slices as its output dimension covers.
+        """
+        output_sizes = self.base_layer.output_sizes
+        expanded_lora_a: list[torch.Tensor | None] = []
+        expanded_lora_b: list[torch.Tensor | None] = []
+        output_index = 0
+
+        for lora_a_i, lora_b_i in zip(lora_a, lora_b):
+            if lora_b_i is None:
+                expanded_lora_a.append(None)
+                expanded_lora_b.append(None)
+                output_index += 1
+                continue
+
+            start = 0
+            remaining = lora_b_i.shape[0]
+            while remaining > 0:
+                output_size = output_sizes[output_index]
+                end = start + output_size
+                expanded_lora_a.append(lora_a_i)
+                expanded_lora_b.append(lora_b_i[start:end, :])
+                start = end
+                remaining -= output_size
+                output_index += 1
+
+        assert output_index == self.n_slices
+        return expanded_lora_a, expanded_lora_b
 
     def set_lora(
         self,
@@ -654,6 +715,8 @@ class MergedColumnParallelLinearVariableSliceWithLoRA(
                 lora_b_list.append(lora_b[start_idx:end_idx, :])
                 start_idx = end_idx
             lora_b = lora_b_list
+        elif len(lora_b) != self.n_slices:
+            lora_a, lora_b = self._expand_grouped_loras(lora_a, lora_b)
 
         # Now call parent's set_lora which expects lists
         super().set_lora(index, lora_a, lora_b)

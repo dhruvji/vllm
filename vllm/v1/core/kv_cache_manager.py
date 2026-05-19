@@ -190,6 +190,18 @@ class KVCacheManager:
         # so those blocks can be matched.
         cart_seq_len = getattr(request, "cartridge_seq_len", 0)
         max_cache_hit_length = request.num_tokens + cart_seq_len - 1
+        if (
+            request.sampling_params is not None
+            and request.sampling_params.prompt_logprobs_start_index is not None
+        ):
+            # Prompt logprobs for target token i require the hidden state at
+            # i - 1. Keep prefix-cache reads below that boundary so suffix-only
+            # prompt logprobs can still use the cached prefix without skipping
+            # the first requested target token.
+            max_cache_hit_length = min(
+                max_cache_hit_length,
+                max(0, request.sampling_params.prompt_logprobs_start_index - 1),
+            )
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
