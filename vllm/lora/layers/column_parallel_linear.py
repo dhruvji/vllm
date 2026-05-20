@@ -187,9 +187,9 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         # There are two LoRA layers
         # the output_sizes in MergedColumnParallelLinear is not sharded by tp
         # we need to divide it by the tp_size to get correct slices size
-        output_sizes = self.base_layer.output_sizes
+        self.output_sizes = self.base_layer.output_sizes
         self.output_slices = tuple(
-            divide(output_size, self.tp_size) for output_size in output_sizes
+            divide(output_size, self.tp_size) for output_size in self.output_sizes
         )
         self.n_slices = len(self.output_slices)
         self.output_ids = (self.tp_rank,) * self.n_slices
@@ -253,6 +253,46 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                 ]
         return sliced_lora_b
 
+    def expand_packed_lora(
+        self,
+        lora_a: list[torch.Tensor | None],
+        lora_b: list[torch.Tensor | None],
+    ) -> tuple[list[torch.Tensor | None], list[torch.Tensor | None]]:
+        expanded_a: list[torch.Tensor | None] = []
+        expanded_b: list[torch.Tensor | None] = []
+        start_idx = 0
+
+        for lora_a_i, lora_b_i in zip(lora_a, lora_b):
+            if lora_b_i is None:
+                expanded_a.append(lora_a_i)
+                expanded_b.append(lora_b_i)
+                start_idx += 1
+                continue
+
+            rows = lora_b_i.shape[0]
+            covered_rows = 0
+            covered_slices = 0
+            for slice_idx in range(start_idx, self.n_slices):
+                covered_rows += self.output_sizes[slice_idx]
+                covered_slices += 1
+                if covered_rows == rows:
+                    break
+            else:
+                raise ValueError(
+                    f"Cannot split packed LoRA B with {rows} rows into "
+                    f"output sizes {self.output_sizes} from slice {start_idx}."
+                )
+
+            row_start = 0
+            for offset in range(covered_slices):
+                output_size = self.output_sizes[start_idx + offset]
+                expanded_a.append(lora_a_i)
+                expanded_b.append(lora_b_i[row_start : row_start + output_size, :])
+                row_start += output_size
+            start_idx += covered_slices
+
+        return expanded_a, expanded_b
+
     def set_lora(
         self,
         index: int,
@@ -260,6 +300,13 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         lora_b: torch.Tensor | list[torch.Tensor],
     ):
         self.reset_lora(index)
+
+        if (
+            isinstance(lora_a, list)
+            and isinstance(lora_b, list)
+            and len(lora_b) != self.n_slices
+        ):
+            lora_a, lora_b = self.expand_packed_lora(lora_a, lora_b)
 
         if self.tp_size > 1:
             lora_a = self.slice_lora_a(lora_a)
@@ -467,18 +514,14 @@ class MergedColumnParallelLinearWithShardedLoRA(MergedColumnParallelLinearWithLo
     def slice_lora_a(
         self, lora_a: list[torch.Tensor | None]
     ) -> list[torch.Tensor | None]:
-        # NOTE: lora_a contains 2 subloras, and each sublora could be None.
         output_shard_size = self.lora_a_stacked[0].shape[2]
         output_start_idx = self.tp_rank * output_shard_size
-        lora_a = [
-            lora_a[0][output_start_idx : output_start_idx + output_shard_size, :]
-            if lora_a[0] is not None
-            else None,
-            lora_a[1][output_start_idx : output_start_idx + output_shard_size, :]
-            if lora_a[1] is not None
-            else None,
+        return [
+            lora_a_i[output_start_idx : output_start_idx + output_shard_size, :]
+            if (lora_a_i := lora_a[i]) is not None
+            else None
+            for i in range(len(lora_a))
         ]
-        return lora_a
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         return _mcp_apply(x, bias, self)

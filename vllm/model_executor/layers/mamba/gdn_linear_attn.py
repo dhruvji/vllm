@@ -24,6 +24,7 @@ from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
 )
 from vllm.model_executor.layers.fla.ops import (
+    fused_post_conv_prep,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -531,7 +532,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        core_attn_out = core_attn_out.flatten(-2)
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
     def _warmup_prefill_kernels(self, mixed_qkv: torch.Tensor) -> None:
@@ -569,19 +570,33 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
 
-        # All kernels use BT = chunk_size (FLA_CHUNK_SIZE4), so a single pass with
-        # T = chunk_size is sufficient to populate every autotuner cache.
+        # All kernels use BT = chunk_size, so a single pass with T = chunk_size
+        # is sufficient to populate every autotuner cache. Mirror the real
+        # prefill path here: build q/k/v/g/beta via fused_post_conv_prep and
+        # then run chunk_gated_delta_rule with in-kernel L2 norm disabled.
         T = FLA_CHUNK_SIZE
-        q = torch.randn(1, T, num_k_heads, self.head_k_dim, device=device, dtype=dtype)
-        k = torch.randn(1, T, num_k_heads, self.head_k_dim, device=device, dtype=dtype)
-        v = torch.randn(1, T, num_v_heads, self.head_v_dim, device=device, dtype=dtype)
-        # NOTE: g and beta must have the same dtypes as during
-        # inference, so we construct them with the same function
-        # (fused_gdn_gating). dummy_a and dummy_b are throwaway
-        # inputs required by that function.
+        dummy_mixed_qkv = torch.randn(
+            T, mixed_qkv.shape[-1], device=device, dtype=dtype
+        )
         dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
         dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
-        g, beta = fused_gdn_gating(self.A_log, dummy_a, dummy_b, self.dt_bias)
+        q, k, v, g, beta = fused_post_conv_prep(
+            conv_output=dummy_mixed_qkv,
+            a=dummy_a,
+            b=dummy_b,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            num_k_heads=num_k_heads,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            apply_l2norm=True,
+            output_g_exp=False,
+        )
+        q = q.unsqueeze(0)
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
+        g = g.unsqueeze(0)
+        beta = beta.unsqueeze(0)
         state = torch.zeros(
             1,
             num_v_heads,
@@ -602,7 +617,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 initial_state=state,
                 output_final_state=True,
                 cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=False,
             )
         except Exception:
             logger.warning(
@@ -620,7 +635,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 self.prefix,
             )
         finally:
-            del q, k, v, dummy_a, dummy_b, g, beta, state, cu_seqlens
+            del dummy_mixed_qkv, q, k, v, dummy_a, dummy_b, g, beta, state, cu_seqlens
 
         torch.accelerator.empty_cache()
 
@@ -743,19 +758,44 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             mixed_qkv_non_spec = None
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
-            mixed_qkv_non_spec
-        )
-
         if attn_metadata.num_prefills > 0:
-            g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+            assert mixed_qkv_non_spec is not None, (
+                "mixed_qkv_non_spec must be provided for prefill path"
+            )
             if spec_sequence_masks is not None:
-                g_non_spec = g.index_select(1, non_spec_token_indx)
-                beta_non_spec = beta.index_select(1, non_spec_token_indx)
+                a_non_spec = a.index_select(0, non_spec_token_indx)
+                b_non_spec = b.index_select(0, non_spec_token_indx)
             else:
-                g_non_spec = g
-                beta_non_spec = beta
+                a_non_spec = a
+                b_non_spec = b
+
+            (
+                query_non_spec,
+                key_non_spec,
+                value_non_spec,
+                g_non_spec,
+                beta_non_spec,
+            ) = fused_post_conv_prep(
+                conv_output=mixed_qkv_non_spec,
+                a=a_non_spec,
+                b=b_non_spec,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                num_k_heads=self.num_k_heads // self.tp_size,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+                apply_l2norm=True,
+                output_g_exp=False,
+            )
+            query_non_spec = query_non_spec.unsqueeze(0)
+            key_non_spec = key_non_spec.unsqueeze(0)
+            value_non_spec = value_non_spec.unsqueeze(0)
+            g_non_spec = g_non_spec.unsqueeze(0)
+            beta_non_spec = beta_non_spec.unsqueeze(0)
         else:
+            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+                mixed_qkv_non_spec
+            )
             g_non_spec = None
             beta_non_spec = None
 
@@ -801,7 +841,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=non_spec_query_start_loc,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=False,
             )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(

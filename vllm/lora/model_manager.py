@@ -558,6 +558,14 @@ class LoRAModelManager:
                 if isinstance(module, MergedColumnParallelLinearVariableSliceWithLoRA):
                     output_dims = module.replacement_output_sizes(replacements)
                 else:
+                    n_slices = len(module.lora_b_stacked)
+                    if module.__class__.__name__ == "FusedMoEWithLoRA":
+                        replacements = replacements[
+                            : len(module.lora_a_stacked) // self.lora_slots
+                        ]
+                        n_slices = len(replacements)
+                    if n_slices != len(replacements):
+                        replacements = [f"slice_{i}" for i in range(n_slices)]
                     output_dims = [
                         module.lora_b_stacked[i].shape[-2]
                         for i in range(len(replacements))

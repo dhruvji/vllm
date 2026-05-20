@@ -462,9 +462,10 @@ class Qwen3_5ForCausalLMBase(
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
-        self.model = Qwen3_5Model(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
+        # Deal with the case where the prefix is already "language_model" since
+        # Qwen/Qwen3.5-397B-A17B has naming like: model.language_model.layers.0
+        model_prefix = prefix if "model" in prefix else "model"
+        self.model = Qwen3_5Model(vllm_config=vllm_config, prefix=model_prefix)
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
