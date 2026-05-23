@@ -1286,6 +1286,13 @@ class ModalVolumeV2(Path):
             local = local / self.volume_path
         return local
 
+    def _fresh_mounted_local_path(self):
+        local = self._mounted_local_path()
+        if local is not None:
+            with self._volume_lock():
+                _run_modal_sync(self.volume.reload)
+        return local
+
     def _volume_lock(self):
         with MODAL_VOLUME_LOCKS_GUARD:
             if self.volume_name not in MODAL_VOLUME_LOCKS:
@@ -1322,7 +1329,7 @@ class ModalVolumeV2(Path):
 
     @property
     def size(self):
-        local = self._mounted_local_path()
+        local = self._fresh_mounted_local_path()
         if local is not None:
             return local.size
         entry = self._exact_entry()
@@ -1332,29 +1339,33 @@ class ModalVolumeV2(Path):
     def open(self, mode="r"):
         assert mode in "r rb w wb a ab".split(), mode
         local = self._mounted_local_path()
-        if local is not None:
-            if "r" in mode and "w" not in mode and "a" not in mode:
-                # Always reload before reading so FUSE reflects the latest
-                # committed state.  Without this, a stale FUSE entry (e.g. an
-                # older, smaller file from a previous training run at the same
-                # path) can be returned, causing safetensors to report
-                # "incomplete metadata, file not fully covered".
-                self._reload()
-                return local.open(mode)
-            else:
-                local.parent.mkdir(parents=True, exist_ok=True)
-                return _ModalMountedWriteFile(self, local.open(mode))
         if "r" in mode and "w" not in mode and "a" not in mode:
+            # Do not return live file handles on mounted Modal volume paths.
+            # Modal rejects volume.reload() while any file on the mounted
+            # volume is open, and inference can load several hot LoRA
+            # checkpoints concurrently. Read through the Volume API into a
+            # temporary local buffer instead, so the volume is not held open
+            # across adapter deserialization.
             return self._open_for_read(mode)
+        if local is not None:
+            local.parent.mkdir(parents=True, exist_ok=True)
+            return _ModalMountedWriteFile(self, local.open(mode))
         return self._open_for_write(mode)
 
     def _open_for_read(self, mode):
-        self._reload()
         buffer = tempfile.SpooledTemporaryFile(
             max_size=self.SPOOLED_FILE_SIZE, mode="w+b"
         )
-        for chunk in self.volume.read_file(self.volume_path):
-            buffer.write(chunk)
+        local = self._mounted_local_path()
+        if local is not None:
+            with self._volume_lock():
+                _run_modal_sync(self.volume.reload)
+                with local.open("rb") as f:
+                    shutil.copyfileobj(f, buffer)
+        else:
+            self._reload()
+            for chunk in self.volume.read_file(self.volume_path):
+                buffer.write(chunk)
         buffer.seek(0)
         if mode == "rb":
             return buffer
@@ -1400,7 +1411,7 @@ class ModalVolumeV2(Path):
         return sorted(results)
 
     def exists(self):
-        local = self._mounted_local_path()
+        local = self._fresh_mounted_local_path()
         if local is not None:
             return local.exists()
         if not self.volume_path:
@@ -1408,7 +1419,7 @@ class ModalVolumeV2(Path):
         return self.isfile() or self.isdir()
 
     def isfile(self):
-        local = self._mounted_local_path()
+        local = self._fresh_mounted_local_path()
         if local is not None:
             return local.isfile()
         entry = self._exact_entry()
@@ -1417,7 +1428,7 @@ class ModalVolumeV2(Path):
         return self._entry_type_name(entry) == "FILE"
 
     def isdir(self):
-        local = self._mounted_local_path()
+        local = self._fresh_mounted_local_path()
         if local is not None:
             return local.isdir()
         if not self.volume_path:

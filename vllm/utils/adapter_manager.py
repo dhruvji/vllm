@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import struct
 import threading
 import time
 from pathlib import Path as StdPath
@@ -100,6 +101,7 @@ def _load_adapter(path: str | StdPath, **kwargs) -> dict:
     logger.info("[load_adapter] resolved path: %s", path_str)
     if path_str.endswith(".safetensors"):
         data = _read_file_bytes(path_str)
+        data = _canonical_safetensors_bytes(data, path_str)
         logger.info(
             "[load_adapter] safetensors bytes: %d, first16=%s, last16=%s",
             len(data),
@@ -115,6 +117,54 @@ def _load_adapter(path: str | StdPath, **kwargs) -> dict:
         return result
     with path_obj.open("rb") as f:
         return torch.load(f, map_location="cpu", **kwargs)
+
+
+def _canonical_safetensors_bytes(data: bytes, path: str) -> bytes:
+    """Return bytes exactly covered by the safetensors header metadata.
+
+    Modal volume reads can include block-aligned zero padding at the end of a
+    freshly committed file. The safetensors format rejects uncovered trailing
+    bytes, so trim only padding that is provably outside every tensor range.
+    """
+    if len(data) < 8:
+        raise ValueError(f"Safetensors file is too small: {path}")
+
+    header_len = struct.unpack("<Q", data[:8])[0]
+    header_end = 8 + header_len
+    if len(data) < header_end:
+        raise ValueError(
+            f"Safetensors file ended before header: {path} "
+            f"actual={len(data)} header_end={header_end}"
+        )
+
+    header = json.loads(data[8:header_end])
+    expected_data_len = max(
+        value["data_offsets"][1]
+        for key, value in header.items()
+        if key != "__metadata__"
+    )
+    expected_size = header_end + expected_data_len
+    if len(data) == expected_size:
+        return data
+    if len(data) < expected_size:
+        raise ValueError(
+            f"Safetensors file is truncated: {path} "
+            f"actual={len(data)} expected={expected_size}"
+        )
+
+    padding = data[expected_size:]
+    if any(padding):
+        raise ValueError(
+            f"Safetensors file has non-zero trailing bytes: {path} "
+            f"actual={len(data)} expected={expected_size}"
+        )
+
+    logger.warning(
+        "[load_adapter] trimming %d trailing zero bytes from safetensors %s",
+        len(data) - expected_size,
+        path,
+    )
+    return data[:expected_size]
 
 
 def _read_file_bytes(path: str) -> bytes:

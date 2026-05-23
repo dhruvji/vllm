@@ -29,7 +29,6 @@ from vllm.model_executor.layers.fla.ops import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
-from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -535,110 +534,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         core_attn_out = core_attn_out.flatten(-2)
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
-    def _warmup_prefill_kernels(self, mixed_qkv: torch.Tensor) -> None:
-        """Warm up GDN prefill kernels during V1 profiling.
-
-        During V1 profile runs, ``_forward_core`` returns early because
-        ``attn_metadata`` is ``None``, so the autotuned kernels used by
-        ``chunk_gated_delta_rule`` (e.g. ``solve_tril``,
-        ``chunk_scaled_dot_kkt``) are never invoked.  After profiling,
-        vLLM allocates KV cache using most of the remaining GPU memory.
-        When the first real inference triggers the autotuner it OOMs
-        because there is not enough memory left for benchmarking.
-
-        This method runs minimal forward passes through
-        ``chunk_gated_delta_rule`` with small dummy tensors to force
-        autotuning while GPU memory is still plentiful.  The autotuner
-        results are cached globally, so only the first layer incurs
-        actual benchmarking cost.
-
-        All kernels including ``chunk_fwd_kernel_o`` now use a fixed
-        ``BT = chunk_size`` (64).  A single warmup pass with T = 64
-        is sufficient to populate the autotuner cache.
-
-        The decode path uses ``fused_sigmoid_gating_delta_rule_update``
-        which has fixed kernel parameters (no autotuning), so only the
-        prefill (chunked) path needs warming up.
-        """
-        if hasattr(self, "_prefill_kernels_warmed_up"):
-            return
-        self._prefill_kernels_warmed_up = True
-
-        device = mixed_qkv.device
-        dtype = mixed_qkv.dtype
-        num_k_heads = self.num_k_heads // self.tp_size
-        num_v_heads = self.num_v_heads // self.tp_size
-        _, state_dtype = self.get_state_dtype()
-
-        # All kernels use BT = chunk_size, so a single pass with T = chunk_size
-        # is sufficient to populate every autotuner cache. Mirror the real
-        # prefill path here: build q/k/v/g/beta via fused_post_conv_prep and
-        # then run chunk_gated_delta_rule with in-kernel L2 norm disabled.
-        T = FLA_CHUNK_SIZE
-        dummy_mixed_qkv = torch.randn(
-            T, mixed_qkv.shape[-1], device=device, dtype=dtype
-        )
-        dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
-        dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
-        q, k, v, g, beta = fused_post_conv_prep(
-            conv_output=dummy_mixed_qkv,
-            a=dummy_a,
-            b=dummy_b,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            num_k_heads=num_k_heads,
-            head_k_dim=self.head_k_dim,
-            head_v_dim=self.head_v_dim,
-            apply_l2norm=True,
-            output_g_exp=False,
-        )
-        q = q.unsqueeze(0)
-        k = k.unsqueeze(0)
-        v = v.unsqueeze(0)
-        g = g.unsqueeze(0)
-        beta = beta.unsqueeze(0)
-        state = torch.zeros(
-            1,
-            num_v_heads,
-            self.head_v_dim,
-            self.head_k_dim,
-            device=device,
-            dtype=state_dtype,
-        )
-        cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
-
-        try:
-            self.chunk_gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=state,
-                output_final_state=True,
-                cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=False,
-            )
-        except Exception:
-            logger.warning(
-                "GDN prefill kernel warmup (T=%d) failed for "
-                "layer %s. First inference may OOM due to "
-                "autotuner.",
-                T,
-                self.prefix,
-                exc_info=True,
-            )
-        else:
-            logger.debug(
-                "GDN prefill kernel warmup (T=%d) completed for layer %s",
-                T,
-                self.prefix,
-            )
-        finally:
-            del dummy_mixed_qkv, q, k, v, dummy_a, dummy_b, g, beta, state, cu_seqlens
-
-        torch.accelerator.empty_cache()
-
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -650,9 +545,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # V1 profile run — warm up prefill kernels so that
-            # autotuning completes before KV cache allocation.
-            self._warmup_prefill_kernels(mixed_qkv)
+            # V1 profile runs have no GDN metadata. Avoid launching dummy
+            # prefill kernels here; failed CUDA warmups poison the engine
+            # before serving, while real prefill still uses the fast GDN path.
             return
 
         assert isinstance(attn_metadata, dict)

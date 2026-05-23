@@ -217,6 +217,10 @@ class Qwen3_5Model(Qwen3NextModel):
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.config = config
+        multimodal_config = vllm_config.model_config.multimodal_config
+        self.language_model_only = (
+            multimodal_config is not None and multimodal_config.language_model_only
+        )
 
         self.vocab_size = config.vocab_size
 
@@ -245,6 +249,26 @@ class Qwen3_5Model(Qwen3NextModel):
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if self.language_model_only and positions.ndim == 2:
+            # Language-only Qwen3.5 uses text RoPE even when the request builder
+            # supplies multimodal-style T/H/W positions. Use the text row so the
+            # rotary embedding sees one position per token.
+            positions = positions[0]
+
+        return super().forward(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
 
     def load_fused_expert_weights(
         self,
