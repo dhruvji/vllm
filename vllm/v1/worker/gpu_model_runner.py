@@ -81,6 +81,7 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import (
@@ -986,6 +987,52 @@ class GPUModelRunner(
             layer_kv_list.append((layer_keys, layer_values))
         return layer_kv_list
 
+    @staticmethod
+    def _is_cartridge_supported_backend(backend_name: str) -> bool:
+        return (
+            "FlashAttention" in backend_name
+            or "FlashInfer" in backend_name
+            or "TritonAttention" in backend_name
+        )
+
+    @staticmethod
+    def _get_cartridge_cache_writer(backend_name: str):
+        if "FlashAttention" in backend_name:
+            kv_dim = 0
+            from vllm.v1.attention.backends.fa_utils import (
+                reshape_and_cache_flash as reshape_and_cache,
+            )
+        elif "FlashInfer" in backend_name:
+            kv_dim = 1
+            from vllm.v1.attention.backends.fa_utils import (
+                reshape_and_cache_flash as reshape_and_cache,
+            )
+        elif "TritonAttention" in backend_name:
+            kv_dim = 1
+            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                triton_reshape_and_cache_flash as reshape_and_cache,
+            )
+        else:
+            raise NotImplementedError(
+                f"Cartridge prepopulation not supported for backend: "
+                f"{backend_name}. Only FlashAttention, FlashInfer, and Triton "
+                f"are supported."
+            )
+        return kv_dim, reshape_and_cache
+
+    def _get_cartridge_layer_targets(
+        self,
+        kv_cache_group_id: int,
+    ) -> list[tuple[int, str]]:
+        targets: list[tuple[int, str]] = []
+        for attn_group in self.attn_groups[kv_cache_group_id]:
+            backend_name = attn_group.backend.__name__
+            if not self._is_cartridge_supported_backend(backend_name):
+                continue
+            for layer_name in attn_group.layer_names:
+                targets.append((extract_layer_index(layer_name), backend_name))
+        return sorted(targets)
+
     def _prepopulate_cartridge_to_cache(
         self,
         block_ids: tuple[list[int], ...],
@@ -1005,13 +1052,19 @@ class GPUModelRunner(
             cart_seq_len: Length of the cartridge sequence.
         """
         attn_group_ids = [gid for gid, groups in enumerate(self.attn_groups) if groups]
-        if not attn_group_ids:
-            raise RuntimeError("No attention KV cache groups available for cartridge.")
-
         selected_gid: int | None = None
+        cartridge_targets: list[tuple[int, str]] = []
         selected_block_size: int | None = None
         selected_block_ids_list: list[int] | None = None
+        unsupported_backend_names: list[str] = []
         for gid in attn_group_ids:
+            gid_targets = self._get_cartridge_layer_targets(gid)
+            if not gid_targets:
+                unsupported_backend_names.extend(
+                    group.backend.__name__ for group in self.attn_groups[gid]
+                )
+                continue
+
             block_table = self.input_batch.block_table[gid]
             block_size = block_table.block_size
             group_block_ids = block_ids[gid]
@@ -1024,9 +1077,21 @@ class GPUModelRunner(
 
             if len(group_block_ids) >= cdiv(cart_seq_len, block_size):
                 selected_gid = gid
+                cartridge_targets = gid_targets
                 selected_block_size = block_size
                 selected_block_ids_list = group_block_ids
                 break
+
+        if selected_gid is None and unsupported_backend_names:
+            supported_groups = [
+                gid for gid in attn_group_ids if self._get_cartridge_layer_targets(gid)
+            ]
+            if not supported_groups:
+                raise NotImplementedError(
+                    "No supported attention KV cache groups available for cartridge. "
+                    f"Backends: {unsupported_backend_names}. Only FlashAttention, "
+                    "FlashInfer, and Triton are supported."
+                )
 
         if selected_gid is None or selected_block_size is None or selected_block_ids_list is None:
             group_debug = []
@@ -1072,52 +1137,18 @@ class GPUModelRunner(
         k_scale = torch.ones(1, device=self.device, dtype=torch.float32)
         v_scale = torch.ones(1, device=self.device, dtype=torch.float32)
 
-        # Determine K/V unbind dimension and cache writer based on backend.
-        # flash_attn: (2, num_blocks, ...) -> unbind(0)
-        # flashinfer/triton: (num_blocks, 2, ...) -> unbind(1)
-        backend_name = self.attn_groups[selected_gid][0].backend.__name__
-        if "FlashAttention" in backend_name:
-            kv_dim = 0
-            # Lazy import to avoid module-level import failures on non-CUDA
-            # platforms.
-            from vllm.v1.attention.backends.fa_utils import (
-                reshape_and_cache_flash as reshape_and_cache,
-            )
-        elif "FlashInfer" in backend_name:
-            kv_dim = 1
-            from vllm.v1.attention.backends.fa_utils import (
-                reshape_and_cache_flash as reshape_and_cache,
-            )
-        elif "TritonAttention" in backend_name:
-            kv_dim = 1
-            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                triton_reshape_and_cache_flash as reshape_and_cache,
-            )
-        else:
-            raise NotImplementedError(
-                f"Cartridge prepopulation not supported for backend: "
-                f"{backend_name}. Only FlashAttention, FlashInfer, and Triton "
-                f"are supported."
-            )
-
-        layer_indices = sorted(
-            {
-                int(layer_name.split(".layers.")[1].split(".", 1)[0])
-                for attn_group in self.attn_groups[selected_gid]
-                for layer_name in attn_group.layer_names
-            }
-        )
-        if len(layer_indices) < len(layer_kv_list):
+        if len(cartridge_targets) < len(layer_kv_list):
             raise RuntimeError(
                 "Cartridge layer count exceeds available attention KV caches: "
                 f"{len(layer_kv_list)} cartridge layers vs "
-                f"{len(layer_indices)} cache layers."
+                f"{len(cartridge_targets)} cache layers."
             )
 
         # Write cartridge KV to each selected attention layer's cache.
-        for layer_idx, (layer_keys, layer_values) in zip(
-            layer_indices, layer_kv_list, strict=False
+        for (layer_idx, backend_name), (layer_keys, layer_values) in zip(
+            cartridge_targets, layer_kv_list, strict=False
         ):
+            kv_dim, reshape_and_cache = self._get_cartridge_cache_writer(backend_name)
             kv_cache = self.kv_caches[layer_idx]
             key_cache, value_cache = kv_cache.unbind(kv_dim)
 
