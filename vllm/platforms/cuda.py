@@ -222,6 +222,7 @@ class CudaPlatformBase(Platform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
 
         if not cache_config.user_specified_block_size:
             cache_config.block_size = cache_config.DEFAULT_BLOCK_SIZE
