@@ -1229,62 +1229,6 @@ direct_register_custom_op(
 )
 
 
-def unified_mla_kv_cache_update(
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
-    layer_name: str,
-    kv_cache_dtype: str,
-    k_scale: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Returns a dummy that is passed to unified_attention to signal a side effect and
-    the data dependency between them to ensure torch.compile preserves ordering.
-    """
-    forward_context = get_forward_context()
-    attn_layer = forward_context.no_compile_layers[layer_name]
-    kv_cache = attn_layer.kv_cache
-
-    # This needs to run even when we don't have metadata yet, so that the op
-    # is correctly captured.
-    if kv_cache.numel() == 0:
-        # Can't update an empty KV cache.
-        return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
-
-    slot_mapping = forward_context.slot_mapping
-    assert isinstance(slot_mapping, dict), (
-        f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
-    )
-    layer_slot_mapping = slot_mapping.get(layer_name)
-    if layer_slot_mapping is not None:
-        attn_layer.impl.do_kv_cache_update(
-            kv_c_normed,
-            k_pe,
-            kv_cache,
-            layer_slot_mapping,
-            kv_cache_dtype,
-            k_scale,
-        )
-
-    return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
-
-
-def unified_mla_kv_cache_update_fake(
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
-    layer_name: str,
-    kv_cache_dtype: str,
-    k_scale: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
-
-
-direct_register_custom_op(
-    op_name="unified_mla_kv_cache_update",
-    op_func=unified_mla_kv_cache_update,
-    fake_impl=unified_mla_kv_cache_update_fake,
-)
-
-
 @maybe_transfer_kv_layer
 def unified_mla_attention_with_output(
     q: torch.Tensor,
