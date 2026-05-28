@@ -614,6 +614,16 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+        # Cartridge request bookkeeping. Cartridge KV is pre-populated into
+        # cache slots before prompt tokens, so live cartridge requests need
+        # position and slot offsets while they are in the batch.
+        self.cartridge_position_offsets: dict[str, int] = {}
+        self.gpu_cartridge_cache: dict[
+            str, list[tuple[torch.Tensor, torch.Tensor]]
+        ] = {}
+        self._cartridge_ref_counts: dict[str, int] = {}
+        self._request_to_cartridge: dict[str, str] = {}
+        self._cartridge_debug_count = 0
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1170,6 +1180,23 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+
+        # Clear cartridge state for finished requests and free GPU-side
+        # cartridge KV once no live request references it.
+        for req_id in scheduler_output.finished_req_ids:
+            self.cartridge_position_offsets.pop(req_id, None)
+            cartridge_id = self._request_to_cartridge.pop(req_id, None)
+            if cartridge_id is not None:
+                self._cartridge_ref_counts[cartridge_id] -= 1
+                if self._cartridge_ref_counts[cartridge_id] <= 0:
+                    del self._cartridge_ref_counts[cartridge_id]
+                    if cartridge_id in self.gpu_cartridge_cache:
+                        del self.gpu_cartridge_cache[cartridge_id]
+                        if _CARTRIDGE_DEBUG_TIMING:
+                            logger.info(
+                                "[cartridge-cleanup] Freed GPU cache for %s",
+                                cartridge_id,
+                            )
 
         if self.routed_experts_initialized:
             free_routing_buffers(
