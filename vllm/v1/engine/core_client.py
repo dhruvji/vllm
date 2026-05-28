@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
-import multiprocessing
 import queue
 import sys
 import uuid
@@ -12,6 +11,7 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
+from multiprocessing.queues import Queue
 from threading import Thread
 from typing import Any, TypeAlias, TypeVar
 
@@ -28,7 +28,6 @@ from vllm.tracing import instrument
 from vllm.utils.async_utils import in_loop
 from vllm.utils.network_utils import (
     close_sockets,
-    get_open_port,
     get_open_zmq_inproc_path,
     make_zmq_socket,
 )
@@ -36,8 +35,10 @@ from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     EEPNotificationType,
     EngineCoreOutputs,
+    EngineCoreReadyResponse,
     EngineCoreRequest,
     EngineCoreRequestType,
+    PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
     UtilityOutput,
@@ -45,12 +46,15 @@ from vllm.v1.engine import (
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
     CoreEngineProcManager,
+    get_engine_zmq_addresses,
     launch_core_engines,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
 logger = init_logger(__name__)
@@ -133,7 +137,7 @@ class EngineCoreClient(ABC):
         return AsyncMPClient(*client_args)
 
     @abstractmethod
-    def shutdown(self): ...
+    def shutdown(self, timeout: float | None = None) -> None: ...
 
     def get_output(self) -> EngineCoreOutputs:
         raise NotImplementedError
@@ -144,7 +148,7 @@ class EngineCoreClient(ABC):
     def add_request(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
-    def profile(self, is_start: bool = True) -> None:
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         raise NotImplementedError
 
     def reset_mm_cache(self) -> None:
@@ -158,7 +162,7 @@ class EngineCoreClient(ABC):
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
-    def sleep(self, level: int = 1) -> None:
+    def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         raise NotImplementedError
 
     def wake_up(self, tags: list[str] | None = None) -> None:
@@ -203,7 +207,7 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     def dp_engines_running(self) -> bool:
-        """Returns True id data parallel engines are collectively in a
+        """Returns True if data parallel engines are collectively in a
         running state."""
         raise NotImplementedError
 
@@ -219,7 +223,9 @@ class EngineCoreClient(ABC):
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
-    async def profile_async(self, is_start: bool = True) -> None:
+    async def profile_async(
+        self, is_start: bool = True, profile_prefix: str | None = None
+    ) -> None:
         raise NotImplementedError
 
     async def reset_mm_cache_async(self) -> None:
@@ -233,7 +239,7 @@ class EngineCoreClient(ABC):
     async def reset_encoder_cache_async(self) -> None:
         raise NotImplementedError
 
-    async def sleep_async(self, level: int = 1) -> None:
+    async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         raise NotImplementedError
 
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
@@ -301,11 +307,11 @@ class InprocClient(EngineCoreClient):
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         self.engine_core.shutdown()
 
-    def profile(self, is_start: bool = True) -> None:
-        self.engine_core.profile(is_start)
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+        self.engine_core.profile(is_start, profile_prefix)
 
     def reset_mm_cache(self) -> None:
         self.engine_core.reset_mm_cache()
@@ -320,8 +326,11 @@ class InprocClient(EngineCoreClient):
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
 
-    def sleep(self, level: int = 1) -> None:
-        self.engine_core.sleep(level)
+    def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        if mode == "wait":
+            raise ValueError("'wait' pause mode is not supported in inproc-engine mode")
+        result = self.engine_core.sleep(level, mode)
+        assert result is None
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.engine_core.wake_up(tags)
@@ -454,6 +463,13 @@ class BackgroundResources:
                 raise EngineDeadError()
 
 
+@dataclass
+class ElasticScalingCache:
+    existing_core_engines: list[EngineIdentity]
+    num_new_core_engines: int
+    pending_notifications: dict[EEPNotificationType, set[int]]
+
+
 class MPClient(EngineCoreClient):
     """
     MPClient: base client for multi-proc EngineCore.
@@ -476,9 +492,6 @@ class MPClient(EngineCoreClient):
         client_addresses: dict[str, str] | None = None,
     ):
         self.vllm_config = vllm_config
-        # Serialization setup.
-        self.encoder = MsgpackEncoder()
-        self.decoder = MsgpackDecoder(EngineCoreOutputs)
 
         # ZMQ setup.
         sync_ctx = zmq.Context(io_threads=2)
@@ -493,41 +506,68 @@ class MPClient(EngineCoreClient):
         try:
             # State used for data parallel.
             self.engines_running = False
+            parallel_config = vllm_config.parallel_config
+            # Elastic EP can remove a rank and later add it back with the same
+            # identity. The client input ROUTER needs handover to allow the new
+            # engine to replace the dead connection.
+            enable_input_socket_handover = parallel_config.enable_elastic_ep
 
             self.stats_update_address: str | None = None
+            tensor_queue: Queue | None = None
             if client_addresses:
                 # Engines are managed externally to this client.
                 input_address = client_addresses["input_address"]
                 output_address = client_addresses["output_address"]
                 self.stats_update_address = client_addresses.get("stats_update_address")
+                # Tensor queues passed via client_addresses for multi-API-server case
+                tensor_queue = client_addresses.get("tensor_queue")  # type: ignore[assignment]
+                self.input_socket = self.resources.input_socket = make_zmq_socket(
+                    self.ctx,
+                    input_address,
+                    zmq.ROUTER,
+                    bind=True,
+                    router_handover=enable_input_socket_handover,
+                )
+                self.resources.output_socket = make_zmq_socket(
+                    self.ctx, output_address, zmq.PULL
+                )
             else:
                 # Engines are managed by this client.
-                with launch_core_engines(vllm_config, executor_class, log_stats) as (
-                    engine_manager,
-                    coordinator,
-                    addresses,
-                    _tensor_queue,
-                ):
+                addresses = get_engine_zmq_addresses(vllm_config)
+                self.input_socket = self.resources.input_socket = make_zmq_socket(
+                    self.ctx,
+                    addresses.inputs[0],
+                    zmq.ROUTER,
+                    bind=True,
+                    router_handover=enable_input_socket_handover,
+                )
+                self.resources.output_socket = make_zmq_socket(
+                    self.ctx, addresses.outputs[0], zmq.PULL
+                )
+
+                with launch_core_engines(
+                    vllm_config, executor_class, log_stats, addresses
+                ) as (engine_manager, coordinator, addresses, tensor_queue):
                     self.resources.coordinator = coordinator
                     self.resources.engine_manager = engine_manager
 
-                (input_address,) = addresses.inputs
-                (output_address,) = addresses.outputs
                 self.stats_update_address = addresses.frontend_stats_publish_address
                 if coordinator is not None:
                     assert self.stats_update_address == (
                         coordinator.get_stats_publish_address()
                     )
 
-            # Create input and output sockets.
-            self.input_socket = self.resources.input_socket = make_zmq_socket(
-                self.ctx, input_address, zmq.ROUTER, bind=True
-            )
-            self.resources.output_socket = make_zmq_socket(
-                self.ctx, output_address, zmq.PULL
-            )
+            # Serialization setup with tensor queues for multimodal tensor IPC.
+            tensor_ipc_sender: TensorIpcSender | None = None
+            model_config = getattr(vllm_config, "model_config", None)
+            if model_config is not None and model_config.multimodal_config is not None:
+                mm_tensor_ipc = model_config.multimodal_config.mm_tensor_ipc
+                if mm_tensor_ipc == "torch_shm" and tensor_queue is not None:
+                    tensor_ipc_sender = TensorIpcSender(tensor_queue)
 
-            parallel_config = vllm_config.parallel_config
+            self.encoder = MsgpackEncoder(oob_tensor_consumer=tensor_ipc_sender)
+            self.decoder = MsgpackDecoder(EngineCoreOutputs)
+
             dp_size = parallel_config.data_parallel_size
             dp_rank = parallel_config.data_parallel_index
             dp_local_size = parallel_config.data_parallel_size_local
@@ -555,11 +595,17 @@ class MPClient(EngineCoreClient):
                     timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms
                 ):
                     raise TimeoutError(
-                        "Timed out waiting for engines to send "
-                        "initial message on input socket."
+                        f"Timed out waiting for engine core processes to "
+                        f"start. This is often caused by slow weight loading "
+                        f"for large models. Waited "
+                        f"{VLLM_ENGINE_READY_TIMEOUT_S}s (configured by "
+                        f"VLLM_ENGINE_READY_TIMEOUT_S). To increase the "
+                        f"timeout, set the environment variable: "
+                        f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
                     )
-                identity, _ = sync_input_socket.recv_multipart()
+                identity, payload = sync_input_socket.recv_multipart()
                 identities.remove(identity)
+                self._apply_ready_response(payload)
 
             self.core_engine: EngineIdentity = self.core_engines[0]
             self.utility_results: dict[int, AnyFuture] = {}
@@ -577,9 +623,12 @@ class MPClient(EngineCoreClient):
             if not success:
                 self._finalizer()
 
-    def shutdown(self):
-        # Terminate background resources.
-        self._finalizer()
+    def shutdown(self, timeout: float | None = None) -> None:
+        """Shutdown engine manager under timeout and clean up resources."""
+        if self._finalizer.detach() is not None:
+            if self.resources.engine_manager is not None:
+                self.resources.engine_manager.shutdown(timeout=timeout)
+            self.resources()
 
     def _format_exception(self, e: Exception) -> Exception:
         """If errored, use EngineDeadError so root cause is clear."""
@@ -607,34 +656,20 @@ class MPClient(EngineCoreClient):
     def start_engine_core_monitor(self):
         """Start a monitor thread for engine core processes."""
         engine_manager = self.resources.engine_manager
-        if (
-            engine_manager is None
-            or not hasattr(engine_manager, "processes")
-            or not engine_manager.processes
-        ):
+        if engine_manager is None:
             # No engine processes to monitor
             return
 
-        engine_processes = engine_manager.processes
         self_ref = weakref.ref(self)
 
         # Monitor engine core process liveness. If any die unexpectedly,
-        # logs an error, shuts down the client and invokes the failure
-        # callback to inform the engine.
+        # marks the engine as dead, and shuts down the client.
         def monitor_engine_cores():
-            sentinels = [proc.sentinel for proc in engine_processes]
-            died = multiprocessing.connection.wait(sentinels)
+            engine_manager.monitor_engine_liveness()
             _self = self_ref()
-            if not _self or _self.resources.engine_dead:
+            if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
             _self.resources.engine_dead = True
-            proc_name = next(
-                proc.name for proc in engine_processes if proc.sentinel == died[0]
-            )
-            logger.error(
-                "Engine core proc %s died unexpectedly, shutting down client.",
-                proc_name,
-            )
             _self.shutdown()
             # Note: For MPClient, we don't have a failure callback mechanism
             # like MultiprocExecutor, but we set engine_dead flag which will
@@ -643,6 +678,32 @@ class MPClient(EngineCoreClient):
         Thread(
             target=monitor_engine_cores, daemon=True, name="MPClientEngineMonitor"
         ).start()
+
+    def _apply_ready_response(self, payload: bytes) -> None:
+        """Decode an EngineCoreReadyResponse and sync any post-initialization
+        config changes (e.g. auto-fitted max_model_len) back to the frontend."""
+        if not payload:
+            return
+        vllm_config = self.vllm_config
+        response = msgspec.msgpack.decode(payload, type=EngineCoreReadyResponse)
+        vllm_config.model_config.max_model_len = min(
+            vllm_config.model_config.max_model_len, response.max_model_len
+        )
+
+        # Setup KV cache config with initialization state from
+        # engine core process. Sum values from all engines in DP case.
+        num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks or 0
+        num_gpu_blocks += response.num_gpu_blocks
+        vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
+
+        # In external DP LB mode, the coordinator address that the
+        # front-end procs connect to is obtained by each engine via it's
+        # initial handshake with the rank 0 front-end.
+        if response.dp_stats_address is not None:
+            if self.stats_update_address is None:
+                self.stats_update_address = response.dp_stats_address
+            else:
+                assert response.dp_stats_address == self.stats_update_address
 
 
 def _process_utility_output(
@@ -742,6 +803,7 @@ class SyncMPClient(MPClient):
         # it is forwarded to the outputs_queue so we can raise it
         # from this (run_output_handler) task to shut down the server.
         outputs = self.outputs_queue.get()
+
         if isinstance(outputs, Exception):
             raise self._format_exception(outputs) from None
         if outputs.wave_complete is not None:
@@ -782,8 +844,8 @@ class SyncMPClient(MPClient):
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
-    def profile(self, is_start: bool = True) -> None:
-        self.call_utility("profile", is_start)
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+        self.call_utility("profile", is_start, profile_prefix)
 
     def reset_mm_cache(self) -> None:
         self.call_utility("reset_mm_cache")
@@ -810,8 +872,8 @@ class SyncMPClient(MPClient):
     def pin_lora(self, lora_id: int) -> bool:
         return self.call_utility("pin_lora", lora_id)
 
-    def sleep(self, level: int = 1) -> None:
-        self.call_utility("sleep", level)
+    def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        self.call_utility("sleep", level, mode)
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.call_utility("wake_up", tags)
@@ -1024,18 +1086,21 @@ class AsyncMPClient(MPClient):
         if request_ids and not self.resources.engine_dead:
             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
-    async def pause_scheduler_async(self) -> None:
-        """Pause the scheduler, keeping requests frozen in queue.
-        Blocks until the EngineCore acknowledges the pause.
-        """
-        await self.call_utility_async("pause_scheduler")
+    async def pause_scheduler_async(
+        self, mode: PauseMode = "abort", clear_cache: bool = True
+    ) -> None:
+        await self.call_utility_async("pause_scheduler", mode, clear_cache)
 
     async def resume_scheduler_async(self) -> None:
-        """Resume the scheduler after a pause."""
         await self.call_utility_async("resume_scheduler")
 
-    async def profile_async(self, is_start: bool = True) -> None:
-        await self.call_utility_async("profile", is_start)
+    async def is_scheduler_paused_async(self) -> bool:
+        return await self.call_utility_async("is_scheduler_paused")
+
+    async def profile_async(
+        self, is_start: bool = True, profile_prefix: str | None = None
+    ) -> None:
+        await self.call_utility_async("profile", is_start, profile_prefix)
 
     async def reset_mm_cache_async(self) -> None:
         await self.call_utility_async("reset_mm_cache")
@@ -1050,8 +1115,8 @@ class AsyncMPClient(MPClient):
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
 
-    async def sleep_async(self, level: int = 1) -> None:
-        await self.call_utility_async("sleep", level)
+    async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        await self.call_utility_async("sleep", level, mode)
 
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
         await self.call_utility_async("wake_up", tags)
@@ -1125,6 +1190,8 @@ class DPAsyncMPClient(AsyncMPClient):
         # List of [waiting, running] pair per engine.
         # Used only by DPLBAsyncMPClient subclass.
         self.lb_engines: list[list[int]] = [[0, 0] for _ in self.core_engines]
+        self.eep_scaling_cache: ElasticScalingCache | None = None
+
         self.eep_scaling_cache: ElasticScalingCache | None = None
 
         self.first_req_sock_addr = get_open_zmq_inproc_path()
@@ -1324,7 +1391,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
-        if (eng_index := request.data_parallel_rank) is None:
+        if (eng_index := request.data_parallel_rank) is None and (
+            eng_index := get_late_interaction_engine_index(
+                request.pooling_params, len(self.core_engines)
+            )
+        ) is None:
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
@@ -1383,6 +1454,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         if notification_type == EEPNotificationType.RECONFIGURE_FINISHED:
             from vllm.v1.engine import UtilityResult
 
+            # NOTE(yongji): process a dummy UtilityOutput to resolve the future
+            # awaited in _eep_wait_for_setup_switch_complete(), signaling that
+            # all engine cores have completed reconfiguration.
             dummy_output = UtilityOutput(
                 call_id=EEP_NOTIFICATION_CALL_ID, result=UtilityResult(None)
             )
@@ -1545,7 +1619,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         parallel_config.eplb_config.num_redundant_experts = 0
         start_new_worker_future = asyncio.to_thread(
             self.resources.engine_manager.scale_up_elastic_ep,
-            self.vllm_config, new_data_parallel_size
+            self.vllm_config,
+            new_data_parallel_size,
         )
         wait_future = self._eep_wait_for_setup_switch_complete()
 
@@ -1577,8 +1652,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     f"timeout, set the environment variable: "
                     f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
                 )
-            identity, _ = sync_input_socket.recv_multipart()
+            identity, payload = sync_input_socket.recv_multipart()
             new_engine_identities.discard(identity)
+            self._apply_ready_response(payload)
 
         # NOTE(yongji): Before we schedule any requests on the new workers,
         # we should wait for them to switch to the new setup.
@@ -1592,6 +1668,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             ("SCALE_ELASTIC_EP", new_data_parallel_size)
         )
         await self.first_req_send_socket.send(scale_up_marker)
+
         logger.info(
             "[Elastic EP] Scale up completed, new data parallel size: %s",
             new_data_parallel_size,

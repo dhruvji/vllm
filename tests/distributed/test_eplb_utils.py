@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
-from vllm.config import EPLBConfig, ParallelConfig
-from vllm.distributed.eplb.eplb_utils import override_envs_for_eplb
 from vllm.distributed.eplb.eplb_state import (
     _commit_eplb_maps,
     _commit_eplb_maps_for_layer,
@@ -83,7 +80,7 @@ def test_commit_eplb_maps_for_layer_logical_padding():
         .contiguous()
     )
     layer = 0
-    _commit_eplb_maps_for_layer(model_state, new_phy2log, layer)
+    _commit_eplb_maps_for_layer(model_state, new_phy2log[layer], layer)
 
     assert torch.all(model_state.logical_to_physical_map[layer, :, 2] == -1)
 
@@ -146,7 +143,7 @@ def test_commit_eplb_maps_for_layer():
     )
     new_logcnt = torch.tensor([[2, 1, 1], [1, 2, 1]], dtype=torch.long)
 
-    _commit_eplb_maps_for_layer(model_state, new_phy2log, layer=0)
+    _commit_eplb_maps_for_layer(model_state, new_phy2log[0], layer=0)
 
     # Layer 0 updated
     assert torch.equal(model_state.physical_to_logical_map[0], new_phy2log[0])
@@ -155,22 +152,3 @@ def test_commit_eplb_maps_for_layer():
 
     # Layer 1 untouched
     assert torch.equal(model_state.physical_to_logical_map[1], original_phy2log[1])
-
-
-def test_override_envs_for_eplb_uses_default_communicator(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.delenv("NCCL_MAX_CTAS", raising=False)
-
-    parallel_config = ParallelConfig(
-        data_parallel_size=2,
-        enable_expert_parallel=True,
-        enable_eplb=True,
-        all2all_backend="deepep_low_latency",
-        eplb_config=EPLBConfig(use_async=True),
-    )
-
-    override_envs_for_eplb(parallel_config)
-
-    assert parallel_config.eplb_config.communicator == "torch_nccl"
-    assert os.environ["NCCL_MAX_CTAS"] == "8"

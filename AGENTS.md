@@ -1,19 +1,18 @@
 # Agent Instructions for vLLM
 
-> These instructions apply to **all** AI-assisted contributions in this checkout.
+> These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
 > Breaching these guidelines can result in automatic banning.
 
 ## 1. Contribution Policy (Mandatory)
 
 ### Duplicate-work checks
 
-Before proposing a PR, run these checks against `engram-lab/vllm` for this
-checkout unless the user explicitly asks for a different target:
+Before proposing a PR, run these checks:
 
 ```bash
-gh issue view <issue_number> --repo engram-lab/vllm --comments
-gh pr list --repo engram-lab/vllm --state open --search "<issue_number> in:body"
-gh pr list --repo engram-lab/vllm --state open --search "<short area keywords>"
+gh issue view <issue_number> --repo vllm-project/vllm --comments
+gh pr list --repo vllm-project/vllm --state open --search "<issue_number> in:body"
+gh pr list --repo vllm-project/vllm --state open --search "<short area keywords>"
 ```
 
 - If an open PR already addresses the same fix, do not open another.
@@ -73,11 +72,11 @@ uv pip install -e . --torch-backend=auto
 
 ```bash
 # Install test dependencies.
-# requirements/test.txt is pinned to x86_64; on other platforms, use the
+# requirements/test/cuda.txt is pinned to x86_64; on other platforms, use the
 # unpinned source file instead:
-uv pip install -r requirements/test.in    # resolves for current platform
+uv pip install -r requirements/test/cuda.in    # resolves for current platform
 # Or on x86_64:
-uv pip install -r requirements/test.txt
+uv pip install -r requirements/test/cuda.txt
 
 # Run a specific test file (use .venv/bin/python directly;
 # `source activate` does not persist in non-interactive shells):

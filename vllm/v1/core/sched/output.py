@@ -38,6 +38,7 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
+    prompt_is_token_ids: list[bool] | None = None
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -76,6 +77,7 @@ class NewRequestData:
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
+            prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             cartridge_kv=cartridge_kv,
             cartridge_id=request.cartridge_id,
@@ -256,9 +258,10 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
-    # Cartridge KV overwrites to apply this step.
-    # Maps cartridge_id -> [stacked_keys, stacked_values]
-    cartridge_overwrites: "dict[str, list[torch.Tensor]] | None" = None
+    # Block IDs freshly allocated from the pool during this scheduling step.
+    # The worker zeros the corresponding GPU memory before the blocks are used,
+    # preventing stale NaN/data from corrupting attention or SSM computation.
+    new_block_ids_to_zero: list[int] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

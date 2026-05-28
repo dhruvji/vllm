@@ -176,7 +176,6 @@ class ViTPatchGenerator(nn.Module):
                 temporal_patch_size=temporal_patch_size,
                 **factory,
             )
-            self._video_embedder_loaded = False
 
         if abs_pos:
             scale = embed_dim**-0.5
@@ -225,12 +224,7 @@ class ViTPatchGenerator(nn.Module):
         Returns:
             Embedded patches with temporal compression applied.
         """
-        if not self._video_embedder_loaded:
-            raise ValueError(
-                "Temporal compression (video_temporal_patch_size > 1) requires "
-                "video_embedder weights, but they were never loaded. "
-                "Ensure the checkpoint was trained with temporal compression."
-            )
+        assert self.temporal_patch_size > 1
         T = self.temporal_patch_size
         input_size = x.shape[2:]
 
