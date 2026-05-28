@@ -187,6 +187,7 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
+from vllm.v1.worker.cartridge_utils import strip_cartridge_offsets_from_seq_lens
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
@@ -194,6 +195,7 @@ from vllm.v1.worker.cp_utils import (
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
+from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -899,14 +901,6 @@ class GPUModelRunner(
 
     def post_kv_cache_wake_up(self) -> None:
         self.init_fp8_kv_scales()
-
-    def reset_encoder_cache(self) -> None:
-        """Clear the GPU-side encoder cache storing vision embeddings.
-
-        This should be called when model weights are updated to ensure
-        stale embeddings computed with old weights are not reused.
-        """
-        self.encoder_cache.clear()
 
     @torch.inference_mode()
     def init_fp8_kv_scales(self) -> None:
@@ -5557,11 +5551,13 @@ class GPUModelRunner(
                     prompt_hidden_states[local_start:local_end]
                 )
 
-            # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
+                # For prompt at index i, token i+1 is the target token whose
+                # logprob we need.
+                tgt_token_ids = prompt_token_ids[
+                    prompt_pos_start + local_start + 1 : prompt_pos_start
+                    + local_end
+                    + 1
+                ]
 
                 chunk_logprobs = compute_topk_logprobs(
                     logits, num_prompt_logprobs, tgt_token_ids
