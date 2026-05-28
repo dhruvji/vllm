@@ -184,9 +184,6 @@ class CoreEngineProcManager:
                         process_kind="EngineCore",
                     ),
                 ):
-                    with set_device_control_env_var(vllm_config, local_dp_rank):
-                        proc.start()
-                else:
                     proc.start()
         finally:
             # Kill other procs if not all are running.
