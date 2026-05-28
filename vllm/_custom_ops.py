@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from enum import IntEnum
+from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
 import torch
