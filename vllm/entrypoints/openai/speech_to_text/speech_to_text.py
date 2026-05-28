@@ -424,7 +424,7 @@ class OpenAISpeechToText(OpenAIServing):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        lora_request = self._maybe_get_adapters(request)
+        lora_request = await self._maybe_get_adapters(request)
 
         engine_inputs, duration_s = await self._preprocess_speech_to_text(
             request=request,
@@ -473,18 +473,17 @@ class OpenAISpeechToText(OpenAIServing):
         list_result_generator = []
         try:
             for request_id_item, engine_input in zip(engine_request_ids, engine_inputs):
+                trace_headers = (
+                    None
+                    if raw_request is None
+                    else await self._get_trace_headers(raw_request.headers)
+                )
                 self._log_inputs(
                     request_id_item,
                     engine_input,
                     params=sampling_params,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
-                )
-
-                trace_headers = (
-                    None
-                    if raw_request is None
-                    else await self._get_trace_headers(raw_request.headers)
                 )
 
                 if isinstance(sampling_params, BeamSearchParams):

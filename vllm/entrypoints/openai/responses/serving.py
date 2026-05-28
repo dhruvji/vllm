@@ -368,7 +368,7 @@ class OpenAIServingResponses(OpenAIServing):
         else:
             prev_response = None
 
-        lora_request = self._maybe_get_adapters(request)
+        lora_request = await self._maybe_get_adapters(request)
         model_name = self.models.model_name(lora_request)
 
         if self.use_harmony:

@@ -244,6 +244,10 @@ class SamplingParams(
     prompt_logprobs: int | None = None
     """Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities."""
+    prompt_logprobs_start_index: int | None = None
+    """First prompt token index to return prompt logprobs for."""
+    prompt_logprobs_end_index: int | None = None
+    """Exclusive prompt token index to return prompt logprobs for."""
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
