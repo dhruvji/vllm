@@ -1085,8 +1085,6 @@ def launch_core_engines(
     # their co-located frontend and also the rank 0 front-end, and hence this
     # will be False.
     handshake_local_only = offline_mode or local_engine_count == dp_size
-    if parallel_config.enable_elastic_ep:
-        handshake_local_only = False
 
     # NOTE(yongji): handling scaling from intra-node to inter-node
     if parallel_config.enable_elastic_ep:
