@@ -4,6 +4,7 @@ import functools
 from math import prod
 
 import torch
+import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (

@@ -166,34 +166,6 @@ def get_routing_method_type(
     return RoutingMethodType.Unspecified
 
 
-def get_routing_method_type(
-    scoring_func: str,
-    top_k: int,
-    renormalize: bool,
-    num_expert_group: int | None,
-    has_e_score_bias: bool,
-) -> RoutingMethodType:
-    if has_e_score_bias:
-        if (num_expert_group or 0) > 0 and scoring_func == "sigmoid":
-            return RoutingMethodType.DeepSeekV3
-        else:
-            return RoutingMethodType.Unspecified
-
-    if scoring_func == "sigmoid":
-        if top_k == 1:
-            return RoutingMethodType.Llama4
-        else:
-            return RoutingMethodType.Unspecified
-
-    if scoring_func == "softmax":
-        if renormalize:
-            return RoutingMethodType.Renormalize
-        else:
-            return RoutingMethodType.Default
-
-    return RoutingMethodType.Unspecified
-
-
 @dataclass
 class FusedMoEQuantDesc:
     """
@@ -784,26 +756,6 @@ def mxfp4_w4a8_moe_quant_config(
         _w1=FusedMoEQuantDesc("mxfp4", None, w1_scale, None, None, w1_bias),
         _w2=FusedMoEQuantDesc("mxfp4", None, w2_scale, None, None, w2_bias),
         gemm1_clamp_limit=gemm1_clamp_limit,
-    )
-
-
-def mxfp4_w4a8_moe_quant_config(
-    w1_scale: Union[torch.Tensor, "PrecisionConfig"],
-    w2_scale: Union[torch.Tensor, "PrecisionConfig"],
-    a1_scale: torch.Tensor | None = None,
-    a2_scale: torch.Tensor | None = None,
-    w1_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
-    block_shape: list[int] | None = None,
-) -> FusedMoEQuantConfig:
-    """
-    Construct a quant config for fp8 activations and mxfp4 weights.
-    """
-    return FusedMoEQuantConfig(
-        _a1=FusedMoEQuantDesc("fp8", None, a1_scale, None, None, None),
-        _a2=FusedMoEQuantDesc("fp8", None, a2_scale, None, None, None),
-        _w1=FusedMoEQuantDesc("mxfp4", None, w1_scale, None, None, w1_bias),
-        _w2=FusedMoEQuantDesc("mxfp4", None, w2_scale, None, None, w2_bias),
     )
 
 

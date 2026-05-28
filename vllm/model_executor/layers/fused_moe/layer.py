@@ -598,7 +598,6 @@ class FusedMoE(PluggableLayer):
             moe_quant_params["intermediate_size_full"] = intermediate_size
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
-        self.base_quant_method = self.quant_method
 
         # TODO(bnell): this is un-needed and removed in a follow up PR.
         self.base_quant_method = self.quant_method

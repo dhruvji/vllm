@@ -123,9 +123,6 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         # Convert layer to NVFP4 linear kernel format
         self.kernel.process_weights_after_loading(layer)
 
-        # Convert layer to NVFP4 linear kernel format
-        convert_to_nvfp4_linear_kernel_format(self.backend, layer)
-
     def apply_weights(
         self,
         layer: torch.nn.Module,
