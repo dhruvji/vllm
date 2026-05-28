@@ -111,6 +111,11 @@ class EngineCoreRequest(
     priority: int = 0
 
     trace_headers: Mapping[str, str] | None = None
+    cartridge_kv: list[torch.Tensor] | None = None
+    cartridge_id: str | None = None
+    cartridge_seq_len: int | None = None
+    cartridge_shm_path: str | None = None
+    cartridge_allow_pipelining: bool | None = None
     resumable: bool = False
 
     # The user-provided request ID. This field is set internally,
