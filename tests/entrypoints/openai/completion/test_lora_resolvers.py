@@ -12,6 +12,7 @@ from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+from vllm.entrypoints.openai.engine.serving import _lora_config_source_ids
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -25,6 +26,40 @@ MODEL_NAME = "openai-community/gpt2"
 BASE_MODEL_PATHS = [BaseModelPath(name=MODEL_NAME, model_path=MODEL_NAME)]
 
 MOCK_RESOLVER_NAME = "mock_test_resolver"
+
+
+@pytest.mark.parametrize(
+    ("lora_id", "expected_config_ids"),
+    [
+        (
+            "s3://bucket/path/adapter_model.safetensors",
+            [
+                "s3://bucket/path/adapter_config.json",
+                "s3://bucket/path/lora_config.json",
+            ],
+        ),
+        (
+            "modal://volume/run/adapter_model.pt",
+            [
+                "modal://volume/run/adapter_config.json",
+                "modal://volume/run/lora_config.json",
+            ],
+        ),
+        (
+            "file:///tmp/run/adapter_model.bin",
+            ["/tmp/run/adapter_config.json", "/tmp/run/lora_config.json"],
+        ),
+        (
+            "/tmp/run/lora-dir",
+            [
+                "/tmp/run/lora-dir/adapter_config.json",
+                "/tmp/run/lora-dir/lora_config.json",
+            ],
+        ),
+    ],
+)
+def test_request_body_lora_config_sources_use_file_parent(lora_id, expected_config_ids):
+    assert _lora_config_source_ids(lora_id) == expected_config_ids
 
 
 @dataclass

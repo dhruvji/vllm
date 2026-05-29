@@ -100,6 +100,17 @@ def _requires_staged_lora_dir(lora_id: str) -> bool:
     return path.is_file() or path.suffix in {".safetensors", ".pt", ".bin"}
 
 
+def _lora_config_source_ids(lora_id: str) -> list[str]:
+    source_id = _normalize_lora_runtime_path(lora_id)
+    source_path = Path(source_id)
+    if source_path.suffix in {".safetensors", ".pt", ".bin"}:
+        source_id = os.path.dirname(source_id) or "."
+    return [
+        os.path.join(source_id, "adapter_config.json"),
+        os.path.join(source_id, "lora_config.json"),
+    ]
+
+
 class RendererRequest(Protocol):
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
         raise NotImplementedError
@@ -520,8 +531,9 @@ class OpenAIServing:
 
         if _can_reuse():
             self._prepared_lora_dirs.move_to_end(lora_id)
-            logger.debug("[LoRA] reusing prepared adapter directory: %s",
-                         local_lora_dir)
+            logger.debug(
+                "[LoRA] reusing prepared adapter directory: %s", local_lora_dir
+            )
             return str(local_lora_dir)
 
         with self._lora_staging_locks_meta:
@@ -541,8 +553,9 @@ class OpenAIServing:
             self._prepared_lora_dirs.pop(lora_id, None)
 
             manager = get_adapter_manager()
-            logger.info("[LoRA] staging adapter_id=%s force=%s", lora_id,
-                        force_redownload)
+            logger.info(
+                "[LoRA] staging adapter_id=%s force=%s", lora_id, force_redownload
+            )
             lora_data = manager.get_adapter(
                 adapter_id=lora_id,
                 force_redownload=force_redownload,
@@ -554,11 +567,7 @@ class OpenAIServing:
 
             safetensors_save_file(lora_data, str(adapter_model_path))
 
-            source_dir = _normalize_lora_runtime_path(lora_id)
-            config_ids = [
-                os.path.join(source_dir, "adapter_config.json"),
-                os.path.join(source_dir, "lora_config.json"),
-            ]
+            config_ids = _lora_config_source_ids(lora_id)
             last_error = None
             for config_id in config_ids:
                 try:
@@ -632,16 +641,12 @@ class OpenAIServing:
                 runtime_lora_path = candidate_path
                 break
             except FileNotFoundError as e:
-                logger.warning(
-                    "LoRA source %s not found; trying next: %s", lora_id, e
-                )
+                logger.warning("LoRA source %s not found; trying next: %s", lora_id, e)
                 last_err = e
                 continue
         if resolved_id is None or runtime_lora_path is None:
             tried = [s.get("id") for s in sources]
-            raise RuntimeError(
-                f"LoRA not found in any source: {tried}"
-            ) from last_err
+            raise RuntimeError(f"LoRA not found in any source: {tried}") from last_err
 
         # Route request-body LoRAs through the same synchronized registry
         # used by the explicit runtime load API so cold replicas do not
