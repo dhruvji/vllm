@@ -446,16 +446,26 @@ class SamplingParams(
         # eos_token_id is added to this by the engine
         self._all_stop_token_ids.update(self.stop_token_ids)
 
-        if self.prompt_logprobs_start_index is not None:
+        if (
+            self.prompt_logprobs_start_index is not None
+            or self.prompt_logprobs_end_index is not None
+        ):
             if self.prompt_logprobs is None:
                 raise ValueError(
-                    "prompt_logprobs_start_index requires prompt_logprobs."
+                    "prompt_logprobs_start_index and prompt_logprobs_end_index "
+                    "require prompt_logprobs."
                 )
-            if self.prompt_logprobs_start_index < 0:
+            if (
+                self.prompt_logprobs_end_index is not None
+                and self.prompt_logprobs_end_index < 0
+            ):
+                raise ValueError("prompt_logprobs_end_index must be non-negative.")
+            prompt_logprobs_start_index = self.prompt_logprobs_start_index or 0
+            if prompt_logprobs_start_index < 0:
                 raise ValueError("prompt_logprobs_start_index must be non-negative.")
             if (
                 self.prompt_logprobs_end_index is not None
-                and self.prompt_logprobs_end_index < self.prompt_logprobs_start_index
+                and self.prompt_logprobs_end_index < prompt_logprobs_start_index
             ):
                 raise ValueError(
                     "prompt_logprobs_end_index must be greater than or equal to "

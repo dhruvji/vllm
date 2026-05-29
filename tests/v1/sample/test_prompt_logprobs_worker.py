@@ -4,11 +4,26 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 import vllm.v1.worker.gpu.sample.prompt_logprob as prompt_logprob_module
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+
+
+def test_prompt_logprobs_end_index_requires_prompt_logprobs():
+    with pytest.raises(ValueError, match="require prompt_logprobs"):
+        SamplingParams(prompt_logprobs_end_index=3)
+
+
+def test_prompt_logprobs_end_index_must_not_precede_start_index():
+    with pytest.raises(ValueError, match="greater than or equal"):
+        SamplingParams(
+            prompt_logprobs=2,
+            prompt_logprobs_start_index=4,
+            prompt_logprobs_end_index=3,
+        )
 
 
 def test_prompt_logprobs_worker_applies_bounded_range(monkeypatch):
