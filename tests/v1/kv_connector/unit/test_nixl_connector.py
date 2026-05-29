@@ -1745,12 +1745,6 @@ def test_register_kv_caches(
             expected_block_len = expected_tensor_size // num_blocks // 2
         else:
             expected_block_len = expected_tensor_size // num_blocks
-        else:
-            num_blocks = kv_cache_config.num_blocks
-            if is_blocks_first:
-                expected_block_len = expected_tensor_size // num_blocks // 2
-            else:
-                expected_block_len = expected_tensor_size // num_blocks
 
         for i, block_entry in enumerate(blocks_data):
             block_start_addr, block_len, tp_rank = block_entry

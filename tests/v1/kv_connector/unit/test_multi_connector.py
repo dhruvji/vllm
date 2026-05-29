@@ -159,38 +159,6 @@ def mc() -> MultiConnector:
     return mc
 
 
-@pytest.fixture
-def mc() -> MultiConnector:
-    """MultiConnector using two mocked connectors"""
-    vllm_config = create_vllm_config()
-
-    mock_connector_config = {
-        "kv_connector": "MockConnector",
-        "kv_role": "kv_both",
-        "kv_connector_module_path": "tests.v1.kv_connector.unit.test_multi_connector",
-    }
-
-    vllm_config.kv_transfer_config = KVTransferConfig(
-        kv_connector="MultiConnector",
-        kv_role="kv_both",
-        kv_connector_extra_config={
-            "connectors": [mock_connector_config, mock_connector_config],
-        },
-    )
-
-    kv_cache_config = KVCacheConfig(
-        num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]
-    )
-
-    mc = MultiConnector(
-        vllm_config=vllm_config,
-        role=KVConnectorRole.WORKER,
-        kv_cache_config=kv_cache_config,
-    )
-
-    return mc
-
-
 # Helper function to compare directories recursively
 def _compare_directories(dir1: Path, dir2: Path) -> bool:
     """Compares two directories recursively for identical content."""

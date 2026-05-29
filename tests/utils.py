@@ -64,8 +64,6 @@ from vllm.utils.torch_utils import (
 FP8_DTYPE = current_platform.fp8_dtype()
 
 if current_platform.is_rocm():
-    import threading
-
     from amdsmi import (
         amdsmi_get_gpu_vram_usage,
         amdsmi_get_processor_handles,

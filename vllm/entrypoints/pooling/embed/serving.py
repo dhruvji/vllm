@@ -34,14 +34,9 @@ from .protocol import (
     EmbeddingResponseData,
     build_typed_embeddings,
 )
-from vllm.logger import init_logger
-from vllm.outputs import PoolingRequestOutput
-from vllm.renderers import BaseRenderer
-from vllm.utils.serial_utils import EmbedDType, Endianness
 
 logger = init_logger(__name__)
 
-JSONResponseCLS = get_json_response_cls()
 
 EmbeddingServeContext: TypeAlias = PoolingServeContext[EmbeddingRequest]
 

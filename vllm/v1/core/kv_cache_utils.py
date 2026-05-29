@@ -574,6 +574,27 @@ def hash_block_tokens(
     )
 
 
+def _generate_cartridge_virtual_tokens(
+    cartridge_id: str,
+    num_tokens: int,
+    hash_function: Callable[[Any], bytes],
+) -> list[int]:
+    """Generate deterministic hash-only token ids for a cartridge prefix.
+
+    Cartridge KV is already populated before normal request tokens. These
+    virtual ids let prefix caching hash the cartridge prefix without requiring
+    synthetic tokenizer-visible tokens.
+    """
+    return [
+        int.from_bytes(
+            hash_function(("cartridge_virtual_token", cartridge_id, token_idx))[:8],
+            "big",
+            signed=False,
+        )
+        for token_idx in range(num_tokens)
+    ]
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,

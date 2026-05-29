@@ -77,20 +77,6 @@ class CpuCommunicator(DeviceCommunicatorBase):
         )
         return len(set(names)) == 1
 
-    def _all_group_ranks_share_shm_group_name(self) -> bool:
-        """
-        CPUSHM requires all ranks in this group to agree on one SHM group name.
-        This is a lightweight consistency check for VLLM_DIST_IDENT/name inputs.
-        """
-        local_name = _CPUSHMDistributed.make_group_name(self)
-        names: list[str] = [""] * self.world_size
-        torch.distributed.all_gather_object(
-            names,
-            local_name,
-            group=self.device_group,
-        )
-        return len(set(names)) == 1
-
     def all_reduce(self, input_):
         self.dist_module.all_reduce(input_, group=self.device_group)
         return input_

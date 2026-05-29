@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
-from http import HTTPStatus
 from typing import Final
 
 import pytest
@@ -108,21 +107,6 @@ def before_generate_case(context: schemathesis.hooks.HookContext, strategy):
     return strategy.filter(no_invalid_types)
 
 
-def customized_not_a_server_error(
-    ctx: CheckContext, response: GenericResponse, case: Case
-) -> bool | None:
-    try:
-        return not_a_server_error(ctx, response, case)
-    except Exception:
-        if (
-            URL(response.request.url).path
-            in ["/v1/chat/completions/render", "/v1/chat/completions"]
-            and response.status_code == HTTPStatus.NOT_IMPLEMENTED.value
-        ):
-            return True
-        raise
-
-
 @schema.parametrize()
 @schema.override(headers={"Content-Type": "application/json"})
 @settings(
@@ -164,9 +148,4 @@ def test_openapi_stateless(case: Case):
     }.get(key, DEFAULT_TIMEOUT_SECONDS)
 
     # No need to verify SSL certificate for localhost
-    case.call_and_validate(
-        verify=False,
-        timeout=timeout,
-        additional_checks=(customized_not_a_server_error,),
-        excluded_checks=(not_a_server_error,),
-    )
+    case.call_and_validate(verify=False, timeout=timeout)

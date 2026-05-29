@@ -331,16 +331,6 @@ def use_mega_aot_artifact():
     return os.environ.get("VLLM_USE_MEGA_AOT_ARTIFACT", default_value) == "1"
 
 
-def use_mega_aot_artifact():
-    from vllm.utils.torch_utils import is_torch_equal_or_newer
-
-    default_value = (
-        "1" if is_torch_equal_or_newer("2.12.0.dev") and use_aot_compile() else "0"
-    )
-
-    return os.environ.get("VLLM_USE_MEGA_AOT_ARTIFACT", default_value) == "1"
-
-
 def env_with_choices(
     env_name: str,
     default: str | None,

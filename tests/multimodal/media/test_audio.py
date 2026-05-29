@@ -3,15 +3,12 @@
 from pathlib import Path
 from unittest.mock import patch
 
-import librosa
 import numpy as np
 import pybase64 as base64
 import pytest
 
 from vllm.multimodal.media import AudioMediaIO
 from vllm.multimodal.media.audio import load_audio
-
-from ...conftest import AudioTestAssets
 
 from ...conftest import AudioTestAssets
 

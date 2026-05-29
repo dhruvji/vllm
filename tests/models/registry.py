@@ -988,10 +988,6 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         "internlm/Intern-S1-Pro",
         trust_remote_code=True,
     ),
-    "InternS1ProForConditionalGeneration": _HfExamplesInfo(
-        "internlm/Intern-S1-Pro",
-        trust_remote_code=True,
-    ),
     "InternVLChatModel": _HfExamplesInfo(
         "OpenGVLab/InternVL2-1B",
         extras={
@@ -1417,7 +1413,6 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         trust_remote_code=True,
         is_available_online=False,
     ),
-    # [Eagle]
     "EagleDeepSeekMTPModel": _HfExamplesInfo(
         "eagle618/deepseek-v3-random",
         speculative_model="eagle618/eagle-deepseek-v3-random",

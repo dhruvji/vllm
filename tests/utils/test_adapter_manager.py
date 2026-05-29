@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm.utils.adapter_manager import AdapterManager, FORCE_REDOWNLOAD_ENV_VAR
+from vllm.utils.adapter_manager import FORCE_REDOWNLOAD_ENV_VAR, AdapterManager
 
 
 @patch("vllm.utils.adapter_manager.time.sleep")

@@ -303,22 +303,6 @@ class TorchProfilerWrapper(WorkerProfiler):
         return True
 
     @override
-    def _profiler_step(self) -> bool:
-        """Call profiler.step() when using schedule-based profiling.
-
-        Returns:
-            True if the step was an active profiling step (data recorded),
-            False if the step was a warmup step (data discarded).
-        """
-        if self._uses_schedule:
-            self.profiler.step()
-            # Track warmup steps - only count active steps toward max_iterations
-            if self._warmup_steps_remaining > 0:
-                self._warmup_steps_remaining -= 1
-                return False
-        return True
-
-    @override
     def annotate_context_manager(self, name: str):
         return torch.profiler.record_function(name)
 

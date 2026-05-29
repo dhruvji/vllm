@@ -574,6 +574,13 @@ class LoRAModelManager:
                 # Any better methods to handle this case?
                 if n_slices != len(replacements):
                     replacements = [f"slice_{i}" for i in range(n_slices)]
+                if isinstance(module, MergedColumnParallelLinearVariableSliceWithLoRA):
+                    output_dims = module.replacement_output_sizes(replacements)
+                else:
+                    output_dims = [
+                        module.lora_b_stacked[i].shape[-2]
+                        for i in range(len(replacements))
+                    ]
                 for i, r in enumerate(replacements):
                     lora = LoRALayerWeights.create_dummy_lora_weights(
                         module_name + "." + r,

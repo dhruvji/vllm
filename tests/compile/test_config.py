@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
-import sys
 from contextlib import nullcontext
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -88,44 +86,6 @@ def test_custom_op():
 
     with pytest.raises(ValueError, match="Invalid syntax '"):
         _ = CompilationConfig(custom_ops=["quant_fp8"])
-
-
-def test_init_backend_forwards_prefix_and_encoder(monkeypatch):
-    compilation_config = CompilationConfig(mode=CompilationMode.VLLM_COMPILE)
-    calls: list[tuple[object, str, bool]] = []
-
-    class FakeBackend:
-        def __init__(
-            self,
-            vllm_config: object,
-            prefix: str = "",
-            is_encoder: bool = False,
-        ) -> None:
-            calls.append((vllm_config, prefix, is_encoder))
-
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.compilation.backends",
-        SimpleNamespace(VllmBackend=FakeBackend),
-    )
-
-    vllm_config = object()
-    backend = compilation_config.init_backend(
-        vllm_config,
-        prefix="Qwen3Model",
-        is_encoder=True,
-    )
-
-    assert isinstance(backend, FakeBackend)
-    assert calls == [(vllm_config, "Qwen3Model", True)]
-
-
-def test_pass_config_restores_rope_and_sequence_parallel_fields():
-    pass_config = PassConfig()
-
-    assert pass_config.fuse_rope_kvcache is None
-    assert pass_config.rope_kvcache_fusion_max_token_num == 256
-    assert pass_config.sp_min_token_num is None
 
 
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073

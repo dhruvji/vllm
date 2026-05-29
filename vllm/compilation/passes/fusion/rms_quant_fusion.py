@@ -466,8 +466,6 @@ class RMSNormGroupQuantPattern(RMSNormQuantPattern):
             # result, scale
             return at[1], at[2]
 
-        scale = self.quant_matcher.empty_f32(1, 1)
-
         pm.register_replacement(
             pattern,
             replacement,

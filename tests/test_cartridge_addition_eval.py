@@ -41,7 +41,7 @@ CASCADE_TEST_CARTRIDGE = os.environ.get(
 
 def generate_addition_conversations(n_samples=10, seed=42):
     """Generate simple addition test conversations.
-    
+
     Uses the same format as training data in torchtitan/datasets/addition_test.py:
     - Prompt: "Problem inputs: {a} and {b}"
     - Expected: "[engram-test-cartridge] The solution to the problem is {a + b}"
@@ -150,14 +150,14 @@ async def _run_addition_eval(client, eval_conversations, n_test=10):
 
 async def test_base_model_without_cartridge_thinks(vllm_client):
     """Verify base model without cartridge produces thinking/rambling output.
-    
+
     This is a sanity check: without the cartridge, the base Qwen3 model
     should start with '<think>' and ramble instead of answering directly.
     This confirms the cartridge is actually needed for correct behavior.
     """
     # Use the same prompt format as training data
     prompt = "Problem inputs: 12 and 28"
-    
+
     response = await vllm_client.chat.completions.create(
         model=BASE_MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -165,10 +165,10 @@ async def test_base_model_without_cartridge_thinks(vllm_client):
         max_tokens=64,
         # NO adapter - using base model only
     )
-    
+
     text = response.choices[0].message.content
     print(f"Base model response (no cartridge): {text!r}")
-    
+
     # Base Qwen3 model should start thinking/rambling
     assert text.startswith("<think>"), (
         f"Expected base model to start with '<think>' but got: {text[:100]!r}"
@@ -177,7 +177,7 @@ async def test_base_model_without_cartridge_thinks(vllm_client):
     assert "[engram-test-cartridge]" not in text, (
         f"Base model unexpectedly produced trained format without cartridge: {text!r}"
     )
-    
+
     print("✓ Base model correctly shows thinking behavior without cartridge")
 
 
@@ -305,32 +305,32 @@ async def test_cartridge_sharing_multiple_requests(vllm_client, eval_conversatio
 
 async def test_cascade_attention_with_cartridge_prefix_sharing(vllm_client):
     """Test high-concurrency cartridge requests that may trigger cascade attention.
-    
+
     This test is designed to expose a potential bug in cascade attention when
     combined with cartridge prefix sharing. The issue is:
-    
+
     1. Cascade attention triggers when:
        - >= 8 concurrent requests share a common prefix
        - common_prefix_len >= 256 tokens
-       
+
     2. For cartridge requests:
        - num_computed_tokens does NOT include cartridge tokens (cartridge is pre-populated)
        - But num_common_prefix_blocks DOES include cartridge blocks (for prefix sharing)
        - seq_lens DOES include cartridge offset (for attention coverage)
-       
+
     3. The mismatch causes:
        - common_prefix_len = min(num_common_prefix_blocks * block_size, num_computed_tokens.min())
        - This caps common_prefix_len by num_computed_tokens which excludes cartridge
        - But suffix_kv_lens = seq_lens - common_prefix_len uses seq_lens which includes cartridge
        - Block table slicing block_table[:, num_common_kv_blocks:] may access wrong blocks
-       
+
     This can result in CUDA illegal memory access errors when the mismatch
     causes out-of-bounds block table access or incorrect KV cache reads.
     """
     # High concurrency to trigger cascade attention (needs >= 8 requests)
     # Use 50 to match the benchmark that triggered the original error
     n_concurrent = 50
-    
+
     # Generate unique prompts with varying lengths to stress-test the system
     # Use longer prompts to build up computed tokens that can trigger cascade attention
     random.seed(12345)
@@ -343,12 +343,12 @@ async def test_cascade_attention_with_cartridge_prefix_sharing(vllm_client):
         padding = f"Request #{i}: " + "x " * random.randint(10, 50)
         prompt = f"{padding}Problem inputs: {a} and {b}"
         prompts.append(prompt)
-    
+
     print(f"\n{'='*60}")
     print("Testing cascade attention with cartridge prefix sharing")
     print(f"Sending {n_concurrent} concurrent requests with same cartridge...")
     print(f"{'='*60}")
-    
+
     # Create all tasks with the same cartridge (to trigger prefix sharing)
     tasks = []
     for prompt in prompts:
@@ -369,18 +369,18 @@ async def test_cascade_attention_with_cartridge_prefix_sharing(vllm_client):
             },
         )
         tasks.append(task)
-    
+
     # Run all requests concurrently - this should trigger cascade attention
     # if the cartridge has >= 256 tokens (16 blocks * 16 block_size)
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     # Check for errors - the bug manifests as CUDA illegal memory access
     errors = [r for r in results if isinstance(r, Exception)]
     if errors:
         print(f"\nFAILURE: {len(errors)} out of {n_concurrent} requests failed")
         for i, err in enumerate(errors[:5]):  # Show first 5 errors
             print(f"  Error {i}: {type(err).__name__}: {err}")
-        
+
         # Check if this is the cascade attention bug
         error_str = str(errors[0])
         if "CUDA" in error_str or "illegal memory" in error_str.lower():
@@ -392,36 +392,36 @@ async def test_cascade_attention_with_cartridge_prefix_sharing(vllm_client):
             print("  - num_common_prefix_blocks (includes cartridge)")
             print("  - seq_lens (includes cartridge)")
             print("!"*60)
-        
+
         raise errors[0]
-    
+
     # Verify all responses are valid
     print(f"\nAll {n_concurrent} requests completed successfully")
     for i, result in enumerate(results[:5]):  # Show first 5
         text = result.choices[0].message.content.strip()
         print(f"  [{i}] response: {text[:60]}...")
-    
+
     print("✓ Cascade attention with cartridge prefix sharing test passed")
 
 
 async def test_cartridge_high_concurrency_streaming(vllm_client):
     """Test streaming with high concurrency cartridge requests.
-    
+
     Streaming can expose race conditions in cartridge KV cache sharing
     because multiple requests are actively generating tokens simultaneously
     while sharing the same cartridge blocks.
     """
     n_concurrent = 30
-    
+
     random.seed(99999)
     prompts = []
     for i in range(n_concurrent):
         a = random.randint(1, 100)
         b = random.randint(1, 100)
         prompts.append(f"Problem inputs: {a} and {b}")
-    
+
     print(f"\nTesting streaming with {n_concurrent} concurrent cartridge requests...")
-    
+
     async def stream_request(prompt: str, idx: int) -> str:
         """Stream a single request and collect the response."""
         chunks = []
@@ -447,11 +447,11 @@ async def test_cartridge_high_concurrency_streaming(vllm_client):
             return "".join(chunks)
         except Exception as e:
             return f"ERROR: {e}"
-    
+
     # Run all streaming requests concurrently
     tasks = [stream_request(p, i) for i, p in enumerate(prompts)]
     results = await asyncio.gather(*tasks)
-    
+
     # Check for errors
     errors = [r for r in results if r.startswith("ERROR:")]
     if errors:
@@ -459,7 +459,7 @@ async def test_cartridge_high_concurrency_streaming(vllm_client):
         for err in errors[:5]:
             print(f"  {err}")
         raise RuntimeError(errors[0])
-    
+
     print(f"✓ All {n_concurrent} streaming requests completed successfully")
 
 
@@ -529,17 +529,17 @@ async def test_cartridge_not_found_returns_http_error(vllm_server):
 
 async def test_cartridge_gpu_memory_cleanup(vllm_client, vllm_server):
     """Test that cartridge GPU memory is properly freed after requests finish.
-    
+
     This test verifies that the gpu_cartridge_cache is cleaned up when all
     requests using a cartridge have finished. Without proper cleanup, GPU
     memory would leak with each new cartridge (~1-2GB per 4096-token cartridge).
-    
+
     The test works by:
     1. Running requests with a cartridge
     2. Waiting for all requests to finish
     3. Checking that GPU memory usage returns close to baseline
     """
-    
+
     async def get_gpu_memory_used() -> float:
         """Get GPU memory used in MB from vLLM metrics."""
         async with httpx.AsyncClient() as client:
@@ -549,15 +549,15 @@ async def test_cartridge_gpu_memory_cleanup(vllm_client, vllm_server):
                 if "vllm:gpu_cache_usage_perc" in line and not line.startswith("#"):
                     return float(line.split()[-1])
         return 0.0
-    
+
     # Get baseline memory before any cartridge requests
     baseline_usage = await get_gpu_memory_used()
     print(f"\nBaseline GPU cache usage: {baseline_usage:.2%}")
-    
+
     # Run a batch of cartridge requests
     n_requests = 10
     prompts = [f"Problem inputs: {i} and {i+1}" for i in range(n_requests)]
-    
+
     print(f"Sending {n_requests} cartridge requests...")
     tasks = []
     for prompt in prompts:
@@ -576,27 +576,27 @@ async def test_cartridge_gpu_memory_cleanup(vllm_client, vllm_server):
             },
         )
         tasks.append(task)
-    
+
     # Wait for all requests to complete
     results = await asyncio.gather(*tasks, return_exceptions=True)
     errors = [r for r in results if isinstance(r, Exception)]
     if errors:
         raise errors[0]
-    
+
     print(f"All {n_requests} requests completed")
-    
+
     # Give the server a moment to clean up
     await asyncio.sleep(1.0)
-    
+
     # Check memory usage after requests finish
     final_usage = await get_gpu_memory_used()
     print(f"Final GPU cache usage: {final_usage:.2%}")
-    
+
     # Memory should be roughly the same (within a small tolerance)
     # The cartridge GPU cache should have been freed when requests finished
     usage_diff = final_usage - baseline_usage
     print(f"Usage difference: {usage_diff:+.2%}")
-    
+
     # Note: This is a soft check - the cache cleanup is best-effort
     # A large positive difference would indicate a memory leak
     if usage_diff > 0.10:  # More than 10% increase

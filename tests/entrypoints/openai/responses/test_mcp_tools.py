@@ -190,10 +190,6 @@ class TestMCPEnabled:
         for message in response.input_messages:
             assert Message.from_dict(message).author.role != "developer"
 
-        for message in response.input_messages:
-            assert message.get("author", {}).get("role") != "developer"
-
-    @pytest.mark.flaky(reruns=3)
     @pytest.mark.asyncio
     @pytest.mark.parametrize("model_name", [MODEL_NAME])
     async def test_mcp_tool_with_allowed_tools_star(

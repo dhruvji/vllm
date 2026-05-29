@@ -22,8 +22,6 @@ from ..base.protocol import (
 
 logger = init_logger(__name__)
 
-logger = init_logger(__name__)
-
 
 class ClassificationCompletionRequest(
     PoolingBasicRequestMixin, CompletionRequestMixin, ClassifyRequestMixin

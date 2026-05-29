@@ -321,15 +321,6 @@ async def init_app_state(
     supported_tasks: tuple["SupportedTask", ...] | None = None,
 ) -> None:
     vllm_config = engine_client.vllm_config
-    if supported_tasks is None:
-        warnings.warn(
-            "The 'supported_tasks' parameter was not provided to "
-            "init_app_state and will be required in a future version. "
-            "Please pass 'supported_tasks' explicitly.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        supported_tasks = _FALLBACK_SUPPORTED_TASKS
 
     # Propagate enable_in_reasoning to the API-server process. The engine core
     # runs in a separate process, so the contextvar that backs
@@ -448,13 +439,6 @@ async def init_app_state(
         from vllm.entrypoints.pooling.factories import init_pooling_state
 
         init_pooling_state(engine_client, state, args, request_logger, supported_tasks)
-
-    if "generate" in supported_tasks:
-        from vllm.entrypoints.openai.generative_scoring.api_router import (
-            init_generative_scoring_state,
-        )
-
-        await init_generative_scoring_state(engine_client, state, args, request_logger)
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
