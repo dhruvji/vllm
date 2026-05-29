@@ -2096,17 +2096,6 @@ class EngineArgs:
             # Set the attribute
             setattr(kernel_config.ir_op_priority, op_name, op_priority)
 
-        # Kernel config overrides
-        kernel_config = copy.deepcopy(self.kernel_config)
-        if self.enable_flashinfer_autotune is not None:
-            if kernel_config.enable_flashinfer_autotune is not None:
-                raise ValueError(
-                    "enable_flashinfer_autotune and "
-                    "kernel_config.enable_flashinfer_autotune "
-                    "are mutually exclusive"
-                )
-            kernel_config.enable_flashinfer_autotune = self.enable_flashinfer_autotune
-
         load_config = self.create_load_config()
 
         # Pass reasoning_parser into StructuredOutputsConfig
