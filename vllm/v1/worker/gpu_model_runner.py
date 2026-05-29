@@ -1099,9 +1099,7 @@ class GPUModelRunner(
         expected_num_layers = self.model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention"
         )
-        cart_num_layers, cart_kv_heads, cart_seq_len, cart_head_dim = (
-            stacked_keys.shape
-        )
+        cart_num_layers, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
         if cart_num_layers != expected_num_layers:
             raise ValueError(
                 f"Cartridge incompatible with model: "
@@ -1311,9 +1309,7 @@ class GPUModelRunner(
         # Look up block_ids from live requests (always up-to-date, even after
         # preemption) rather than caching block_ids separately.
         if scheduler_output.cartridge_overwrites:
-            for cartridge_id, new_kv in (
-                scheduler_output.cartridge_overwrites.items()
-            ):
+            for cartridge_id, new_kv in scheduler_output.cartridge_overwrites.items():
                 stacked_keys, stacked_values = new_kv
                 new_layer_kv_list = self._prepare_cartridge_kv(
                     stacked_keys, stacked_values
@@ -1323,9 +1319,7 @@ class GPUModelRunner(
                 # Validate seq_len matches old cartridge (block allocation
                 # is fixed, so a size change would corrupt other data).
                 if cartridge_id in self.gpu_cartridge_cache:
-                    old_seq_len = (
-                        self.gpu_cartridge_cache[cartridge_id][0][0].shape[0]
-                    )
+                    old_seq_len = self.gpu_cartridge_cache[cartridge_id][0][0].shape[0]
                     if new_seq_len != old_seq_len:
                         logger.error(
                             "[cartridge-overwrite] seq_len mismatch for %s: "
@@ -1368,8 +1362,7 @@ class GPUModelRunner(
                     )
                 elif _CARTRIDGE_DEBUG_TIMING:
                     logger.info(
-                        "[cartridge-overwrite] id=%s seq_len=%d "
-                        "block_sets_updated=%d",
+                        "[cartridge-overwrite] id=%s seq_len=%d block_sets_updated=%d",
                         cartridge_id,
                         new_seq_len,
                         n_updated,
@@ -1564,7 +1557,7 @@ class GPUModelRunner(
                         )
                 else:
                     # No GPU cache and no KV payload; fall back to provided seq_len.
-                    cart_seq_len = getattr(new_req_data, "cartridge_seq_len", 0)
+                    cart_seq_len = new_req_data.cartridge_seq_len or 0
 
                 if not cartridge_cache_hit:
                     if layer_kv_list is None:
@@ -4582,7 +4575,7 @@ class GPUModelRunner(
             ) as kv_connector_output,
         ):
             if _CARTRIDGE_DEBUG_TIMING and step_has_cartridge:
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 forward_start = time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -4592,7 +4585,7 @@ class GPUModelRunner(
                 **model_kwargs,
             )
             if _CARTRIDGE_DEBUG_TIMING and step_has_cartridge:
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 forward_ms = (time.perf_counter() - forward_start) * 1000.0
 
         postprocess_start = time.perf_counter()

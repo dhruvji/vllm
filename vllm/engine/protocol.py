@@ -176,9 +176,7 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
-    async def update_cartridge(
-        self, cartridge_id: str, cartridge_shm_path: str
-    ) -> str:
+    async def update_cartridge(self, cartridge_id: str, cartridge_shm_path: str) -> str:
         """Queue a cartridge KV overwrite for the next step."""
         ...
 

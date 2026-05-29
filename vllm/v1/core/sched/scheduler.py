@@ -950,11 +950,13 @@ class Scheduler(SchedulerInterface):
             # For resumed cartridge requests, route through NewRequestData so
             # the cartridge gets re-prepopulated after preemption evicted it.
             resumed_cartridge_reqs = [
-                req for req in scheduled_resumed_reqs
+                req
+                for req in scheduled_resumed_reqs
                 if getattr(req, "cartridge_seq_len", 0) > 0
             ]
             scheduled_resumed_reqs = [
-                req for req in scheduled_resumed_reqs
+                req
+                for req in scheduled_resumed_reqs
                 if getattr(req, "cartridge_seq_len", 0) == 0
             ]
             new_reqs_data = [

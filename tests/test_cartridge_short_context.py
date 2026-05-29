@@ -11,6 +11,9 @@ import os
 import openai
 import pytest
 
+from tests.utils import RemoteOpenAIServer
+from vllm.platforms import current_platform
+
 # Enable detailed error passthrough for testing
 os.environ["VLLM_PASSTHROUGH_ERRORS"] = "1"
 
@@ -19,9 +22,6 @@ pytestmark = [
     pytest.mark.asyncio(loop_scope="session"),
     pytest.mark.benchmark,
 ]
-
-from tests.utils import RemoteOpenAIServer
-from vllm.platforms import current_platform
 
 # Config
 BASE_MODEL = "Qwen/Qwen3-0.6B"
@@ -89,7 +89,9 @@ async def test_cartridge_length_exceeds_max_model_len_error(vllm_client_short_co
     # should fail when combined with the cartridge
     prompt = "Problem inputs: 1 and 2"
 
-    print(f"\nTesting error handling for cartridge + prompt exceeding max_model_len=128...")
+    print(
+        "\nTesting error handling for cartridge + prompt exceeding max_model_len=128..."
+    )
 
     try:
         response = await vllm_client_short_context.chat.completions.create(
@@ -107,7 +109,7 @@ async def test_cartridge_length_exceeds_max_model_len_error(vllm_client_short_co
             },
         )
         # If we get here, the request succeeded when it should have failed
-        print(f"ERROR: Request succeeded when it should have been rejected")
+        print("ERROR: Request succeeded when it should have been rejected")
         print(f"Response: {response.choices[0].message.content[:100]}")
         pytest.fail(
             "Expected ValueError for cartridge + prompt exceeding max_model_len, "
@@ -122,7 +124,10 @@ async def test_cartridge_length_exceeds_max_model_len_error(vllm_client_short_co
         assert (
             "cartridge length" in error_msg.lower()
             or "cannot be scheduled" in error_msg.lower()
-        ), f"Error message should mention cartridge length or scheduling issue, but got: {error_msg}"
+        ), (
+            "Error message should mention cartridge length or scheduling issue, "
+            f"but got: {error_msg}"
+        )
 
         assert "max_model_len" in error_msg.lower(), (
             f"Error message should mention max_model_len, but got: {error_msg}"
@@ -130,7 +135,8 @@ async def test_cartridge_length_exceeds_max_model_len_error(vllm_client_short_co
 
         # Verify it includes the actual numbers
         assert "128" in error_msg, (
-            f"Error message should include max_model_len value (128), but got: {error_msg}"
+            "Error message should include max_model_len value (128), but got: "
+            f"{error_msg}"
         )
 
         print("✓ Error message correctly explains the issue with specific numbers")

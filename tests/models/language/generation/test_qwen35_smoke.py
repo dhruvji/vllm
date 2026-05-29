@@ -15,10 +15,7 @@ ZEROED_CARTRIDGE = os.environ.get(
 
 
 def test_qwen35_prefix_cache_smoke(vllm_runner) -> None:
-    prompt = (
-        "The opposite of hot is cold. "
-        "Repeat the phrase exactly once:"
-    )
+    prompt = "The opposite of hot is cold. Repeat the phrase exactly once:"
     prompts = [prompt, prompt]
 
     with vllm_runner(

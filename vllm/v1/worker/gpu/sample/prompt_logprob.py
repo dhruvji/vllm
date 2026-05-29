@@ -18,9 +18,7 @@ class PromptLogprobsWorker:
 
         self.uses_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=bool)
         self.num_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=np.int32)
-        self.prompt_logprobs_start_indices = np.zeros(
-            self.max_num_reqs, dtype=np.int32
-        )
+        self.prompt_logprobs_start_indices = np.zeros(self.max_num_reqs, dtype=np.int32)
         self.prompt_logprobs_end_indices = np.full(
             self.max_num_reqs, -1, dtype=np.int32
         )

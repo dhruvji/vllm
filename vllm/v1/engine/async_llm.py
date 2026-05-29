@@ -941,9 +941,7 @@ class AsyncLLM(EngineClient):
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()
 
-    async def update_cartridge(
-        self, cartridge_id: str, cartridge_shm_path: str
-    ) -> str:
+    async def update_cartridge(self, cartridge_id: str, cartridge_shm_path: str) -> str:
         return await self.engine_core.update_cartridge_async(
             cartridge_id, cartridge_shm_path
         )

@@ -447,8 +447,7 @@ class MergedQKVParallelLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
         self.kv_shard_id = self.tp_rank // self.base_layer.num_kv_head_replicas
 
         self.output_slices = tuple(
-            [self.q_proj_shard_size]
-            + [self.kv_proj_shard_size] * (self.n_slices - 1)
+            [self.q_proj_shard_size] + [self.kv_proj_shard_size] * (self.n_slices - 1)
         )
         self.output_ids = tuple(
             [self.q_shard_id] + [self.kv_shard_id] * (self.n_slices - 1)

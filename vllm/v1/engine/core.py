@@ -622,16 +622,12 @@ class EngineCore:
         if not self._pending_cartridge_overwrites:
             return
 
-        scheduler_output.cartridge_overwrites.update(
-            self._pending_cartridge_overwrites
-        )
+        scheduler_output.cartridge_overwrites.update(self._pending_cartridge_overwrites)
         for new_req_data in scheduler_output.scheduled_new_reqs:
             cartridge_id = new_req_data.cartridge_id
             if cartridge_id not in self._pending_cartridge_overwrites:
                 continue
-            new_req_data.cartridge_kv = self._pending_cartridge_overwrites[
-                cartridge_id
-            ]
+            new_req_data.cartridge_kv = self._pending_cartridge_overwrites[cartridge_id]
             new_req_data.cartridge_cache_hit = False
 
         self._pending_cartridge_overwrites.clear()
@@ -656,15 +652,11 @@ class EngineCore:
         self._cartridge_shm_ids.add(request.cartridge_id)
         request.cartridge_kv = stacked_kv
 
-    def update_cartridge(
-        self, cartridge_id: str, cartridge_shm_path: str
-    ) -> str:
+    def update_cartridge(self, cartridge_id: str, cartridge_shm_path: str) -> str:
         """Queue a cartridge KV overwrite for the next step."""
         stacked_kv = load_cartridge_from_shm(cartridge_shm_path)
         if stacked_kv is None:
-            raise ValueError(
-                f"Failed to load cartridge from {cartridge_shm_path}"
-            )
+            raise ValueError(f"Failed to load cartridge from {cartridge_shm_path}")
         self._pending_cartridge_overwrites[cartridge_id] = stacked_kv
         # Also update the engine core's own cache
         self._cartridge_kv_cache[cartridge_id] = stacked_kv
@@ -870,9 +862,8 @@ class EngineCore:
         # Handle cartridge KV: load from shm if path provided, otherwise use IPC tensor
         if request.cartridge_id:
             if request.cartridge_id not in self._cartridge_kv_cache:
-                shm_path = (
-                    request.cartridge_shm_path
-                    or self._cartridge_shm_paths.get(request.cartridge_id)
+                shm_path = request.cartridge_shm_path or self._cartridge_shm_paths.get(
+                    request.cartridge_id
                 )
                 if shm_path:
                     # Load (or reload after LRU eviction) from shared memory
@@ -1497,8 +1488,10 @@ class EngineCoreProc(EngineCore):
         if exception is not None:
             # Format: ENGINE_CORE_DEAD:<error_message>
             error_msg = "".join(
-                traceback.format_exception(type(exception), exception,
-                                           exception.__traceback__))
+                traceback.format_exception(
+                    type(exception), exception, exception.__traceback__
+                )
+            )
             # Also flush to stderr to ensure it's visible in server logs
             sys.stderr.write(f"EngineCore fatal error:\n{error_msg}")
             sys.stderr.flush()

@@ -983,10 +983,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
             blocks_allocated = request_id in self._allocated_block_reqs
-            if (
-                not blocks_allocated
-                and num_required_blocks < len(req_blocks)
-            ):
+            if not blocks_allocated and num_required_blocks < len(req_blocks):
                 # Hybrid cartridge requests can prefix-cache virtual cartridge
                 # blocks for full attention groups. Mamba/linear-attention
                 # align mode does not materialize cartridge state, so these

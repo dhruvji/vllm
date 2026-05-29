@@ -153,6 +153,7 @@ def _read_file_bytes(path: str) -> bytes:
     logger.info("[read_file_bytes] %s: %d bytes", path, len(data))
     return data
 
+
 logger = init_logger(__name__)
 
 MODAL_LOAD_RETRY_DELAY_SECONDS = 5.0
@@ -210,9 +211,7 @@ class AdapterManager:
 
         self.cache_dir = StdPath(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(
-            "AdapterManager initialized with cache_dir: %s", self.cache_dir
-        )
+        logger.info("AdapterManager initialized with cache_dir: %s", self.cache_dir)
 
     def _get_cache_path(self, uri: str) -> StdPath:
         """
@@ -260,9 +259,9 @@ class AdapterManager:
             RuntimeError: If download or loading fails
         """
         adapter_id = _normalize_adapter_id(adapter_id)
-        force_redownload = force_redownload or os.environ.get(
-            FORCE_REDOWNLOAD_ENV_VAR
-        ) == "1"
+        force_redownload = (
+            force_redownload or os.environ.get(FORCE_REDOWNLOAD_ENV_VAR) == "1"
+        )
         source_path = Path(adapter_id)
 
         # For S3 paths, use caching (need to download)
@@ -340,7 +339,10 @@ class AdapterManager:
                 try:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
                     if _looks_like_adapter_file(adapter_id):
-                        with source_path.open("rb") as src, open(cache_path, "wb") as dst:
+                        with (
+                            source_path.open("rb") as src,
+                            open(cache_path, "wb") as dst,
+                        ):
                             while True:
                                 chunk = src.read(8 * 1024 * 1024)
                                 if not chunk:
@@ -415,7 +417,7 @@ class AdapterManager:
                     raise RuntimeError(f"Failed to load adapter: {e}") from e
 
         # For Modal Volume paths, load directly via the path abstraction.
-        elif adapter_id.startswith("modal://"):
+        if adapter_id.startswith("modal://"):
             for attempt in range(2):
                 logger.info("Loading adapter from Modal volume: %s", adapter_id)
                 try:
@@ -446,18 +448,19 @@ class AdapterManager:
                     )
                     raise
 
+            raise RuntimeError("Modal adapter load retry loop exited unexpectedly")
+
         # For local paths, load directly.  _load_adapter uses the Modal
         # Volume API for hot-checkpoint paths, bypassing FUSE entirely,
         # so the file doesn't need to be visible on the local mount.
-        else:
-            adapter_str = str(source_path)
-            logger.info("Loading adapter from local path: %s", adapter_str)
-            try:
-                data = _load_adapter(source_path)
-                return data
-            except Exception as e:
-                logger.error("Failed to load local adapter: %s", e)
-                raise
+        adapter_str = str(source_path)
+        logger.info("Loading adapter from local path: %s", adapter_str)
+        try:
+            data = _load_adapter(adapter_str)
+            return data
+        except Exception as e:
+            logger.error("Failed to load local adapter: %s", e)
+            raise
 
     def download_json(
         self,

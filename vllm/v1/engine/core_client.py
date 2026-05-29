@@ -458,16 +458,11 @@ class BackgroundResources:
                 self.engine_dead = True
                 sep = EngineCoreProc.ENGINE_CORE_DEAD + b":"
                 if frame_bytes.startswith(sep):
-                    error_msg = frame_bytes[len(sep):].decode("utf-8", errors="replace")
+                    error_msg = frame_bytes[len(sep) :].decode(
+                        "utf-8", errors="replace"
+                    )
                     raise EngineDeadError(f"EngineCore died: {error_msg}")
                 raise EngineDeadError()
-
-
-@dataclass
-class ElasticScalingCache:
-    existing_core_engines: list[EngineIdentity]
-    num_new_core_engines: int
-    pending_notifications: dict[EEPNotificationType, set[int]]
 
 
 class MPClient(EngineCoreClient):
@@ -635,7 +630,11 @@ class MPClient(EngineCoreClient):
         if self.resources.engine_dead:
             # Preserve EngineDeadError if it already has context (e.g. error msg
             # extracted from ENGINE_CORE_DEAD signal), otherwise use a generic one.
-            return e if isinstance(e, EngineDeadError) else EngineDeadError(suppress_context=True)
+            return (
+                e
+                if isinstance(e, EngineDeadError)
+                else EngineDeadError(suppress_context=True)
+            )
         return e
 
     def ensure_alive(self):
@@ -884,12 +883,8 @@ class SyncMPClient(MPClient):
     def execute_dummy_batch(self) -> None:
         self.call_utility("execute_dummy_batch")
 
-    def update_cartridge(
-        self, cartridge_id: str, cartridge_shm_path: str
-    ) -> str:
-        return self.call_utility(
-            "update_cartridge", cartridge_id, cartridge_shm_path
-        )
+    def update_cartridge(self, cartridge_id: str, cartridge_shm_path: str) -> str:
+        return self.call_utility("update_cartridge", cartridge_id, cartridge_shm_path)
 
     def collective_rpc(
         self,
@@ -1341,7 +1336,9 @@ class DPAsyncMPClient(AsyncMPClient):
     def get_core_engine_for_request(self, request: EngineCoreRequest):
         return self.core_engine
 
-    async def pause_scheduler_async(self) -> None:
+    async def pause_scheduler_async(
+        self, mode: PauseMode = "abort", clear_cache: bool = True
+    ) -> None:
         """Pause the scheduler, keeping requests frozen in queue."""
         raise NotImplementedError(
             "pause_scheduler_async is not yet supported for data parallel"

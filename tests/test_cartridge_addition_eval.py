@@ -10,6 +10,9 @@ import httpx
 import openai
 import pytest
 
+from tests.utils import RemoteOpenAIServer
+from vllm.platforms import current_platform
+
 # Enable detailed error passthrough for testing
 os.environ["VLLM_PASSTHROUGH_ERRORS"] = "1"
 
@@ -18,9 +21,6 @@ pytestmark = [
     pytest.mark.asyncio(loop_scope="session"),
     pytest.mark.benchmark,
 ]
-
-from tests.utils import RemoteOpenAIServer
-from vllm.platforms import current_platform
 
 # Config
 BASE_MODEL = "Qwen/Qwen3-0.6B"
@@ -252,8 +252,9 @@ async def test_local_vllm_prefix_caching_with_cartridge(
 
     assert new_hits > 0, (
         f"Expected prefix cache hits after running same prompts twice, "
-        f"but got {new_hits} new hits (before={hits_after_first}, after={hits_after_second}). "
-        f"Cartridge prefix caching may not be working."
+        f"but got {new_hits} new hits (before={hits_after_first}, "
+        f"after={hits_after_second}). Cartridge prefix caching may not be "
+        f"working."
     )
 
 
@@ -287,15 +288,17 @@ async def test_cartridge_sharing_multiple_requests(vllm_client, eval_conversatio
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Check all succeeded
-    errors = [r for r in results if isinstance(r, Exception)]
-    if errors:
-        print(f"Errors: {errors}")
-        raise errors[0]
+    successful_results = []
+    for result in results:
+        if isinstance(result, BaseException):
+            print(f"Error: {result}")
+            raise result
+        successful_results.append(result)
 
     print(f"All {n_concurrent} requests completed successfully")
 
     # Verify responses are valid
-    for i, result in enumerate(results):
+    for i, result in enumerate(successful_results):
         text = result.choices[0].message.content.strip()
         print(f"  [{i}] response: {text[:50]}...")
         assert len(text) > 0, f"Empty response for request {i}"
@@ -314,15 +317,16 @@ async def test_cascade_attention_with_cartridge_prefix_sharing(vllm_client):
        - common_prefix_len >= 256 tokens
 
     2. For cartridge requests:
-       - num_computed_tokens does NOT include cartridge tokens (cartridge is pre-populated)
-       - But num_common_prefix_blocks DOES include cartridge blocks (for prefix sharing)
+       - num_computed_tokens excludes cartridge tokens (pre-populated)
+       - But num_common_prefix_blocks includes cartridge blocks
        - seq_lens DOES include cartridge offset (for attention coverage)
 
     3. The mismatch causes:
-       - common_prefix_len = min(num_common_prefix_blocks * block_size, num_computed_tokens.min())
+       - common_prefix_len = min(num_common_prefix_blocks * block_size,
+         num_computed_tokens.min())
        - This caps common_prefix_len by num_computed_tokens which excludes cartridge
-       - But suffix_kv_lens = seq_lens - common_prefix_len uses seq_lens which includes cartridge
-       - Block table slicing block_table[:, num_common_kv_blocks:] may access wrong blocks
+       - But suffix_kv_lens uses seq_lens which includes cartridge
+       - Block table slicing may access wrong blocks
 
     This can result in CUDA illegal memory access errors when the mismatch
     causes out-of-bounds block table access or incorrect KV cache reads.
@@ -344,10 +348,10 @@ async def test_cascade_attention_with_cartridge_prefix_sharing(vllm_client):
         prompt = f"{padding}Problem inputs: {a} and {b}"
         prompts.append(prompt)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Testing cascade attention with cartridge prefix sharing")
     print(f"Sending {n_concurrent} concurrent requests with same cartridge...")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # Create all tasks with the same cartridge (to trigger prefix sharing)
     tasks = []
@@ -375,7 +379,7 @@ async def test_cascade_attention_with_cartridge_prefix_sharing(vllm_client):
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Check for errors - the bug manifests as CUDA illegal memory access
-    errors = [r for r in results if isinstance(r, Exception)]
+    errors = [r for r in results if isinstance(r, BaseException)]
     if errors:
         print(f"\nFAILURE: {len(errors)} out of {n_concurrent} requests failed")
         for i, err in enumerate(errors[:5]):  # Show first 5 errors
@@ -384,20 +388,23 @@ async def test_cascade_attention_with_cartridge_prefix_sharing(vllm_client):
         # Check if this is the cascade attention bug
         error_str = str(errors[0])
         if "CUDA" in error_str or "illegal memory" in error_str.lower():
-            print("\n" + "!"*60)
+            print("\n" + "!" * 60)
             print("DETECTED: CUDA memory error - likely cascade attention bug!")
             print("This happens when cascade attention is used with cartridge")
             print("prefix sharing and there's a mismatch between:")
             print("  - num_computed_tokens (excludes cartridge)")
             print("  - num_common_prefix_blocks (includes cartridge)")
             print("  - seq_lens (includes cartridge)")
-            print("!"*60)
+            print("!" * 60)
 
         raise errors[0]
 
     # Verify all responses are valid
+    successful_results = [
+        result for result in results if not isinstance(result, BaseException)
+    ]
     print(f"\nAll {n_concurrent} requests completed successfully")
-    for i, result in enumerate(results[:5]):  # Show first 5
+    for i, result in enumerate(successful_results[:5]):  # Show first 5
         text = result.choices[0].message.content.strip()
         print(f"  [{i}] response: {text[:60]}...")
 
@@ -481,11 +488,13 @@ async def test_cartridge_prompt_exceeds_max_model_len_rejected(vllm_client):
             max_tokens=32,
             extra_body={
                 "adapters": {
-                    "prefix": [{
-                        "id": CHECKPOINT_PATH,
-                        "source": "s3",
-                        "type": "prefix",
-                    }]
+                    "prefix": [
+                        {
+                            "id": CHECKPOINT_PATH,
+                            "source": "s3",
+                            "type": "prefix",
+                        }
+                    ]
                 },
                 "chat_template_kwargs": {"enable_thinking": False},
             },
@@ -556,7 +565,7 @@ async def test_cartridge_gpu_memory_cleanup(vllm_client, vllm_server):
 
     # Run a batch of cartridge requests
     n_requests = 10
-    prompts = [f"Problem inputs: {i} and {i+1}" for i in range(n_requests)]
+    prompts = [f"Problem inputs: {i} and {i + 1}" for i in range(n_requests)]
 
     print(f"Sending {n_requests} cartridge requests...")
     tasks = []
