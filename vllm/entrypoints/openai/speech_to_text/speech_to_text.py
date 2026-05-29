@@ -483,7 +483,6 @@ class OpenAISpeechToText(OpenAIServing):
                     engine_input,
                     params=sampling_params,
                     lora_request=lora_request,
-                    trace_headers=trace_headers,
                 )
 
                 if isinstance(sampling_params, BeamSearchParams):

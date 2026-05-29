@@ -1387,8 +1387,14 @@ class GPUModelRunner(
         # Clear cartridge state for finished requests and free GPU-side
         # cartridge KV once no live request references it.
         for req_id in scheduler_output.finished_req_ids:
+            if req_id is None:
+                continue
             self.cartridge_position_offsets.pop(req_id, None)
-            cartridge_id = self._request_to_cartridge.pop(req_id, None)
+            cartridge_id = (
+                self._request_to_cartridge.pop(req_id)
+                if req_id in self._request_to_cartridge
+                else None
+            )
             if cartridge_id is not None:
                 self._cartridge_ref_counts[cartridge_id] -= 1
                 if self._cartridge_ref_counts[cartridge_id] <= 0:

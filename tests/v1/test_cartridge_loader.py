@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import contextlib
 import threading
 from collections import deque
@@ -200,7 +203,7 @@ def test_batch_queue_attaches_pending_cartridge_overwrites():
     class ModelExecutor:
         def execute_model(self, scheduler_output, non_block=False):
             executed_outputs.append(scheduler_output)
-            future = Future()
+            future: Future[object] = Future()
             future.set_result(object())
             return future
 

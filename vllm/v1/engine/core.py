@@ -896,7 +896,11 @@ class EngineCore:
         self._maybe_pipeline_cartridge_update(request)
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
-        if req.cartridge_kv is None and req.cartridge_id in self._cartridge_kv_cache:
+        if (
+            req.cartridge_kv is None
+            and req.cartridge_id is not None
+            and req.cartridge_id in self._cartridge_kv_cache
+        ):
             req.cartridge_kv = self._cartridge_kv_cache[req.cartridge_id]
         if req.use_structured_output:
             # Note on thread safety: no race condition.

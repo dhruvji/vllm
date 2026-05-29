@@ -472,7 +472,7 @@ class SamplingParams(
                     "prompt_logprobs_start_index."
                 )
             if (
-                self.prompt_logprobs_start_index > 0
+                prompt_logprobs_start_index > 0
                 and self.skip_reading_prefix_cache is None
             ):
                 self.skip_reading_prefix_cache = False
