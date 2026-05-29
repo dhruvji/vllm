@@ -598,6 +598,12 @@ class EngineCore:
         # Clean up cartridge shm files
         self._cleanup_cartridge_shm()
 
+        # Undo the gc.freeze() from __init__ so that the objects allocated
+        # during engine startup (model weights, KV caches, etc.) become
+        # visible to the garbage collector again. Without this, deleting
+        # the engine in-process (e.g. unit tests) leaks GPU memory.
+        gc.unfreeze()
+
     def _cleanup_cartridge_shm(self):
         """Clean up shared memory files for cartridges loaded from shm."""
         if not self._cartridge_shm_ids:
@@ -659,13 +665,9 @@ class EngineCore:
         self._pending_cartridge_overwrites[cartridge_id] = stacked_kv
         # Also update the engine core's own cache
         self._cartridge_kv_cache[cartridge_id] = stacked_kv
+        self._cartridge_shm_paths[cartridge_id] = cartridge_shm_path
+        self._cartridge_shm_ids.add(cartridge_id)
         return "queued"
-
-        # Undo the gc.freeze() from __init__ so that the objects allocated
-        # during engine startup (model weights, KV caches, etc.) become
-        # visible to the garbage collector again. Without this, deleting
-        # the engine in-process (e.g. unit tests) leaks GPU memory.
-        gc.unfreeze()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)

@@ -3,6 +3,7 @@ import threading
 import torch
 
 from vllm.v1 import cartridge_loader
+from vllm.v1.engine.core import EngineCore
 
 
 def _reset_shm_state() -> None:
@@ -123,3 +124,25 @@ def test_real_model_layer_indices_stack_in_sorted_attention_order():
 
     assert torch.equal(stacked_keys, torch.stack(expected_keys))
     assert torch.equal(stacked_values, torch.stack(expected_values))
+
+
+def test_engine_update_cartridge_tracks_shm_for_cleanup(monkeypatch):
+    engine = EngineCore.__new__(EngineCore)
+    engine._pending_cartridge_overwrites = {}
+    engine._cartridge_kv_cache = {}
+    engine._cartridge_shm_paths = {}
+    engine._cartridge_shm_ids = set()
+    stacked_kv = [torch.randn(1, 1, 2, 3), torch.randn(1, 1, 2, 3)]
+
+    monkeypatch.setattr(
+        "vllm.v1.engine.core.load_cartridge_from_shm",
+        lambda path: stacked_kv,
+    )
+
+    result = engine.update_cartridge("cart-1", "/tmp/cart-1.pt")
+
+    assert result == "queued"
+    assert engine._pending_cartridge_overwrites["cart-1"] is stacked_kv
+    assert engine._cartridge_kv_cache["cart-1"] is stacked_kv
+    assert engine._cartridge_shm_paths["cart-1"] == "/tmp/cart-1.pt"
+    assert "cart-1" in engine._cartridge_shm_ids
