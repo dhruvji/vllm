@@ -15,9 +15,9 @@ Supports multiple storage backends:
 This class is storage-agnostic and doesn't handle adapter-specific logic.
 """
 
+import glob as globlib
 import hashlib
 import json
-import logging
 import os
 import struct
 import threading
@@ -28,6 +28,7 @@ import filelock
 import torch
 from safetensors.torch import load as safetensors_load
 
+from vllm.logger import init_logger
 from vllm.path import Path
 
 
@@ -66,27 +67,6 @@ def _resolve_adapter_file(path_str: str) -> str:
 
 def _looks_like_adapter_file(path_str: str) -> bool:
     return path_str.endswith((".safetensors", ".pt", ".bin"))
-
-
-def _resolve_adapter_path(path: str | StdPath) -> str:
-    """Resolve adapter path, handling directories transparently.
-
-    If *path* points to a directory, looks for ``model.pt`` or
-    ``adapter_model.safetensors`` inside it.  Otherwise returns
-    the path as-is.  This lets callers pass either a directory
-    (e.g. an S3 prefix / checkpoint dir) or a direct file path.
-    """
-    p = StdPath(path)
-    if p.is_dir():
-        for candidate in ("model.pt", "adapter_model.safetensors"):
-            child = p / candidate
-            if child.exists():
-                return str(child)
-        raise FileNotFoundError(
-            f"Adapter directory {path} does not contain model.pt "
-            f"or adapter_model.safetensors"
-        )
-    return str(path)
 
 
 def _load_adapter(path: str | StdPath, **kwargs) -> dict:
@@ -173,7 +153,7 @@ def _read_file_bytes(path: str) -> bytes:
     logger.info("[read_file_bytes] %s: %d bytes", path, len(data))
     return data
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 MODAL_LOAD_RETRY_DELAY_SECONDS = 5.0
 FORCE_REDOWNLOAD_ENV_VAR = "VLLM_ADAPTER_FORCE_REDOWNLOAD"
@@ -249,7 +229,7 @@ class AdapterManager:
         self,
         adapter_id: str,
         force_redownload: bool = False,
-    ) -> torch.Tensor:
+    ) -> dict:
         """
         Get an adapter, downloading from S3 or loading from local/volume path.
 
@@ -290,8 +270,6 @@ class AdapterManager:
                 the destination size. boto3's download_file writes to a
                 temp file (*.XXXXXX) then renames atomically.
                 """
-                import glob as globlib
-
                 start_t = time.time()
                 stop_evt = threading.Event()
 
@@ -376,8 +354,6 @@ class AdapterManager:
 
             def _cleanup_temp_files() -> None:
                 """Remove stale boto3 temp files from previous interrupted downloads."""
-                import glob as globlib
-
                 temp_pattern = str(cache_path) + ".*"
                 for temp_file in globlib.glob(temp_pattern):
                     try:

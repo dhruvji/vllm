@@ -1,4 +1,7 @@
-# From elements -- refactor into shared engrams lib later
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Filesystem abstraction for local, S3, GCS, and Modal volume paths."""
+
 import asyncio
 import concurrent.futures
 import fnmatch
@@ -1381,7 +1384,7 @@ class ModalVolumeV2(Path):
         return self
 
     def glob(self, pattern):
-        local = self._mounted_local_path()
+        local = self._fresh_mounted_local_path()
         if local is not None:
             root = str(local)
             results = []
