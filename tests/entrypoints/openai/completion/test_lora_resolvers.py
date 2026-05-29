@@ -39,6 +39,13 @@ MOCK_RESOLVER_NAME = "mock_test_resolver"
             ],
         ),
         (
+            "s3://bucket/path/adapter.v1.safetensors",
+            [
+                "s3://bucket/path/adapter_config.json",
+                "s3://bucket/path/lora_config.json",
+            ],
+        ),
+        (
             "modal://volume/run/adapter_model.pt",
             [
                 "modal://volume/run/adapter_config.json",
