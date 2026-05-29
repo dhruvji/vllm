@@ -18,6 +18,12 @@ class PromptLogprobsWorker:
 
         self.uses_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=bool)
         self.num_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=np.int32)
+        self.prompt_logprobs_start_indices = np.zeros(
+            self.max_num_reqs, dtype=np.int32
+        )
+        self.prompt_logprobs_end_indices = np.full(
+            self.max_num_reqs, -1, dtype=np.int32
+        )
         # req_idx -> list of in-progress LogprobsTensors
         self.in_progress_prompt_logprobs: dict[str, list[LogprobsTensors]] = {}
 
@@ -25,6 +31,14 @@ class PromptLogprobsWorker:
         uses_prompt_logprobs = sampling_params.prompt_logprobs is not None
         self.uses_prompt_logprobs[req_idx] = uses_prompt_logprobs
         self.num_prompt_logprobs[req_idx] = sampling_params.prompt_logprobs or 0
+        self.prompt_logprobs_start_indices[req_idx] = (
+            sampling_params.prompt_logprobs_start_index or 0
+        )
+        self.prompt_logprobs_end_indices[req_idx] = (
+            sampling_params.prompt_logprobs_end_index
+            if sampling_params.prompt_logprobs_end_index is not None
+            else -1
+        )
         if uses_prompt_logprobs:
             self.in_progress_prompt_logprobs[req_id] = []
 
@@ -119,8 +133,6 @@ class PromptLogprobsWorker:
                     selected_token_ranks=prompt_ranks[start_idx:end_idx],
                 )
             )
-            logical_start = computed_prefill[i]
-            logical_end = logical_start + end_idx - start_idx
             target_start = max(int(prompt_logprobs_starts[i]), 1)
             target_end = int(prompt_logprobs_ends[i])
             if target_end < 0:
@@ -130,6 +142,25 @@ class PromptLogprobsWorker:
             target_start = min(target_start, target_end)
             range_start = target_start - 1
             range_end = target_end - 1
+            hidden_start = int(computed_prefill[i])
+            hidden_end = hidden_start + end_idx - start_idx
+            overlap_start = max(hidden_start, range_start)
+            overlap_end = min(hidden_end, range_end)
+            if logprobs is not None:
+                if overlap_start >= overlap_end:
+                    logprobs = None
+                else:
+                    slice_start = overlap_start - hidden_start
+                    slice_end = overlap_end - hidden_start
+                    logprobs = LogprobsTensors(
+                        logprob_token_ids=logprobs.logprob_token_ids[
+                            slice_start:slice_end
+                        ],
+                        logprobs=logprobs.logprobs[slice_start:slice_end],
+                        selected_token_ranks=logprobs.selected_token_ranks[
+                            slice_start:slice_end
+                        ],
+                    )
 
             prompt_logprobs_list = self.in_progress_prompt_logprobs[req_id]
             if logprobs is not None and (req_is_prompt_chunked or prompt_logprobs_list):
