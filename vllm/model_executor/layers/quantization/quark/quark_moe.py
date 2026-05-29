@@ -40,9 +40,6 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     prepare_fp8_moe_layer_for_marlin,
 )
-from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-    _swizzle_mxfp4,
-)
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
     OCP_MX_BLOCK_SIZE,
     OCP_MX_Scheme,
@@ -1080,27 +1077,6 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             self.mxfp4_backend is not None
             and self.mxfp4_backend != Mxfp4MoeBackend.EMULATION
         ):
-            hidden_size, intermediate_size_per_partition = (
-                mxfp4_round_up_hidden_size_and_intermediate_size(
-                    self.mxfp4_backend, hidden_size, intermediate_size_per_partition
-                )
-            )
-        return hidden_size, intermediate_size_per_partition
-
-    def maybe_roundup_sizes(
-        self,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        act_dtype: torch.dtype,
-        moe_parallel_config: FusedMoEParallelConfig,
-    ) -> tuple[int, int]:
-        hidden_size, intermediate_size_per_partition = super().maybe_roundup_sizes(
-            hidden_size=hidden_size,
-            intermediate_size_per_partition=intermediate_size_per_partition,
-            act_dtype=act_dtype,
-            moe_parallel_config=moe_parallel_config,
-        )
-        if self.mxfp4_backend is not None:
             hidden_size, intermediate_size_per_partition = (
                 mxfp4_round_up_hidden_size_and_intermediate_size(
                     self.mxfp4_backend, hidden_size, intermediate_size_per_partition

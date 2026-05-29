@@ -5,7 +5,6 @@ import fnmatch
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from transformers import PretrainedConfig
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -44,10 +43,6 @@ if TYPE_CHECKING:
 __all__ = ["QuarkLinearMethod"]
 
 logger = init_logger(__name__)
-
-# model_type values that use dynamic MXFP4 re-quantization for
-# OCP MX fp4 Quark checkpoints
-_DEEPSEEK_V3_FAMILY_MODEL_TYPES = frozenset({"deepseek_v3"})
 
 
 class QuarkConfig(QuantizationConfig):

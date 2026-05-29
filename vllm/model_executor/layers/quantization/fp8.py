@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
@@ -288,28 +289,7 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = self.weight_block_size is not None
         self.act_q_static = self.quant_config.activation_scheme == "static"
 
-        # Use per-token quantization for better perf if dynamic and cutlass
-        if self.act_q_static:
-            activation_quant_key = kFp8StaticTensorSym
-        elif cutlass_fp8_supported():
-            activation_quant_key = kFp8DynamicTokenSym
-        else:
-            activation_quant_key = kFp8DynamicTensorSym
-
         if self.block_quant:
-            weight_quant_key = kFp8Static128BlockSym
-        else:
-            weight_quant_key = kFp8StaticTensorSym
-
-        self.fp8_linear = init_fp8_linear_kernel(
-            activation_quant_key=activation_quant_key,
-            weight_quant_key=weight_quant_key,
-            out_dtype=torch.get_default_dtype(),
-            module_name=self.__class__.__name__,
-        )
-        self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
-
-        if self.block_quant and not self.use_marlin:
             assert not self.act_q_static
             assert self.weight_block_size is not None
 

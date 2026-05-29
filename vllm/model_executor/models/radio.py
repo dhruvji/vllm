@@ -788,9 +788,6 @@ class RadioModel(nn.Module):
                 weight_loader(param, weight)
                 loaded_params.add(vllm_key)
 
-        if "model.patch_generator.video_embedder.weight" in loaded_params:
-            self.model.patch_generator._video_embedder_loaded = True
-
         return loaded_params
 
     def _extract_final(

@@ -113,10 +113,6 @@ if HAS_TRITON:
     from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
         TritonOrDeepGemmExperts,
     )
-    from vllm.model_executor.layers.fused_moe.xpu_fused_moe import (
-        XPUExperts,
-        XPUExpertsFp8,
-    )
 
     __all__ += [
         "AiterExperts",

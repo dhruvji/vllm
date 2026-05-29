@@ -166,30 +166,6 @@ def fused_topk_bias(
             )
         else:
             raise ValueError(f"Unsupported scoring function: {scoring_func}")
-    elif rocm_aiter_ops.is_fused_moe_enabled() and scoring_func == "sigmoid":
-        M = hidden_states.size(0)
-        num_experts = gating_output.shape[-1]
-        num_expert_group = _aiter_get_num_expert_group(num_experts)
-        if topk >= num_expert_group:
-            topk_weights = torch.empty(
-                M, topk, dtype=torch.float32, device=hidden_states.device
-            )
-            topk_ids = torch.empty(
-                M,
-                topk,
-                dtype=torch.int32 if indices_type is None else indices_type,
-                device=hidden_states.device,
-            )
-            rocm_aiter_ops.biased_grouped_topk(
-                gating_output,
-                e_score_correction_bias.to(gating_output.dtype),
-                topk_weights,
-                topk_ids,
-                num_expert_group=num_expert_group,
-                topk_group=num_expert_group,
-                need_renorm=renormalize,
-            )
-            return topk_weights, topk_ids
 
     elif rocm_aiter_ops.is_fused_moe_enabled() and scoring_func == "sigmoid":
         M = hidden_states.size(0)

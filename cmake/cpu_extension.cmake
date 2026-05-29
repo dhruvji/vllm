@@ -326,14 +326,6 @@ if (ENABLE_X86_ISA OR (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND) OR POWER9_FOUND 
     set(ONEDNN_VERBOSE "ON")
     set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
-    # TODO: Refactor this
-    if (ENABLE_X86_ISA)
-        # Note: only enable oneDNN for AVX512
-        list(APPEND DNNL_COMPILE_FLAGS ${CXX_COMPILE_FLAGS_AVX512})
-    else()
-        list(APPEND DNNL_COMPILE_FLAGS ${CXX_COMPILE_FLAGS})
-    endif()
-
     set(VLLM_BUILD_TYPE ${CMAKE_BUILD_TYPE})
     set(CMAKE_BUILD_TYPE "Release") # remove oneDNN debug symbols to reduce size
     FetchContent_MakeAvailable(oneDNN)

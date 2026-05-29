@@ -2,17 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
+import hashlib
 import json
+import os
+import shutil
+import tempfile
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, Awaitable, Mapping
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, ClassVar, Generic, Protocol, TypeAlias, TypeVar
 
 import numpy as np
 from fastapi import Request
 from openai.types.responses import ToolChoiceFunction
 from pydantic import ConfigDict, TypeAdapter, ValidationError
+from safetensors.torch import save_file as safetensors_save_file
 from starlette.datastructures import Headers
 
 import vllm.envs as envs
@@ -71,10 +79,25 @@ from vllm.tracing import (
     log_tracing_disabled_warning,
 )
 from vllm.utils import random_uuid
+from vllm.utils.adapter_manager import get_adapter_manager
 from vllm.utils.async_utils import collect_from_async_generator
 from vllm.utils.mistral import is_mistral_tool_parser
+from vllm.v1.cartridge_loader import _resolve_glob, _spec_sources
 
 logger = init_logger(__name__)
+
+
+def _normalize_lora_runtime_path(lora_id: str) -> str:
+    if lora_id.startswith("file://"):
+        return lora_id.removeprefix("file://")
+    return os.path.expanduser(lora_id)
+
+
+def _requires_staged_lora_dir(lora_id: str) -> bool:
+    if lora_id.startswith(("s3://", "gs://", "modal://")):
+        return True
+    path = Path(_normalize_lora_runtime_path(lora_id))
+    return path.is_file() or path.suffix in {".safetensors", ".pt", ".bin"}
 
 
 class RendererRequest(Protocol):
@@ -157,6 +180,10 @@ class OpenAIServing:
         self.model_config = engine_client.model_config
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
+        self._prepared_lora_dirs: OrderedDict[str, str] = OrderedDict()
+        self._prepared_lora_dirs_max_size = 128
+        self._lora_staging_locks: dict[str, threading.Lock] = {}
+        self._lora_staging_locks_meta = threading.Lock()
         vllm_config = getattr(engine_client, "vllm_config", None)
         kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
         self.has_kv_connector = kv_transfer_config is not None
@@ -476,10 +503,6 @@ class OpenAIServing:
         lora_id: str,
         force_redownload: bool,
     ) -> str:
-        from safetensors.torch import save_file as safetensors_save_file
-
-        from vllm.utils.adapter_manager import get_adapter_manager
-
         lora_hash = hashlib.sha256(lora_id.encode()).hexdigest()[:16]
         lora_cache_dir = envs.VLLM_LORA_RESOLVER_CACHE_DIR or tempfile.gettempdir()
         local_lora_dir = Path(lora_cache_dir) / lora_hash
@@ -567,8 +590,6 @@ class OpenAIServing:
         if not isinstance(lora_specs, list):
             raise ValueError("`adapters.lora` must be a list.")
 
-        from vllm.v1.cartridge_loader import _resolve_glob
-
         if len(lora_specs) > 1:
             logger.warning(
                 "Multiple LoRA adapters detected (%d). Only the first one "
@@ -579,8 +600,6 @@ class OpenAIServing:
         lora_spec = lora_specs[0]
         if not isinstance(lora_spec, dict):
             raise ValueError("Each LoRA adapter spec must be an object.")
-
-        from vllm.v1.cartridge_loader import _spec_sources
 
         sources = _spec_sources(lora_spec)
         if not sources:

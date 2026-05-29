@@ -80,25 +80,6 @@ from .utils import (
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
-_TEXT_ONLY_MROPE_KEYS = frozenset(("mrope_section", "mrope_interleaved"))
-
-
-def _get_text_rope_parameters(
-    config: Qwen3NextConfig,
-    model_config: ModelConfig | None,
-):
-    rope_parameters = config.rope_parameters
-    if model_config is None or model_config.multimodal_config is None:
-        return rope_parameters
-    if not model_config.multimodal_config.language_model_only:
-        return rope_parameters
-    if rope_parameters is None:
-        return None
-    return {
-        key: value
-        for key, value in rope_parameters.items()
-        if key not in _TEXT_ONLY_MROPE_KEYS
-    }
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -277,7 +258,7 @@ class Qwen3NextAttention(nn.Module):
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             max_position=config.max_position_embeddings,
-            rope_parameters=_get_text_rope_parameters(config, model_config),
+            rope_parameters=config.rope_parameters,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
 
@@ -312,20 +293,19 @@ class Qwen3NextAttention(nn.Module):
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
-            num_tokens = q_gate.shape[0]
-            q_gate = q_gate.reshape(num_tokens, self.num_heads, 2 * self.head_dim)
+            orig_shape = q_gate.shape[:-1]
+            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(num_tokens, self.q_size)
-            gate = gate.reshape(num_tokens, self.q_size)
+            q = q.reshape(*orig_shape, -1)
+            gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            num_tokens = q.shape[0]
 
-        q = self.q_norm(q.reshape(num_tokens, self.num_heads, self.head_dim)).reshape(
-            num_tokens, self.q_size
+        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+            -1, self.num_heads * self.head_dim
         )
-        k = self.k_norm(k.reshape(num_tokens, self.num_kv_heads, self.head_dim)).reshape(
-            num_tokens, self.kv_size
+        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+            -1, self.num_kv_heads * self.head_dim
         )
 
         q, k = self.rotary_emb(positions, q, k)
