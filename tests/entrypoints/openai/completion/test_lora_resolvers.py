@@ -202,7 +202,11 @@ async def test_serving_completion_with_request_body_lora(mock_serving_setup):
     with suppress(Exception):
         await serving_completion.create_completion(req)
 
-    mock_engine.add_lora.assert_not_awaited()
+    mock_engine.add_lora.assert_awaited_once()
+    added_lora_request = mock_engine.add_lora.call_args[0][0]
+    assert isinstance(added_lora_request, LoRARequest)
+    assert added_lora_request.lora_name == "/fake/path/request-body-lora"
+    assert added_lora_request.lora_path == "/fake/path/request-body-lora"
 
     mock_engine.generate.assert_called_once()
     generated_lora_request = mock_engine.generate.call_args[1]["lora_request"]
