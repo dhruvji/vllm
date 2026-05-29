@@ -294,7 +294,6 @@ class CompilerManager:
                     "from the cache, took %.3f s",
                     str(compile_range),
                     elapsed,
-                    scope="local",
                 )
             return compiled_graph
 
@@ -379,7 +378,6 @@ class CompilerManager:
                 logger.info_once(
                     "Cache the graph of compile range %s for later use",
                     str(compile_range),
-                    scope="local",
                 )
             logger.debug_once(
                 "Store the %s-th graph for compile range%s from %s via handle %s",
@@ -387,7 +385,6 @@ class CompilerManager:
                 str(compile_range),
                 self.compiler.name,
                 handle,
-                scope="local",
             )
 
         # after compiling the last graph, record the end time
@@ -1152,11 +1149,6 @@ class VllmBackend:
             "Dynamo bytecode transform time: %.2f s",
             dynamo_time,
         )
-
-        # Record Dynamo time in tracing if available
-        start_time = int(torch_compile_start_time * 1e9)
-        attributes = {"dynamo.time_seconds": dynamo_time}
-        instrument_manual("Dynamo bytecode transform", start_time, None, attributes)
 
         # Record Dynamo time in tracing if available
         start_time = int(torch_compile_start_time * 1e9)

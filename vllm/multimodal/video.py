@@ -359,20 +359,6 @@ class OpenCVVideoBackendMixin:
             )
         return frames, valid_frame_indices
 
-    @classmethod
-    def read_frames(
-        cls,
-        cap: "cv2.VideoCapture",
-        frame_idx: list[int],
-        total_frames_num: int,
-        *,
-        frame_recovery: bool = False,
-    ) -> tuple[npt.NDArray, list[int]]:
-        if frame_recovery:
-            num_frames_to_sample = len(frame_idx)
-            frames, valid_frame_indices, recovered_map = cls._read_frames_with_recovery(
-                cap, frame_idx, total_frames_num
-            )
 
 class PyAVVideoBackendMixin:
     """PyAV (in-process FFmpeg bindings) codec utilities.
@@ -591,7 +577,6 @@ class DynamicVideoBackend(VideoBackend):
         fps = target.fps
         max_frame_idx = source.total_frames_num - 1
 
-        max_frame_idx = source.total_frames_num - 1
         # Refer to:
         # https://github.com/huggingface/transformers/blob/v4.55.4/src/transformers/models/glm4v/video_processing_glm4v.py#L103-L140
         frame_indices_list: list[int]

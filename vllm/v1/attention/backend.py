@@ -172,10 +172,6 @@ class AttentionBackend(ABC):
         )
 
     @classmethod
-    def is_ssm(cls) -> bool:
-        return False
-
-    @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
         if block_size is None:
             return True
@@ -301,8 +297,6 @@ class AttentionBackend(ABC):
             invalid_reasons.append(
                 "partial multimodal token full attention not supported"
             )
-        if use_per_head_quant_scales and not cls.supports_per_head_quant_scales():
-            invalid_reasons.append("per-head quant scales not supported")
         if use_mla != cls.is_mla():
             if use_mla:
                 invalid_reasons.append("MLA not supported")
@@ -845,8 +839,6 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         """
         raise NotImplementedError
 
-class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
-    """MLA attention implementation with forward_mqa and forward_mha methods."""
 
 class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     """MLA attention implementation with forward_mqa and forward_mha methods."""

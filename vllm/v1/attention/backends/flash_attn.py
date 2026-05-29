@@ -375,23 +375,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.max_num_splits = (
                 self.attention_config.flash_attn_max_num_splits_for_cuda_graph
             )
-            # Pre-allocate scheduler metadata buffer. The size must account for
-            # max_num_splits since FA3's get_scheduler_metadata() returns a
-            # tensor sized proportionally to batch_size * num_splits.
-            self.scheduler_metadata = torch.zeros(
-                (vllm_config.scheduler_config.max_num_seqs + 1)
-                * self.max_num_splits,
-                dtype=torch.int32,
-                device=self.device,
-            )
-
-        if self.dcp_world_size > 1:
-            max_num_reqs = vllm_config.scheduler_config.max_num_seqs
-            self._dcp_context_kv_lens = torch.zeros(
-                max_num_reqs,
-                dtype=torch.int32,
-                device=self.device,
-            )
 
         if self.dcp_world_size > 1:
             max_num_reqs = vllm_config.scheduler_config.max_num_seqs
@@ -566,12 +549,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # For FA3 + full cudagraph
         if self.use_full_cuda_graph and scheduler_metadata is not None:
             n = scheduler_metadata.shape[0]
-            # Ensure the persistent buffer is large enough
-            assert n <= self.scheduler_metadata.shape[0], (
-                f"Scheduler metadata size {n} exceeds buffer size "
-                f"{self.scheduler_metadata.shape[0]}. This can happen if "
-                f"max_num_splits is too small for the batch configuration."
-            )
             self.scheduler_metadata[:n] = scheduler_metadata
             # NOTE(woosuk): We should zero out the rest of the scheduler
             # metadata to guarantee the correctness. Otherwise, some thread

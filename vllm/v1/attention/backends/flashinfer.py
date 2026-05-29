@@ -925,9 +925,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             has_sinks=self.has_sinks,
             has_spec=uses_spec_reorder,
         )
-        # KV transfer requires non-contiguous KV cache views, incompatible with TRTLLM
-        if self._kv_transfer_enabled:
-            prefill_use_trtllm = False
         decode_use_trtllm = (
             self.use_trtllm_decode_attention and self.dcp_world_size <= 1
         )

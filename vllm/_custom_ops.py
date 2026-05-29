@@ -275,10 +275,18 @@ def mla_decode_kvcache_cpu(
 
 # merge attn states ops
 @lru_cache
+def merge_attn_states_schema() -> str:
+    return str(torch.ops._C.merge_attn_states.default._schema)
+
+
+@lru_cache
 def merge_attn_states_supports_prefill_tokens_with_context() -> bool:
-    return "prefill_tokens_with_context" in str(
-        torch.ops._C.merge_attn_states.default._schema
-    )
+    return "prefill_tokens_with_context" in merge_attn_states_schema()
+
+
+@lru_cache
+def merge_attn_states_supports_output_scale() -> bool:
+    return "output_scale" in merge_attn_states_schema()
 
 
 def merge_attn_states(
@@ -292,6 +300,30 @@ def merge_attn_states(
     output_scale: torch.Tensor | None = None,
 ) -> None:
     if merge_attn_states_supports_prefill_tokens_with_context():
+        if merge_attn_states_supports_output_scale():
+            torch.ops._C.merge_attn_states(
+                output,
+                output_lse,
+                prefix_output,
+                prefix_lse,
+                suffix_output,
+                suffix_lse,
+                prefill_tokens_with_context,
+                output_scale,
+            )
+        else:
+            torch.ops._C.merge_attn_states(
+                output,
+                output_lse,
+                prefix_output,
+                prefix_lse,
+                suffix_output,
+                suffix_lse,
+                prefill_tokens_with_context,
+            )
+        return
+
+    if merge_attn_states_supports_output_scale():
         torch.ops._C.merge_attn_states(
             output,
             output_lse,
@@ -299,20 +331,17 @@ def merge_attn_states(
             prefix_lse,
             suffix_output,
             suffix_lse,
-            prefill_tokens_with_context,
+            output_scale,
         )
-        return
-
-    torch.ops._C.merge_attn_states(
-        output,
-        output_lse,
-        prefix_output,
-        prefix_lse,
-        suffix_output,
-        suffix_lse,
-        prefill_tokens_with_context,
-        output_scale,
-    )
+    else:
+        torch.ops._C.merge_attn_states(
+            output,
+            output_lse,
+            prefix_output,
+            prefix_lse,
+            suffix_output,
+            suffix_lse,
+        )
 
 
 def convert_vertical_slash_indexes(

@@ -12,7 +12,6 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv

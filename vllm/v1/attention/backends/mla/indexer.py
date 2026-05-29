@@ -195,8 +195,6 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
-    use_large_context_topk: bool
-    offsets: torch.Tensor | None  # Precomputed offsets for speculative decoding
 
 
 @dataclass
@@ -626,8 +624,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,
-                use_large_context_topk=use_large_context_topk,
-                offsets=offsets,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

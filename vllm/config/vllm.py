@@ -155,19 +155,6 @@ def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
     )
 
 
-def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable if TP > 1 and Hopper+ and flashinfer installed."""
-    from vllm.platforms import current_platform
-    from vllm.utils.flashinfer import has_flashinfer
-
-    return (
-        cfg.parallel_config.tensor_parallel_size > 1
-        and current_platform.is_cuda()
-        and current_platform.has_device_capability(90)
-        and has_flashinfer()
-    )
-
-
 def enable_norm_pad_fusion(cfg: "VllmConfig") -> bool:
     """Enable if using AITER RMSNorm and hidden size is 2880 i.e. gpt-oss."""
 
@@ -312,8 +299,6 @@ class VllmConfig:
     """LoRA configuration."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
-    reasoning_config: ReasoningConfig | None = None
-    """Reasoning configuration."""
     structured_outputs_config: StructuredOutputsConfig = Field(
         default_factory=StructuredOutputsConfig
     )
@@ -1092,14 +1077,6 @@ class VllmConfig:
 
         self._set_max_num_scheduled_tokens()
 
-        if self.compilation_config.fast_moe_cold_start is None:
-            # resolve default behavior: try to be as safe as possible
-            # this config is unsafe if any spec decoding draft model has a MOE.
-            # We'll conservatively turn it off if we see spec decoding.
-            self.compilation_config.fast_moe_cold_start = (
-                self.speculative_config is None
-            )
-
         if current_platform.support_static_graph_mode():
             # if cudagraph_mode has full cudagraphs, we need to check support
             if model_config := self.model_config:
@@ -1109,15 +1086,6 @@ class VllmConfig:
                 ):
                     logger.warning_once(
                         "Pooling models do not support full cudagraphs. "
-                        "Overriding cudagraph_mode to PIECEWISE."
-                    )
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-                elif (
-                    self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-                    and model_config.is_hybrid
-                ):
-                    logger.warning_once(
-                        "Hybrid/Mamba models do not support full cudagraphs. "
                         "Overriding cudagraph_mode to PIECEWISE."
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE

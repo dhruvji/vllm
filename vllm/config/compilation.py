@@ -139,9 +139,6 @@ class PassConfig:
     enable_qk_norm_rope_fusion: bool = False
     """Enable fused Q/K RMSNorm + RoPE pass."""
 
-    fuse_rope_kvcache: bool = Field(default=None)
-    """Enable RoPE + KV-cache update fusion."""
-
     # ROCm/AITER specific fusions
     fuse_act_padding: bool = None  # type: ignore[assignment]
     """Fuse the custom RMSNorm + padding ops."""
@@ -154,12 +151,6 @@ class PassConfig:
     """The threshold for ROCm AITER RoPE+KVCache fusion e.g. for small batch decode.
     Larger batch sizes e.g. during prefill will use the unfused kernels.
     """
-
-    rope_kvcache_fusion_max_token_num: int = 256
-    """Maximum token count at which RoPE + KV-cache fusion is applied."""
-
-    sp_min_token_num: int | None = None
-    """Minimum token threshold for enabling sequence parallelism."""
 
     fi_allreduce_fusion_max_size_mb: float | None = None
     """The threshold of the communicated tensor sizes under which
@@ -234,7 +225,6 @@ class PassConfig:
         "enable_sp",
         "fuse_gemm_comms",
         "fuse_allreduce_rms",
-        "fuse_rope_kvcache",
         "fuse_act_padding",
         "fuse_mla_dual_rms_norm",
         "fuse_rope_kvcache",
@@ -265,11 +255,6 @@ class PassConfig:
                 logger.warning_once(
                     "Fusion enabled but reshape elimination disabled. "
                     "Allreduce + rms norm + quant (fp8) fusion might not work"
-                )
-            if self.fuse_rope_kvcache:
-                logger.warning_once(
-                    "Fusion enabled but reshape elimination disabled. "
-                    "RoPE + KV-cache fusion might not work"
                 )
             if self.fuse_act_padding:
                 logger.warning_once(

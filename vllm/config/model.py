@@ -748,18 +748,6 @@ class ModelConfig:
                 f"got {type(self.max_model_len).__name__}: {self.max_model_len!r}. "
                 "Example: max_model_len=2048"
             )
-        if (
-            self.multimodal_config is not None
-            and self.renderer_num_workers > 1
-            and self.multimodal_config.mm_processor_cache_gb > 0
-        ):
-            raise ValueError(
-                "Cannot use --renderer-num-workers > 1 with the multimodal "
-                "processor cache enabled. The MM processor cache is not "
-                "thread-safe across renderer workers. Please set "
-                "--renderer-num-workers 1 (the default), or disable the "
-                "MM processor cache with --mm-processor-cache-gb 0."
-            )
         return self
 
     def _get_transformers_backend_cls(self) -> str:
@@ -1575,11 +1563,6 @@ class ModelConfig:
             if self.convert_type == "classify"
             else self._model_info.score_type
         )
-
-    @property
-    def is_late_interaction(self) -> bool:
-        """Check if model uses late interaction (ColBERT-style) scoring."""
-        return self._model_info.supports_late_interaction
 
     @property
     def is_pp_supported(self) -> bool:

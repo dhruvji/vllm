@@ -1038,16 +1038,6 @@ if _is_cpu():
     else:
         ext_modules.append(CMakeExtension(name="vllm._C"))
 
-if _is_cpu():
-    import platform
-
-    if platform.machine() in ("x86_64", "AMD64"):
-        ext_modules.append(CMakeExtension(name="vllm._C"))
-        ext_modules.append(CMakeExtension(name="vllm._C_AVX512"))
-        ext_modules.append(CMakeExtension(name="vllm._C_AVX2"))
-    else:
-        ext_modules.append(CMakeExtension(name="vllm._C"))
-
 if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
     # also _is_hip() once https://github.com/vllm-project/vllm/issues/35163 is
