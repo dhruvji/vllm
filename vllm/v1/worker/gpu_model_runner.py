@@ -1390,21 +1390,21 @@ class GPUModelRunner(
             if req_id is None:
                 continue
             self.cartridge_position_offsets.pop(req_id, None)
-            cartridge_id = (
+            finished_cartridge_id = (
                 self._request_to_cartridge.pop(req_id)
                 if req_id in self._request_to_cartridge
                 else None
             )
-            if cartridge_id is not None:
-                self._cartridge_ref_counts[cartridge_id] -= 1
-                if self._cartridge_ref_counts[cartridge_id] <= 0:
-                    del self._cartridge_ref_counts[cartridge_id]
-                    if cartridge_id in self.gpu_cartridge_cache:
-                        del self.gpu_cartridge_cache[cartridge_id]
+            if finished_cartridge_id is not None:
+                self._cartridge_ref_counts[finished_cartridge_id] -= 1
+                if self._cartridge_ref_counts[finished_cartridge_id] <= 0:
+                    del self._cartridge_ref_counts[finished_cartridge_id]
+                    if finished_cartridge_id in self.gpu_cartridge_cache:
+                        del self.gpu_cartridge_cache[finished_cartridge_id]
                         if _CARTRIDGE_DEBUG_TIMING:
                             logger.info(
                                 "[cartridge-cleanup] Freed GPU cache for %s",
-                                cartridge_id,
+                                finished_cartridge_id,
                             )
 
         if self.routed_experts_initialized:
