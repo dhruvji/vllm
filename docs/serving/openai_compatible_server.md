@@ -283,8 +283,6 @@ Code example: [examples/speech_to_text/openai/openai_transcription_client.py](..
 
 NOTE: beam search is currently supported in the transcriptions endpoint for encoder-decoder multimodal models, e.g., whisper, but highly inefficient as work for handling the encoder/decoder cache is actively ongoing. This is an active point of ongoing optimization and will be handled properly in the very near future.
 
-NOTE: beam search is currently supported in the transcriptions endpoint for encoder-decoder multimodal models, e.g., whisper, but highly inefficient as work for handling the encoder/decoder cache is actively ongoing. This is an active point of ongoing optimization and will be handled properly in the very near future.
-
 #### API Enforced Limits
 
 Set the maximum audio file size (in MB) that VLLM will accept, via the

@@ -145,11 +145,6 @@ mkdocs.yaml @hmellor
 /vllm/transformers_utils/configs/*nemotron* @tomeras91
 /tests/**/*nemotron* @tomeras91
 
-# Nemotron-specific files
-/vllm/model_executor/models/*nemotron* @tomeras91
-/vllm/transformers_utils/configs/*nemotron* @tomeras91
-/tests/**/*nemotron* @tomeras91
-
 # Qwen-specific files
 /vllm/model_executor/models/qwen* @sighingnow @vadiklyutiy
 /vllm/transformers_utils/configs/qwen* @sighingnow @vadiklyutiy
