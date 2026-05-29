@@ -36,14 +36,21 @@ from vllm.utils.adapter_manager import get_adapter_manager
 
 logger = init_logger(__name__)
 
-# Directory for cartridge IPC files
-# Use /root/.cache/vllm/cartridges instead of /dev/shm for Modal compatibility
-# Modal volumes are shared across processes, /dev/shm is not
-SHM_CARTRIDGE_DIR = "/root/.cache/vllm/cartridges"
+def _vllm_cache_root() -> str:
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    if cache_home:
+        return os.path.join(cache_home, "vllm")
+    return "/root/.cache/vllm"
 
-# Directory for checkpoint resolution cache
-# Shared volume for caching latest.txt timestamps across containers
-CHECKPOINT_CACHE_DIR = "/root/.cache/vllm/checkpoint_cache"
+
+# Directory for cartridge IPC files. Use the vLLM cache root instead of /dev/shm
+# for Modal compatibility; Modal volumes are shared across processes, /dev/shm is
+# not. BaseTen sets XDG_CACHE_HOME to a writable runtime cache.
+SHM_CARTRIDGE_DIR = os.path.join(_vllm_cache_root(), "cartridges")
+
+# Directory for checkpoint resolution cache. This is shared process-local state
+# for caching latest.txt timestamps across containers.
+CHECKPOINT_CACHE_DIR = os.path.join(_vllm_cache_root(), "checkpoint_cache")
 
 # How often to check for new checkpoints (seconds)
 CHECKPOINT_CHECK_INTERVAL = 30
