@@ -30,7 +30,6 @@ from vllm.v1.sample.logits_processor import (
     MinPLogitsProcessor,
     MinTokensLogitsProcessor,
     MoveDirectionality,
-    ThinkingTokenBudgetLogitsProcessor,
     build_logitsprocs,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -56,11 +55,6 @@ STR_NO_LOGITPROC = "none"
 STR_THINKING_BUDGET = "thinking_budget"
 
 # Thinking token budget testing constants
-THINKING_TOKEN_BUDGET = 5
-THINK_START_TOKEN_ID = 999
-THINK_END_TOKEN_ID = 998
-
-# ThinkingTokenBudgetLogitsProcessor testing constants
 THINKING_TOKEN_BUDGET = 5
 THINK_START_TOKEN_ID = 999
 THINK_END_TOKEN_ID = 998
@@ -191,24 +185,6 @@ def _generate_test_fakes(batch_size: int, device: str) -> LogitsprocsTestFakes:
         logits=fake_logits,
         sampling_metadata=sampling_metadata,
     )
-
-
-def test_build_logitsprocs_without_reasoning_config() -> None:
-    vllm_config = VllmConfig()
-
-    logitsprocs = build_logitsprocs(
-        vllm_config=vllm_config,
-        device=torch.device("cpu"),
-        is_pin_memory=False,
-        is_pooling_model=False,
-    )
-
-    thinking_logitproc = next(
-        lp
-        for lp in logitsprocs.all
-        if isinstance(lp, ThinkingTokenBudgetLogitsProcessor)
-    )
-    assert thinking_logitproc.is_enabled is False
 
 
 def _sampling_params_from_logitproc(logitproc_type: LogitprocType) -> SamplingParams:
