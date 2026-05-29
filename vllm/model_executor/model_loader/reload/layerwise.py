@@ -317,10 +317,6 @@ def _reload_attention_scales(layer: torch.nn.Module, info: LayerReloadingInfo) -
     _copy_and_restore_kernel_tensors(layer, info)
 
 
-def finalize_layerwise_reload(*args, **kwargs):
-    finalize_layerwise_processing(*args, **kwargs)
-
-
 def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
     """
     Finalize layer loading after all weights have been buffered.
