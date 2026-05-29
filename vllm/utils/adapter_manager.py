@@ -159,6 +159,14 @@ MODAL_LOAD_RETRY_DELAY_SECONDS = 5.0
 FORCE_REDOWNLOAD_ENV_VAR = "VLLM_ADAPTER_FORCE_REDOWNLOAD"
 
 
+def _default_cache_dir() -> StdPath:
+    """Default adapter cache dir, respecting managed-runtime cache settings."""
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    if cache_home:
+        return StdPath(cache_home) / "vllm" / "adapters"
+    return StdPath(os.path.expanduser("~")) / ".cache" / "vllm" / "adapters"
+
+
 def _normalize_adapter_id(adapter_id: str) -> str:
     """Trim accidental surrounding whitespace without changing the path body."""
     normalized = adapter_id.strip()
@@ -194,12 +202,11 @@ class AdapterManager:
 
         Args:
             cache_dir: Directory to cache downloaded adapters.
-                      Defaults to ~/.cache/vllm/adapters
+                      Defaults to $XDG_CACHE_HOME/vllm/adapters when set,
+                      otherwise ~/.cache/vllm/adapters.
         """
         if cache_dir is None:
-            cache_dir = os.path.join(
-                os.path.expanduser("~"), ".cache", "vllm", "adapters"
-            )
+            cache_dir = str(_default_cache_dir())
 
         self.cache_dir = StdPath(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)

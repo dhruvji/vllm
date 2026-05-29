@@ -8,6 +8,13 @@ import pytest
 from vllm.utils.adapter_manager import FORCE_REDOWNLOAD_ENV_VAR, AdapterManager
 
 
+@patch.dict("os.environ", {"XDG_CACHE_HOME": "/tmp/vllm-xdg-cache"})
+def test_default_cache_dir_respects_xdg_cache_home():
+    manager = AdapterManager()
+
+    assert str(manager.cache_dir) == "/tmp/vllm-xdg-cache/vllm/adapters"
+
+
 @patch("vllm.utils.adapter_manager.time.sleep")
 @patch("vllm.utils.adapter_manager._load_adapter")
 @patch("vllm.utils.adapter_manager.Path")
