@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import traceback
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
@@ -119,9 +119,8 @@ class EngineCore:
 
         self.log_stats = log_stats
         # Cache learned cartridge KV on the engine core to avoid repeated IPC.
-        # Use OrderedDict for LRU eviction — only keep the 20 most recent
+        # Use OrderedDict for LRU eviction; keep only the 20 most recent
         # cartridges to prevent unbounded CPU memory growth (~500MB each).
-        from collections import OrderedDict
         self._cartridge_kv_cache: OrderedDict[str, list[torch.Tensor]] = OrderedDict()
         self._cartridge_kv_cache_max_size: int = 20
         # Track cartridge shm paths for reload after LRU eviction
@@ -374,20 +373,6 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
-    def pause_scheduler(self) -> None:
-        """Pause the scheduler, keeping requests frozen in queue.
-
-        Requests are kept frozen in queue and can be resumed later.
-        """
-        self._scheduler_paused = True
-
-    def resume_scheduler(self) -> None:
-        """Resume the scheduler after a pause.
-
-        Resumes processing of frozen requests in the queue.
-        """
-        self._scheduler_paused = False
-
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""
@@ -440,10 +425,6 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-
-        # If paused, don't schedule any work.
-        if self._scheduler_paused:
-            return {}, False
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.

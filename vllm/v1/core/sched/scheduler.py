@@ -263,8 +263,6 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
-        self._pause_state: PauseState = PauseState.UNPAUSED
-
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -1914,13 +1912,6 @@ class Scheduler(SchedulerInterface):
 
     def has_finished_requests(self) -> bool:
         return len(self.finished_req_ids) > 0
-
-    @property
-    def pause_state(self) -> PauseState:
-        return self._pause_state
-
-    def set_pause_state(self, pause_state: PauseState) -> None:
-        self._pause_state = pause_state
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
