@@ -1192,8 +1192,6 @@ class DPAsyncMPClient(AsyncMPClient):
         self.lb_engines: list[list[int]] = [[0, 0] for _ in self.core_engines]
         self.eep_scaling_cache: ElasticScalingCache | None = None
 
-        self.eep_scaling_cache: ElasticScalingCache | None = None
-
         self.first_req_sock_addr = get_open_zmq_inproc_path()
         self.first_req_send_socket = self.resources.first_req_send_socket = (
             make_zmq_socket(self.ctx, self.first_req_sock_addr, zmq.PAIR, bind=True)
