@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -262,6 +262,11 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # cartridge_id -> [stacked_keys, stacked_values] for mid-generation KV
+    # overwrites. The worker applies these to live requests using that
+    # cartridge. Empty for ordinary requests.
+    cartridge_overwrites: dict[str, "list[torch.Tensor]"] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

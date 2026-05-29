@@ -632,7 +632,9 @@ class EngineCore:
         if not self._pending_cartridge_overwrites:
             return
 
-        attached_ids: set[str] = set()
+        scheduler_output.cartridge_overwrites.update(
+            self._pending_cartridge_overwrites
+        )
         for new_req_data in scheduler_output.scheduled_new_reqs:
             cartridge_id = new_req_data.cartridge_id
             if cartridge_id not in self._pending_cartridge_overwrites:
@@ -641,10 +643,8 @@ class EngineCore:
                 cartridge_id
             ]
             new_req_data.cartridge_cache_hit = False
-            attached_ids.add(cartridge_id)
 
-        for cartridge_id in attached_ids:
-            del self._pending_cartridge_overwrites[cartridge_id]
+        self._pending_cartridge_overwrites.clear()
 
     def _maybe_pipeline_cartridge_update(self, request: EngineCoreRequest) -> None:
         if (
