@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import gc
 import faulthandler
+import gc
 import os
 import queue
 import signal
 import sys
-import traceback
 import threading
 import time
+import traceback
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
@@ -27,7 +27,6 @@ import zmq
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
-import vllm.envs as envs
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
@@ -44,6 +43,7 @@ from vllm.utils.gc_utils import (
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.v1.cartridge_loader import cleanup_cartridge_shm, load_cartridge_from_shm
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
@@ -621,17 +621,55 @@ class EngineCore:
         """Clean up shared memory files for cartridges loaded from shm."""
         if not self._cartridge_shm_ids:
             return
-        from vllm.v1.cartridge_loader import cleanup_cartridge_shm
         for cartridge_id in list(self._cartridge_shm_ids):
             cleanup_cartridge_shm(cartridge_id)
         self._cartridge_shm_ids.clear()
         self._cartridge_kv_cache.clear()
 
+    def _attach_pending_cartridge_overwrites(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        if not self._pending_cartridge_overwrites:
+            return
+
+        attached_ids: set[str] = set()
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            cartridge_id = new_req_data.cartridge_id
+            if cartridge_id not in self._pending_cartridge_overwrites:
+                continue
+            new_req_data.cartridge_kv = self._pending_cartridge_overwrites[
+                cartridge_id
+            ]
+            new_req_data.cartridge_cache_hit = False
+            attached_ids.add(cartridge_id)
+
+        for cartridge_id in attached_ids:
+            del self._pending_cartridge_overwrites[cartridge_id]
+
+    def _maybe_pipeline_cartridge_update(self, request: EngineCoreRequest) -> None:
+        if (
+            not request.cartridge_allow_pipelining
+            or request.cartridge_id is None
+            or request.cartridge_shm_path is None
+        ):
+            return
+
+        stacked_kv = load_cartridge_from_shm(request.cartridge_shm_path)
+        if stacked_kv is None:
+            raise ValueError(
+                f"Failed to load cartridge from {request.cartridge_shm_path}"
+            )
+
+        self._pending_cartridge_overwrites[request.cartridge_id] = stacked_kv
+        self._cartridge_kv_cache[request.cartridge_id] = stacked_kv
+        self._cartridge_shm_paths[request.cartridge_id] = request.cartridge_shm_path
+        self._cartridge_shm_ids.add(request.cartridge_id)
+        request.cartridge_kv = stacked_kv
+
     def update_cartridge(
         self, cartridge_id: str, cartridge_shm_path: str
     ) -> str:
         """Queue a cartridge KV overwrite for the next step."""
-        from vllm.v1.cartridge_loader import load_cartridge_from_shm
         stacked_kv = load_cartridge_from_shm(cartridge_shm_path)
         if stacked_kv is None:
             raise ValueError(
@@ -846,8 +884,6 @@ class EngineCore:
         # Handle cartridge KV: load from shm if path provided, otherwise use IPC tensor
         if request.cartridge_id:
             if request.cartridge_id not in self._cartridge_kv_cache:
-                from vllm.v1.cartridge_loader import load_cartridge_from_shm
-
                 shm_path = (
                     request.cartridge_shm_path
                     or self._cartridge_shm_paths.get(request.cartridge_id)
@@ -862,13 +898,17 @@ class EngineCore:
                         request.cartridge_kv = stacked_kv
                 elif request.cartridge_kv is not None:
                     # Fallback: use IPC tensor (legacy path)
-                    self._cartridge_kv_cache[request.cartridge_id] = request.cartridge_kv
+                    self._cartridge_kv_cache[request.cartridge_id] = (
+                        request.cartridge_kv
+                    )
 
                 # LRU eviction: remove oldest cartridge to prevent unbounded
                 # CPU memory growth (~500MB per cartridge for prefix adapters).
                 # Note: we keep _cartridge_shm_paths so we can reload if needed.
                 while len(self._cartridge_kv_cache) > self._cartridge_kv_cache_max_size:
-                    evicted_id, evicted_kv = self._cartridge_kv_cache.popitem(last=False)
+                    evicted_id, evicted_kv = self._cartridge_kv_cache.popitem(
+                        last=False
+                    )
                     del evicted_kv
                     self._cartridge_shm_ids.discard(evicted_id)
             else:
