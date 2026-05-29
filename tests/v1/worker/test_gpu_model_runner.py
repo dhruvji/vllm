@@ -1187,6 +1187,38 @@ def test_update_hybrid_attention_mamba_layout_with_num_block_2_rewrites_stride()
         which was ambiguous before get_kv_cache_block_dim was used"""
 
 
+def test_cartridge_prepopulate_targets_skip_gdn_attention_groups():
+    class GDNAttentionBackend:
+        pass
+
+    class FlashInferBackend:
+        pass
+
+    runner_stub = SimpleNamespace(
+        attn_groups=[
+            [
+                AttentionGroup(
+                    GDNAttentionBackend,
+                    ["model.layers.0.self_attn"],
+                    None,
+                    0,
+                ),
+                AttentionGroup(
+                    FlashInferBackend,
+                    ["model.layers.3.self_attn", "model.layers.7.self_attn"],
+                    None,
+                    0,
+                ),
+            ]
+        ],
+    )
+
+    assert GPUModelRunner._get_cartridge_layer_targets(runner_stub, 0) == [
+        (3, "FlashInferBackend"),
+        (7, "FlashInferBackend"),
+    ]
+
+
 def test_hybrid_block_table_initialization():
     """Test hybrid block table with different kernel and kvcache_manager block
     sizes."""

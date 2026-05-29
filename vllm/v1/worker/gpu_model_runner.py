@@ -90,6 +90,7 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
@@ -1086,6 +1087,215 @@ class GPUModelRunner(
             stream = torch.cuda.Stream()
             self.async_output_copy_stream = stream
         return stream
+
+    def _prepare_cartridge_kv(
+        self,
+        stacked_keys: torch.Tensor,
+        stacked_values: torch.Tensor,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Validate, shard, transpose, and transfer cartridge KV to GPU."""
+        total_kv_heads = self.model_config.get_total_num_kv_heads()
+        expected_head_size = self.model_config.get_head_size()
+        expected_num_layers = self.model_config.get_num_layers_by_block_type(
+            self.parallel_config, "attention"
+        )
+        cart_num_layers, cart_kv_heads, cart_seq_len, cart_head_dim = (
+            stacked_keys.shape
+        )
+        if cart_num_layers != expected_num_layers:
+            raise ValueError(
+                f"Cartridge incompatible with model: "
+                f"num_attention_layers={cart_num_layers} but model expects "
+                f"{expected_num_layers}."
+            )
+        if cart_kv_heads != total_kv_heads:
+            raise ValueError(
+                f"Cartridge incompatible with model: "
+                f"num_kv_heads={cart_kv_heads} but model expects "
+                f"{total_kv_heads}."
+            )
+        if cart_head_dim != expected_head_size:
+            raise ValueError(
+                f"Cartridge incompatible with model: "
+                f"head_dim={cart_head_dim} but model expects "
+                f"{expected_head_size}."
+            )
+
+        tp_size = self.parallel_config.tensor_parallel_size
+        if tp_size > 1 and total_kv_heads >= tp_size:
+            tp_rank = get_tp_group().rank_in_group
+            heads_per_gpu = total_kv_heads // tp_size
+            start_head = tp_rank * heads_per_gpu
+            end_head = start_head + heads_per_gpu
+            stacked_keys = stacked_keys[:, start_head:end_head, :, :].contiguous()
+            stacked_values = stacked_values[:, start_head:end_head, :, :].contiguous()
+
+        layer_kv_list = []
+        for layer_idx in range(cart_num_layers):
+            layer_keys = stacked_keys[layer_idx].transpose(0, 1).contiguous()
+            layer_values = stacked_values[layer_idx].transpose(0, 1).contiguous()
+            layer_keys = layer_keys.to(self.device, dtype=self.kv_cache_dtype)
+            layer_values = layer_values.to(self.device, dtype=self.kv_cache_dtype)
+            layer_kv_list.append((layer_keys, layer_values))
+        return layer_kv_list
+
+    @staticmethod
+    def _is_cartridge_supported_backend(backend_name: str) -> bool:
+        return (
+            "FlashAttention" in backend_name
+            or "FlashInfer" in backend_name
+            or "TritonAttention" in backend_name
+        )
+
+    @staticmethod
+    def _get_cartridge_cache_writer(backend_name: str):
+        if "FlashAttention" in backend_name:
+            kv_dim = 0
+            from vllm.v1.attention.backends.fa_utils import (
+                reshape_and_cache_flash as reshape_and_cache,
+            )
+        elif "FlashInfer" in backend_name:
+            kv_dim = 1
+            from vllm.v1.attention.backends.fa_utils import (
+                reshape_and_cache_flash as reshape_and_cache,
+            )
+        elif "TritonAttention" in backend_name:
+            kv_dim = 1
+            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                triton_reshape_and_cache_flash as reshape_and_cache,
+            )
+        else:
+            raise NotImplementedError(
+                f"Cartridge prepopulation not supported for backend: "
+                f"{backend_name}. Only FlashAttention, FlashInfer, and Triton "
+                f"are supported."
+            )
+        return kv_dim, reshape_and_cache
+
+    def _get_cartridge_layer_targets(
+        self,
+        kv_cache_group_id: int,
+    ) -> list[tuple[int, str]]:
+        targets: list[tuple[int, str]] = []
+        for attn_group in self.attn_groups[kv_cache_group_id]:
+            backend_name = attn_group.backend.__name__
+            if not self._is_cartridge_supported_backend(backend_name):
+                continue
+            for layer_name in attn_group.layer_names:
+                targets.append((extract_layer_index(layer_name), backend_name))
+        return sorted(targets)
+
+    def _prepopulate_cartridge_to_cache(
+        self,
+        block_ids: tuple[list[int], ...],
+        layer_kv_list: list[tuple[torch.Tensor, torch.Tensor]],
+        cart_seq_len: int,
+    ) -> None:
+        """Pre-populate cartridge KV into supported attention KV caches."""
+        attn_group_ids = [gid for gid, groups in enumerate(self.attn_groups) if groups]
+        selected_gid: int | None = None
+        cartridge_targets: list[tuple[int, str]] = []
+        selected_block_size: int | None = None
+        selected_block_ids_list: list[int] | None = None
+        unsupported_backend_names: list[str] = []
+        for gid in attn_group_ids:
+            gid_targets = self._get_cartridge_layer_targets(gid)
+            if not gid_targets:
+                unsupported_backend_names.extend(
+                    group.backend.__name__ for group in self.attn_groups[gid]
+                )
+                continue
+
+            block_table = self.input_batch.block_table[gid]
+            block_size = block_table.block_size
+            group_block_ids = block_ids[gid]
+            if block_table.use_hybrid_blocks:
+                group_block_ids = block_table.map_to_kernel_blocks(
+                    np.asarray(group_block_ids, dtype=np.int32),
+                    block_table.blocks_per_kv_block,
+                    block_table._kernel_block_arange,
+                ).tolist()
+
+            if len(group_block_ids) >= cdiv(cart_seq_len, block_size):
+                selected_gid = gid
+                cartridge_targets = gid_targets
+                selected_block_size = block_size
+                selected_block_ids_list = group_block_ids
+                break
+
+        if selected_gid is None and unsupported_backend_names:
+            supported_groups = [
+                gid for gid in attn_group_ids if self._get_cartridge_layer_targets(gid)
+            ]
+            if not supported_groups:
+                raise NotImplementedError(
+                    "No supported attention KV cache groups available for cartridge. "
+                    f"Backends: {unsupported_backend_names}. Only FlashAttention, "
+                    "FlashInfer, and Triton are supported."
+                )
+
+        if (
+            selected_gid is None
+            or selected_block_size is None
+            or selected_block_ids_list is None
+        ):
+            group_debug = []
+            for gid in attn_group_ids:
+                block_table = self.input_batch.block_table[gid]
+                group_block_ids = block_ids[gid]
+                if block_table.use_hybrid_blocks:
+                    group_block_ids = block_table.map_to_kernel_blocks(
+                        np.asarray(group_block_ids, dtype=np.int32),
+                        block_table.blocks_per_kv_block,
+                        block_table._kernel_block_arange,
+                    ).tolist()
+                group_debug.append(
+                    f"gid={gid}: block_size={block_table.block_size}, "
+                    f"num_blocks={len(group_block_ids)}"
+                )
+            raise RuntimeError(
+                "Insufficient attention-group block IDs to prepopulate cartridge KV: "
+                f"seq_len={cart_seq_len}; groups={group_debug}"
+            )
+
+        block_size = selected_block_size
+        block_ids_list = selected_block_ids_list
+        positions = torch.arange(cart_seq_len, device=self.device, dtype=torch.long)
+        block_indices = positions // block_size
+        block_offsets = positions % block_size
+        block_ids_tensor = torch.tensor(
+            block_ids_list, device=self.device, dtype=torch.long
+        )
+        physical_blocks = block_ids_tensor[block_indices]
+        slot_mapping = physical_blocks * block_size + block_offsets
+
+        kv_cache_dtype_str = self.cache_config.cache_dtype
+        k_scale = torch.ones(1, device=self.device, dtype=torch.float32)
+        v_scale = torch.ones(1, device=self.device, dtype=torch.float32)
+
+        if len(cartridge_targets) < len(layer_kv_list):
+            raise RuntimeError(
+                "Cartridge layer count exceeds available attention KV caches: "
+                f"{len(layer_kv_list)} cartridge layers vs "
+                f"{len(cartridge_targets)} cache layers."
+            )
+
+        for (layer_idx, backend_name), (layer_keys, layer_values) in zip(
+            cartridge_targets, layer_kv_list, strict=False
+        ):
+            kv_dim, reshape_and_cache = self._get_cartridge_cache_writer(backend_name)
+            kv_cache = self.kv_caches[layer_idx]
+            key_cache, value_cache = kv_cache.unbind(kv_dim)
+            reshape_and_cache(
+                layer_keys,
+                layer_values,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                kv_cache_dtype_str,
+                k_scale,
+                v_scale,
+            )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler

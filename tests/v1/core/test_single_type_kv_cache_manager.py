@@ -14,9 +14,14 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    MambaManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import ChunkedLocalAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -41,6 +46,15 @@ def get_chunked_local_attention_manager(
         enable_caching=enable_caching,
         kv_cache_group_id=0,
         max_admission_blocks_per_request=10**9,
+    )
+
+
+def get_mamba_manager(mamba_spec, block_pool, enable_caching=True):
+    return MambaManager(
+        mamba_spec,
+        block_pool=block_pool,
+        enable_caching=enable_caching,
+        kv_cache_group_id=0,
     )
 
 
@@ -399,6 +413,40 @@ def test_evictable_cached_blocks_not_double_allocated():
     )
     assert len(new_blocks) == 1
     assert len(manager.req_to_blocks[request_id]) == 2
+
+
+def test_mamba_align_drops_oversized_computed_blocks_before_allocation():
+    block_size = 16
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=(1, 1),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=block_size
+    )
+    manager = get_mamba_manager(mamba_spec, block_pool)
+
+    request_id = "req"
+    cartridge_like_blocks = block_pool.blocks[1:5]
+    manager.allocate_new_computed_blocks(
+        request_id,
+        cartridge_like_blocks,
+        num_local_computed_tokens=4 * block_size,
+        num_external_computed_tokens=0,
+    )
+    assert len(manager.req_to_blocks[request_id]) == 4
+
+    new_blocks = manager.allocate_new_blocks(
+        request_id,
+        num_tokens=block_size,
+        num_tokens_main_model=block_size,
+    )
+
+    assert len(new_blocks) == 1
+    assert manager.req_to_blocks[request_id] == new_blocks
+    assert manager.num_cached_block[request_id] == 0
 
 
 def test_chunked_local_attention_get_num_blocks_to_allocate():
