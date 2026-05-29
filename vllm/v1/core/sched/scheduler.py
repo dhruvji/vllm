@@ -692,8 +692,6 @@ class Scheduler(SchedulerInterface):
                     cartridge_cache_hit = req_to_cartridge_cache_hit.get(
                         request.request_id, False
                     )
-                    budget_cost = num_new_tokens + cart_seq_len
-
                     if _CARTRIDGE_DEBUG_TIMING and cart_seq_len > 0:
                         logger.info(
                             "[cartridge-sched] req=%s cache_hit=%s "
@@ -702,7 +700,7 @@ class Scheduler(SchedulerInterface):
                             request.request_id,
                             cartridge_cache_hit,
                             num_new_tokens,
-                            budget_cost,
+                            num_new_tokens + cart_seq_len,
                             token_budget,
                             len(self.running),
                             len(self.waiting),
@@ -711,6 +709,7 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    budget_cost = num_new_tokens + cart_seq_len
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -741,7 +740,21 @@ class Scheduler(SchedulerInterface):
                             )
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    token_budget_for_request = token_budget
+                    if cart_seq_len > 0:
+                        token_budget_for_request -= cart_seq_len
+                        if token_budget_for_request <= 0:
+                            if cart_seq_len >= self.max_num_scheduled_tokens:
+                                raise RuntimeError(
+                                    f"Cartridge request {request.request_id} cannot be "
+                                    f"scheduled: cartridge length {cart_seq_len} "
+                                    "leaves no room for request tokens under "
+                                    f"max_num_scheduled_tokens="
+                                    f"{self.max_num_scheduled_tokens}."
+                                )
+                            break
+
+                    num_new_tokens = min(num_new_tokens, token_budget_for_request)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -874,7 +887,9 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
-                token_budget -= num_new_tokens
+                token_budget -= num_new_tokens + getattr(
+                    request, "cartridge_seq_len", 0
+                )
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Encoder-related.
