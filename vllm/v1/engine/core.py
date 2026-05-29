@@ -490,6 +490,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            self._attach_pending_cartridge_overwrites(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -606,11 +607,13 @@ class EngineCore:
 
     def _cleanup_cartridge_shm(self):
         """Clean up shared memory files for cartridges loaded from shm."""
-        if not self._cartridge_shm_ids:
+        cartridge_ids = set(self._cartridge_shm_ids) | set(self._cartridge_shm_paths)
+        if not cartridge_ids:
             return
-        for cartridge_id in list(self._cartridge_shm_ids):
+        for cartridge_id in cartridge_ids:
             cleanup_cartridge_shm(cartridge_id)
         self._cartridge_shm_ids.clear()
+        self._cartridge_shm_paths.clear()
         self._cartridge_kv_cache.clear()
 
     def _attach_pending_cartridge_overwrites(

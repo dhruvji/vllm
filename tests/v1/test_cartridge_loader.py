@@ -1,8 +1,12 @@
+import contextlib
 import threading
+from collections import deque
+from concurrent.futures import Future
 
 import torch
 
 from vllm.v1 import cartridge_loader
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine.core import EngineCore
 
 
@@ -146,3 +150,70 @@ def test_engine_update_cartridge_tracks_shm_for_cleanup(monkeypatch):
     assert engine._cartridge_kv_cache["cart-1"] is stacked_kv
     assert engine._cartridge_shm_paths["cart-1"] == "/tmp/cart-1.pt"
     assert "cart-1" in engine._cartridge_shm_ids
+
+
+def test_engine_cleanup_covers_lru_evicted_shm_paths(monkeypatch):
+    cleaned = []
+    engine = EngineCore.__new__(EngineCore)
+    engine._cartridge_shm_ids = {"cached-cart"}
+    engine._cartridge_shm_paths = {
+        "cached-cart": "/tmp/cached-cart.pt",
+        "evicted-cart": "/tmp/evicted-cart.pt",
+    }
+    engine._cartridge_kv_cache = {"cached-cart": object()}
+
+    monkeypatch.setattr(
+        "vllm.v1.engine.core.cleanup_cartridge_shm",
+        lambda cartridge_id: cleaned.append(cartridge_id),
+    )
+
+    engine._cleanup_cartridge_shm()
+
+    assert set(cleaned) == {"cached-cart", "evicted-cart"}
+    assert engine._cartridge_shm_ids == set()
+    assert engine._cartridge_shm_paths == {}
+    assert engine._cartridge_kv_cache == {}
+
+
+def test_batch_queue_attaches_pending_cartridge_overwrites():
+    scheduler_output = SchedulerOutput.make_empty()
+    executed_outputs = []
+    stacked_kv = [torch.randn(1, 1, 1, 1), torch.randn(1, 1, 1, 1)]
+    engine = EngineCore.__new__(EngineCore)
+    engine.batch_queue = deque(maxlen=2)
+    engine.batch_queue_size = 2
+    engine.is_ec_consumer = True
+    engine.is_pooling_model = False
+    engine.use_spec_decode = False
+    engine._pending_cartridge_overwrites = {"cart-1": stacked_kv}
+
+    class Scheduler:
+        def has_requests(self):
+            return True
+
+        def schedule(self):
+            return scheduler_output
+
+        def update_from_output(self, scheduler_output, model_output):
+            return {}
+
+    class ModelExecutor:
+        def execute_model(self, scheduler_output, non_block=False):
+            executed_outputs.append(scheduler_output)
+            future = Future()
+            future.set_result(object())
+            return future
+
+    engine.scheduler = Scheduler()
+    engine.model_executor = ModelExecutor()
+    engine.log_error_detail = lambda scheduler_output: contextlib.nullcontext()
+    engine.log_iteration_details = lambda scheduler_output: contextlib.nullcontext()
+    engine._process_aborts_queue = lambda: None
+
+    outputs, model_executed = engine.step_with_batch_queue()
+
+    assert outputs == {}
+    assert model_executed is False
+    assert executed_outputs == [scheduler_output]
+    assert scheduler_output.cartridge_overwrites == {"cart-1": stacked_kv}
+    assert engine._pending_cartridge_overwrites == {}
