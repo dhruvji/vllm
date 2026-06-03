@@ -47,6 +47,7 @@ MTPModelTypes = Literal[
 EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes]
 SpeculativeMethod = Literal[
     "ngram",
+    "ngram_gpu",
     "medusa",
     "mlp_speculator",
     "draft_model",
@@ -746,11 +747,18 @@ class SpeculativeConfig:
     def use_eagle(self) -> bool:
         return self.method in ("eagle", "eagle3", "mtp")
 
+    def use_ngram_gpu(self) -> bool:
+        return self.method == "ngram_gpu"
+
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
 
     def __repr__(self) -> str:
         method = self.method
-        model = None if method in ("ngram", "suffix") else self.draft_model_config.model
+        model = (
+            None
+            if method in ("ngram", "ngram_gpu", "suffix")
+            else self.draft_model_config.model
+        )
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"
