@@ -303,10 +303,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         # Check if thinking is enabled
         self.is_enabled = reasoning_config is not None
 
-        self.think_start_token_ids = getattr(
-            reasoning_config, "think_start_token_ids", []
+        self.think_start_token_ids = (
+            getattr(reasoning_config, "reasoning_start_token_ids", None) or []
         )
-        self.think_end_token_ids = getattr(reasoning_config, "think_end_token_ids", [])
+        self.think_end_token_ids = (
+            getattr(reasoning_config, "reasoning_end_token_ids", None) or []
+        )
 
         self.pin_memory = is_pin_memory
         self.device = device

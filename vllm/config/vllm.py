@@ -622,6 +622,15 @@ class VllmConfig:
 
             self.parallel_config.is_moe_model = self.model_config.is_moe
 
+        if self.reasoning_config is not None and self.model_config is not None:
+            self.reasoning_config.initialize_token_ids(self.model_config)
+            if not self.reasoning_config.enabled:
+                logger.warning_once(
+                    "Auto-initialization of reasoning token IDs failed. "
+                    "Please check whether your reasoning parser has implemented "
+                    "the `reasoning_start_str` and `reasoning_end_str`."
+                )
+
         self.cache_config.verify_with_parallel_config(self.parallel_config)
 
         if self.lora_config is not None:

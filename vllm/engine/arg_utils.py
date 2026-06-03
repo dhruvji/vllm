@@ -51,6 +51,7 @@ from vllm.config import (
     ParallelConfig,
     PoolerConfig,
     ProfilerConfig,
+    ReasoningConfig,
     SchedulerConfig,
     SpeculativeConfig,
     StructuredOutputsConfig,
@@ -511,6 +512,9 @@ class EngineArgs:
     logits_processor_pattern: str | None = ModelConfig.logits_processor_pattern
 
     speculative_config: dict[str, Any] | None = None
+    reasoning_config: ReasoningConfig | None = get_field(
+        VllmConfig, "reasoning_config"
+    )
 
     show_hidden_metrics_for_version: str | None = (
         ObservabilityConfig.show_hidden_metrics_for_version
@@ -1197,8 +1201,12 @@ class EngineArgs:
         # create_engine_config. So we set the type to a JSON string here to
         # delay the Pydantic validation that comes with SpeculativeConfig.
         vllm_kwargs["speculative_config"]["type"] = optional_type(json.loads)
+        vllm_kwargs["reasoning_config"]["type"] = optional_type(json.loads)
         vllm_group.add_argument(
             "--speculative-config", **vllm_kwargs["speculative_config"]
+        )
+        vllm_group.add_argument(
+            "--reasoning-config", **vllm_kwargs["reasoning_config"]
         )
         vllm_group.add_argument(
             "--kv-transfer-config", **vllm_kwargs["kv_transfer_config"]
@@ -1769,6 +1777,9 @@ class EngineArgs:
         # Pass reasoning_parser into StructuredOutputsConfig
         if self.reasoning_parser:
             self.structured_outputs_config.reasoning_parser = self.reasoning_parser
+            if self.reasoning_config is None:
+                self.reasoning_config = ReasoningConfig()
+            self.reasoning_config.reasoning_parser = self.reasoning_parser
 
         if self.reasoning_parser_plugin:
             self.structured_outputs_config.reasoning_parser_plugin = (
@@ -1817,6 +1828,7 @@ class EngineArgs:
             kernel_config=kernel_config,
             lora_config=lora_config,
             speculative_config=speculative_config,
+            reasoning_config=self.reasoning_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,
             compilation_config=compilation_config,
