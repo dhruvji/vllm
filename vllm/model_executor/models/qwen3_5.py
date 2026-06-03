@@ -94,7 +94,6 @@ from .qwen3_vl import (
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
-    WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     is_pp_missing_parameter,
@@ -217,10 +216,6 @@ class Qwen3_5Model(Qwen3NextModel):
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.config = config
-        multimodal_config = vllm_config.model_config.multimodal_config
-        self.language_model_only = (
-            multimodal_config is not None and multimodal_config.language_model_only
-        )
 
         self.vocab_size = config.vocab_size
 
@@ -249,26 +244,6 @@ class Qwen3_5Model(Qwen3NextModel):
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if self.language_model_only and positions.ndim == 2:
-            # Language-only Qwen3.5 uses text RoPE even when the request builder
-            # supplies multimodal-style T/H/W positions. Use the text row so the
-            # rotary embedding sees one position per token.
-            positions = positions[0]
-
-        return super().forward(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-        )
 
     def load_fused_expert_weights(
         self,
@@ -317,9 +292,12 @@ class Qwen3_5Model(Qwen3NextModel):
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
         is_fused_expert = False
+        base_layer = (
+            "base_layer." if any(".base_layer." in name for name in params_dict) else ""
+        )
         fused_expert_params_mapping = [
-            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
-            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
+            (f"experts.{base_layer}w13_weight", "experts.gate_up_proj", 0, "w1"),
+            (f"experts.{base_layer}w2_weight", "experts.down_proj", 0, "w2"),
         ]
         num_experts = (
             self.config.num_experts if hasattr(self.config, "num_experts") else 0
@@ -486,10 +464,9 @@ class Qwen3_5ForCausalLMBase(
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
-        # Deal with the case where the prefix is already "language_model" since
-        # Qwen/Qwen3.5-397B-A17B has naming like: model.language_model.layers.0
-        model_prefix = prefix if "model" in prefix else "model"
-        self.model = Qwen3_5Model(vllm_config=vllm_config, prefix=model_prefix)
+        self.model = Qwen3_5Model(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -574,21 +551,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
     # Qwen3.5 does not support multimodal pruning (EVS).
     supports_multimodal_pruning = False
-    lora_skip_prefixes = ["linear_attn.conv1d"]
-
-    # Qwen3.5 text checkpoints and PEFT LoRAs use text-only names such as
-    # `model.layers.*`. The vLLM wrapper serves the text model under
-    # `language_model.model.*`, so LoRA loading must map those names or the
-    # adapter will load but every language module will miss its weights.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "model.visual.": "visual.",
-            "lm_head.": "language_model.lm_head.",
-            "model.language_model.model.": "language_model.model.",
-            "model.language_model.": "language_model.model.",
-            "model.": "language_model.model.",
-        }
-    )
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
@@ -692,19 +654,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         if intermediate_tensors is not None:
             inputs_embeds = None
 
-        if inputs_embeds is None:
-            hidden_states = self.language_model.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-            )
-        else:
-            hidden_states = self.language_model.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-            )
+        hidden_states = self.language_model.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
 
         return hidden_states
 

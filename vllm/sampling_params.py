@@ -157,6 +157,14 @@ class RequestOutputKind(Enum):
     FINAL_ONLY = 2
 
 
+def _is_non_tekken_mistral(tokenizer: TokenizerLike) -> bool:
+    return is_mistral_tokenizer(tokenizer) and not tokenizer.is_tekken
+
+
+def _get_llg_tokenizer(tokenizer: TokenizerLike) -> Any:
+    return tokenizer.llg_tokenizer if is_mistral_tokenizer(tokenizer) else None
+
+
 class SamplingParams(
     PydanticMsgspecMixin,
     msgspec.Struct,
@@ -237,13 +245,9 @@ class SamplingParams(
     """Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities."""
     prompt_logprobs_start_index: int | None = None
-    """Inclusive prompt-logprobs row index to start returning.
-
-    This is a vLLM extension for continuation scoring. It lets callers score a
-    prompt suffix without returning logprobs for the cached/shared prefix.
-    """
+    """First prompt token index to return prompt logprobs for."""
     prompt_logprobs_end_index: int | None = None
-    """Exclusive prompt-logprobs row index to stop returning."""
+    """Exclusive prompt token index to return prompt logprobs for."""
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
@@ -442,23 +446,33 @@ class SamplingParams(
         # eos_token_id is added to this by the engine
         self._all_stop_token_ids.update(self.stop_token_ids)
 
-        if self.prompt_logprobs_start_index is not None:
+        if (
+            self.prompt_logprobs_start_index is not None
+            or self.prompt_logprobs_end_index is not None
+        ):
             if self.prompt_logprobs is None:
                 raise ValueError(
-                    "prompt_logprobs_start_index requires prompt_logprobs."
+                    "prompt_logprobs_start_index and prompt_logprobs_end_index "
+                    "require prompt_logprobs."
                 )
-            if self.prompt_logprobs_start_index < 0:
+            if (
+                self.prompt_logprobs_end_index is not None
+                and self.prompt_logprobs_end_index < 0
+            ):
+                raise ValueError("prompt_logprobs_end_index must be non-negative.")
+            prompt_logprobs_start_index = self.prompt_logprobs_start_index or 0
+            if prompt_logprobs_start_index < 0:
                 raise ValueError("prompt_logprobs_start_index must be non-negative.")
             if (
                 self.prompt_logprobs_end_index is not None
-                and self.prompt_logprobs_end_index < self.prompt_logprobs_start_index
+                and self.prompt_logprobs_end_index < prompt_logprobs_start_index
             ):
                 raise ValueError(
                     "prompt_logprobs_end_index must be greater than or equal to "
                     "prompt_logprobs_start_index."
                 )
             if (
-                self.prompt_logprobs_start_index > 0
+                prompt_logprobs_start_index > 0
                 and self.skip_reading_prefix_cache is None
             ):
                 self.skip_reading_prefix_cache = False
@@ -716,14 +730,6 @@ class SamplingParams(
                     parameter="logprob_token_ids",
                     value=n,
                 )
-            if self.logprobs is not None and self.logprobs != n:
-                raise VLLMValidationError(
-                    f"When both logprobs and logprob_token_ids are set, "
-                    f"logprobs must equal len(logprob_token_ids). Got "
-                    f"logprobs={self.logprobs}, len(logprob_token_ids)={n}.",
-                    parameter="logprob_token_ids",
-                    value=n,
-                )
 
         # Validate prompt logprobs.
         if num_prompt_logprobs := self.prompt_logprobs:
@@ -868,17 +874,21 @@ class SamplingParams(
             # xgrammar with no fallback
             validate_xgrammar_grammar(self)
         elif backend.startswith("guidance"):
+            if _is_non_tekken_mistral(tokenizer=tokenizer):
+                raise ValueError(
+                    "Non-tekken Mistral tokenizers are not supported for the 'guidance'"
+                    " structured output backend. Please either use a more recent "
+                    "Mistral model, the ['xgrammar', 'outlines'] "
+                    "backends or tokenizer_mode='hf' instead."
+                )
             # TODO: ideally we would have the LLTokenizer here as Lark syntax
             # allows <|special_token|> and similar, see
             # https://github.com/guidance-ai/llguidance/blob/main/docs/syntax.md#special-tokens
             # Without tokenizer these are disallowed in grammars.
-            if is_mistral_tokenizer(tokenizer):
-                raise ValueError(
-                    "Mistral tokenizer is not supported for the 'guidance' "
-                    "structured output backend. Please use ['xgrammar', 'outlines'] "
-                    "backends or tokenizer_mode='hf' instead."
-                )
-            validate_guidance_grammar(self, tokenizer=None)
+            validate_guidance_grammar(
+                self,
+                tokenizer=_get_llg_tokenizer(tokenizer),
+            )
         elif backend == "outlines":
             # outlines backend
             validate_structured_output_request_outlines(self)
@@ -906,24 +916,28 @@ class SamplingParams(
                 # or includes some jsonschema feature(s) that
                 # are not supported in xgrammar.
 
+                skip_guidance = _is_non_tekken_mistral(tokenizer)
+
                 # Check if schema has features unsupported by guidance
                 so_params = self.structured_outputs
-                skip_guidance = False
-                if so_params.json:
+                if not skip_guidance and so_params.json:
                     if isinstance(so_params.json, str):
                         schema = json_mod.loads(so_params.json)
                     else:
                         schema = so_params.json
                     skip_guidance = has_guidance_unsupported_json_features(schema)
 
-                if is_mistral_tokenizer(tokenizer) or skip_guidance:
-                    # Fall back to outlines if the tokenizer is Mistral
-                    # or if schema contains features unsupported by guidance
+                if skip_guidance:
+                    # Fall back to outlines if the tokenizer is non-tekken Mistral or
+                    # the schema contains features unsupported by guidance
                     validate_structured_output_request_outlines(self)
                     self.structured_outputs._backend = "outlines"
                 else:
                     # Fall back to guidance by default.
-                    validate_guidance_grammar(self, tokenizer=None)
+                    validate_guidance_grammar(
+                        self,
+                        tokenizer=_get_llg_tokenizer(tokenizer),
+                    )
                     self.structured_outputs._backend = "guidance"
             # Remember that this backend was set automatically
             self.structured_outputs._backend_was_auto = True

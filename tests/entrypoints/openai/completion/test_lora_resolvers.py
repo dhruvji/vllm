@@ -12,6 +12,7 @@ from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+from vllm.entrypoints.openai.engine.serving import _lora_config_source_ids
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -25,6 +26,47 @@ MODEL_NAME = "openai-community/gpt2"
 BASE_MODEL_PATHS = [BaseModelPath(name=MODEL_NAME, model_path=MODEL_NAME)]
 
 MOCK_RESOLVER_NAME = "mock_test_resolver"
+
+
+@pytest.mark.parametrize(
+    ("lora_id", "expected_config_ids"),
+    [
+        (
+            "s3://bucket/path/adapter_model.safetensors",
+            [
+                "s3://bucket/path/adapter_config.json",
+                "s3://bucket/path/lora_config.json",
+            ],
+        ),
+        (
+            "s3://bucket/path/adapter.v1.safetensors",
+            [
+                "s3://bucket/path/adapter_config.json",
+                "s3://bucket/path/lora_config.json",
+            ],
+        ),
+        (
+            "modal://volume/run/adapter_model.pt",
+            [
+                "modal://volume/run/adapter_config.json",
+                "modal://volume/run/lora_config.json",
+            ],
+        ),
+        (
+            "file:///tmp/run/adapter_model.bin",
+            ["/tmp/run/adapter_config.json", "/tmp/run/lora_config.json"],
+        ),
+        (
+            "/tmp/run/lora-dir",
+            [
+                "/tmp/run/lora-dir/adapter_config.json",
+                "/tmp/run/lora-dir/lora_config.json",
+            ],
+        ),
+    ],
+)
+def test_request_body_lora_config_sources_use_file_parent(lora_id, expected_config_ids):
+    assert _lora_config_source_ids(lora_id) == expected_config_ids
 
 
 @dataclass
@@ -137,7 +179,6 @@ def mock_serving_setup():
 
     mock_engine.model_config = MockModelConfig()
     mock_engine.input_processor = MagicMock()
-    mock_engine.io_processor = MagicMock()
     mock_engine.renderer = _build_renderer(mock_engine.model_config)
 
     models = OpenAIServingModels(
@@ -148,7 +189,6 @@ def mock_serving_setup():
     serving_render = OpenAIServingRender(
         model_config=mock_engine.model_config,
         renderer=mock_engine.renderer,
-        io_processor=mock_engine.io_processor,
         model_registry=models.registry,
         request_logger=None,
         chat_template=None,
@@ -204,7 +244,11 @@ async def test_serving_completion_with_request_body_lora(mock_serving_setup):
     with suppress(Exception):
         await serving_completion.create_completion(req)
 
-    mock_engine.add_lora.assert_not_awaited()
+    mock_engine.add_lora.assert_awaited_once()
+    added_lora_request = mock_engine.add_lora.call_args[0][0]
+    assert isinstance(added_lora_request, LoRARequest)
+    assert added_lora_request.lora_name == "/fake/path/request-body-lora"
+    assert added_lora_request.lora_path == "/fake/path/request-body-lora"
 
     mock_engine.generate.assert_called_once()
     generated_lora_request = mock_engine.generate.call_args[1]["lora_request"]

@@ -1,22 +1,30 @@
-# From elements -- refactor into shared engrams lib later
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Filesystem abstraction for local, S3, GCS, and Modal volume paths."""
+
 import asyncio
 import concurrent.futures
+import contextlib
 import fnmatch
 import glob as globlib
 import io
+import logging
 import os
-import re
 import shutil
 import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Callable
+from typing import Any, ClassVar
+
+import regex as re
 
 
 class Path:
     __slots__ = ("_path",)
 
-    filesystems = []
+    filesystems: ClassVar[list[tuple[type["Path"], Callable[[str], bool]]]] = []
 
     def __new__(cls, path):
         if cls is not Path:
@@ -25,7 +33,7 @@ class Path:
         for impl, pred in cls.filesystems:
             if pred(path):
                 obj = super().__new__(impl)
-                obj.__init__(path)
+                obj.__init__(path)  # type: ignore[misc]
                 return obj
         raise NotImplementedError(f"No filesystem supports: {path}")
 
@@ -77,18 +85,24 @@ class Path:
 
     @property
     def stem(self):
-        return self.name.split(".", 1)[0] if "." in self.name else self.name
+        name = self.name
+        if "." not in name or (name.startswith(".") and name.count(".") == 1):
+            return name
+        return name.rsplit(".", 1)[0]
 
     @property
     def suffix(self):
-        return ("." + self.name.split(".", 1)[1]) if "." in self.name else ""
+        name = self.name
+        if "." not in name or (name.startswith(".") and name.count(".") == 1):
+            return ""
+        return "." + name.rsplit(".", 1)[1]
 
     @property
     def size(self):
         raise NotImplementedError
 
     def read(self, mode="r"):
-        assert mode in "r rb".split(), mode
+        assert mode in ["r", "rb"], mode
         with self.open(mode) as f:
             return f.read()
 
@@ -99,7 +113,7 @@ class Path:
         return self.read(mode="rb")
 
     def write(self, content, mode="w"):
-        assert mode in "w a wb ab".split(), mode
+        assert mode in ["w", "a", "wb", "ab"], mode
         with self.open(mode) as f:
             f.write(content)
 
@@ -152,7 +166,10 @@ class Path:
         return False
 
     def _optimized_copy_from(self, source):
-        """Optimized copy from source. Returns True if handled, False to use fallback."""
+        """Optimized copy from source.
+
+        Returns True if handled, False to use fallback.
+        """
         return False
 
 
@@ -170,7 +187,7 @@ class LocalPath(Path):
         return open(str(self), mode=mode)
 
     def absolute(self):
-        return type(self)(os.path.absolute(str(self)))
+        return type(self)(os.path.abspath(str(self)))
 
     def glob(self, pattern):
         for path in globlib.glob(f"{str(self)}/{pattern}", recursive=True):
@@ -223,7 +240,7 @@ class LocalPath(Path):
 class TFPath(Path):
     __slots__ = ("_path",)
 
-    gfile = None
+    gfile: Any = None
 
     def __init__(self, path):
         path = str(path)
@@ -375,8 +392,11 @@ class GCSPath(Path):
 
     @property
     def size(self):
-        if self.blob.size is None:
-            self._blob = self.bucket.get_blob(self.blob.name, **gcs_retry())
+        blob = self.blob
+        assert blob is not None
+        if blob.size is None:
+            self._blob = self.bucket.get_blob(blob.name, **gcs_retry())
+        assert self._blob is not None
         assert isinstance(self._blob.size, int), self._blob.size
         return self._blob.size
 
@@ -402,7 +422,7 @@ class GCSPath(Path):
             raise NotImplementedError(mode)
 
     def write(self, content, mode="w"):
-        assert mode in "w a wb ab".split(), mode
+        assert mode in ["w", "a", "wb", "ab"], mode
         if mode == "a":
             prefix = self.read("r")
             content = prefix + content
@@ -651,10 +671,8 @@ class GCSAppendFile:
         self._wait_until_exists(self.target)
         self._wait_until_exists(self.temp)
         self.target.compose([self.target, self.temp], **gcs_retry())
-        try:
+        with contextlib.suppress(google.cloud.exceptions.NotFound):
             self.temp.delete(**gcs_retry())
-        except google.cloud.exceptions.NotFound:
-            pass
 
     def _wait_until_exists(self, blob, timeout=60):
         start = time.time()
@@ -777,7 +795,7 @@ class S3Path(Path):
             raise NotImplementedError(mode)
 
     def write(self, content, mode="w"):
-        assert mode in "w a wb ab".split(), mode
+        assert mode in ["w", "a", "wb", "ab"], mode
         assert self.bucket_name
         assert self.key
         if mode in ("a", "ab"):
@@ -831,9 +849,10 @@ class S3Path(Path):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
                     relative = key[len(prefix) :] if prefix else key
-                    if "/" not in relative.rstrip("/") or pattern.count("/") > 0:
-                        if fnmatch.fnmatch(relative, pattern):
-                            results.append(key)
+                    if (
+                        "/" not in relative.rstrip("/") or pattern.count("/") > 0
+                    ) and fnmatch.fnmatch(relative, pattern):
+                        results.append(key)
 
         results = sorted(set(results))
         return [type(self)(f"s3://{self.bucket_name}/{key}") for key in results]
@@ -866,10 +885,11 @@ class S3Path(Path):
                 if error_code in ("404", "NoSuchKey"):
                     return False
             # Log only truly unexpected errors
-            import logging
-
             logging.warning(
-                f"Unexpected error checking if S3 path is file {self}: {type(e).__name__}: {e}"
+                "Unexpected error checking if S3 path is file %s: %s: %s",
+                self,
+                type(e).__name__,
+                e,
             )
             return False
 
@@ -894,16 +914,19 @@ class S3Path(Path):
             if isinstance(e, ClientError):
                 error_code = e.response.get("Error", {}).get("Code", "")
                 if error_code not in ("404", "NoSuchKey"):
-                    import logging
-
                     logging.warning(
-                        f"Unexpected error in head_object for directory check {self}: {type(e).__name__}: {e}"
+                        "Unexpected error in head_object for directory check "
+                        "%s: %s: %s",
+                        self,
+                        type(e).__name__,
+                        e,
                     )
             else:
-                import logging
-
                 logging.warning(
-                    f"Unexpected error in head_object for directory check {self}: {type(e).__name__}: {e}"
+                    "Unexpected error in head_object for directory check %s: %s: %s",
+                    self,
+                    type(e).__name__,
+                    e,
                 )
         try:
             response = self.client.list_objects_v2(
@@ -918,10 +941,11 @@ class S3Path(Path):
                 error_code = e.response.get("Error", {}).get("Code", "")
                 if error_code in ("404", "NoSuchKey"):
                     return False
-            import logging
-
             logging.warning(
-                f"Unexpected error in list_objects_v2 for directory check {self}: {type(e).__name__}: {e}"
+                "Unexpected error in list_objects_v2 for directory check %s: %s: %s",
+                self,
+                type(e).__name__,
+                e,
             )
             return False
 
@@ -996,7 +1020,8 @@ class S3Path(Path):
                         mb_done = self.downloaded / (1024 * 1024)
                         mb_total = self.total_size / (1024 * 1024)
                         print(
-                            f"\r  Downloading: {mb_done:.1f}/{mb_total:.1f} MB ({pct}%)",
+                            "\r  Downloading: "
+                            f"{mb_done:.1f}/{mb_total:.1f} MB ({pct}%)",
                             end="",
                             flush=True,
                         )
@@ -1077,6 +1102,7 @@ class S3ReadFile:
             return response["ContentLength"]
         except Exception as e:
             self._handle_s3_error(e)
+            raise
 
     def seek(self, pos, mode=os.SEEK_SET):
         if self.size is None:
@@ -1337,7 +1363,7 @@ class ModalVolumeV2(Path):
         return entry.size
 
     def open(self, mode="r"):
-        assert mode in "r rb w wb a ab".split(), mode
+        assert mode in ["r", "rb", "w", "wb", "a", "ab"], mode
         local = self._mounted_local_path()
         if "r" in mode and "w" not in mode and "a" not in mode:
             # Do not return live file handles on mounted Modal volume paths.
@@ -1353,7 +1379,7 @@ class ModalVolumeV2(Path):
         return self._open_for_write(mode)
 
     def _open_for_read(self, mode):
-        buffer = tempfile.SpooledTemporaryFile(
+        buffer = tempfile.SpooledTemporaryFile(  # noqa: SIM115
             max_size=self.SPOOLED_FILE_SIZE, mode="w+b"
         )
         local = self._mounted_local_path()
@@ -1381,12 +1407,14 @@ class ModalVolumeV2(Path):
         return self
 
     def glob(self, pattern):
-        local = self._mounted_local_path()
+        local = self._fresh_mounted_local_path()
         if local is not None:
             root = str(local)
             results = []
             for path in local.glob(pattern):
-                relative = str(path)[len(root) :].lstrip("/") if str(path) != root else ""
+                relative = (
+                    str(path)[len(root) :].lstrip("/") if str(path) != root else ""
+                )
                 modal_path = f"modal://{self.volume_name}"
                 if self.volume_path:
                     modal_path += f"/{self.volume_path}"
@@ -1464,9 +1492,7 @@ class ModalVolumeV2(Path):
             dest = Path(dest)
         local = self._mounted_local_path()
         dest_local = (
-            dest._mounted_local_path()
-            if isinstance(dest, ModalVolumeV2)
-            else None
+            dest._mounted_local_path() if isinstance(dest, ModalVolumeV2) else None
         )
         if local is not None and dest_local is not None:
             local.copy(dest_local, recursive=recursive)
@@ -1486,9 +1512,7 @@ class ModalVolumeV2(Path):
             dest = Path(dest)
         local = self._mounted_local_path()
         dest_local = (
-            dest._mounted_local_path()
-            if isinstance(dest, ModalVolumeV2)
-            else None
+            dest._mounted_local_path() if isinstance(dest, ModalVolumeV2) else None
         )
         if local is not None and dest_local is not None:
             local.move(dest_local, recursive=recursive)
@@ -1539,7 +1563,7 @@ class _ModalVolumeWriteFile:
     def __init__(self, path, mode):
         self.path = path
         self.mode = mode
-        self.buffer = tempfile.SpooledTemporaryFile(
+        self.buffer = tempfile.SpooledTemporaryFile(  # noqa: SIM115
             max_size=path.SPOOLED_FILE_SIZE, mode="w+b"
         )
         self.closed = False
@@ -1628,9 +1652,8 @@ def _copy_across_filesystems(source, dest, recursive):
         if source._optimized_copy_to(dest):
             return
         # Fallback: Stream the file to avoid loading large files into memory
-        with source.open("rb") as src:
-            with dest.open("wb") as dst:
-                shutil.copyfileobj(src, dst)
+        with source.open("rb") as src, dest.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
         return
     if dest.exists():
         dest = dest / source.name
@@ -1648,9 +1671,8 @@ def _copy_across_filesystems(source, dest, recursive):
             if s._optimized_copy_to(d):
                 continue
             # Fallback: Stream each file to avoid memory issues
-            with s.open("rb") as src:
-                with d.open("wb") as dst:
-                    shutil.copyfileobj(src, dst)
+            with s.open("rb") as src, d.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
 
 
 Path.filesystems = [

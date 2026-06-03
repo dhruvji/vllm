@@ -5,7 +5,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm.utils.adapter_manager import AdapterManager, FORCE_REDOWNLOAD_ENV_VAR
+from vllm.utils.adapter_manager import FORCE_REDOWNLOAD_ENV_VAR, AdapterManager
+
+
+@patch.dict("os.environ", {"XDG_CACHE_HOME": "/tmp/vllm-xdg-cache"})
+def test_default_cache_dir_respects_xdg_cache_home():
+    manager = AdapterManager()
+
+    assert str(manager.cache_dir) == "/tmp/vllm-xdg-cache/vllm/adapters"
 
 
 @patch("vllm.utils.adapter_manager.time.sleep")
@@ -54,16 +61,19 @@ def test_get_modal_adapter_raises_after_retry_if_still_missing(
     source_path = MagicMock()
     mock_path_cls.return_value = source_path
 
-    with patch(
-        "vllm.utils.adapter_manager._load_adapter",
-        side_effect=FileNotFoundError("not ready"),
-    ), pytest.raises(FileNotFoundError, match="not ready"):
+    with (
+        patch(
+            "vllm.utils.adapter_manager._load_adapter",
+            side_effect=FileNotFoundError("not ready"),
+        ),
+        pytest.raises(FileNotFoundError, match="not ready"),
+    ):
         manager.get_adapter("modal://volume/run/adapter")
 
     mock_sleep.assert_called_once_with(5.0)
 
 
-@patch.dict(f"os.environ", {FORCE_REDOWNLOAD_ENV_VAR: "1"})
+@patch.dict("os.environ", {FORCE_REDOWNLOAD_ENV_VAR: "1"})
 @patch("vllm.utils.adapter_manager._load_adapter")
 @patch("vllm.utils.adapter_manager.Path")
 def test_get_s3_adapter_force_redownload_env_ignores_existing_cache(
@@ -75,11 +85,13 @@ def test_get_s3_adapter_force_redownload_env_ignores_existing_cache(
     mock_path_cls.return_value = source_path
     mock_load_adapter.return_value = {"tensor": "ok"}
 
-    with patch("vllm.utils.adapter_manager.filelock.FileLock"), patch(
-        "pathlib.Path.exists", return_value=True
-    ), patch("builtins.open", MagicMock()), patch(
-        "pathlib.Path.mkdir"
-    ), patch("pathlib.Path.stat", return_value=MagicMock(st_size=0)):
+    with (
+        patch("vllm.utils.adapter_manager.filelock.FileLock"),
+        patch("pathlib.Path.exists", return_value=True),
+        patch("builtins.open", MagicMock()),
+        patch("pathlib.Path.mkdir"),
+        patch("pathlib.Path.stat", return_value=MagicMock(st_size=0)),
+    ):
         result = manager.get_adapter("s3://bucket/adapter.pt")
 
     assert result == {"tensor": "ok"}

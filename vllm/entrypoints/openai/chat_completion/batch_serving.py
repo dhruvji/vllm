@@ -114,12 +114,15 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         """
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
+        single_requests = [
+            request.to_chat_completion_request(messages)
+            for messages in request.messages
+        ]
 
         reasoning_parser: ReasoningParser | None = None
         if self.reasoning_parser_cls:
-            chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                request.chat_template_kwargs,
-                self.default_chat_template_kwargs,
+            chat_template_kwargs = self._effective_chat_template_kwargs(
+                single_requests[0]
             )
             reasoning_parser = self.reasoning_parser_cls(
                 tokenizer,
@@ -139,8 +142,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
             raw_request.state.request_metadata = request_metadata
 
         lora_request = await self._maybe_get_adapters(
-            request,
-            supports_default_mm_loras=True,
+            request, supports_default_mm_loras=True
         )
         model_name = self.models.model_name(lora_request)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
@@ -158,7 +160,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 self.default_sampling_params,
                 self.override_max_tokens,
             )
-            single_request = request.to_chat_completion_request(request.messages[i])
+            single_request = single_requests[i]
             sampling_params = single_request.to_sampling_params(
                 max_tokens, self.default_sampling_params
             )
@@ -317,4 +319,5 @@ class OpenAIServingChatBatch(OpenAIServingChat):
             model=model_name,
             choices=choices,
             usage=usage,
+            system_fingerprint=self.system_fingerprint,
         )

@@ -15,12 +15,12 @@ Cartridges support two use cases:
    - Requires direct KV injection into attention (not token prepending)
 """
 
+import contextlib
 import fcntl
 import glob as globlib
 import hashlib
 import json
 import os
-import re
 import threading
 import time
 import zipfile
@@ -28,6 +28,7 @@ from collections import OrderedDict
 from typing import Any
 
 import boto3
+import regex as re
 import torch
 
 from vllm.logger import init_logger
@@ -36,14 +37,22 @@ from vllm.utils.adapter_manager import get_adapter_manager
 
 logger = init_logger(__name__)
 
-# Directory for cartridge IPC files
-# Use /root/.cache/vllm/cartridges instead of /dev/shm for Modal compatibility
-# Modal volumes are shared across processes, /dev/shm is not
-SHM_CARTRIDGE_DIR = "/root/.cache/vllm/cartridges"
 
-# Directory for checkpoint resolution cache
-# Shared volume for caching latest.txt timestamps across containers
-CHECKPOINT_CACHE_DIR = "/root/.cache/vllm/checkpoint_cache"
+def _vllm_cache_root() -> str:
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    if cache_home:
+        return os.path.join(cache_home, "vllm")
+    return "/root/.cache/vllm"
+
+
+# Directory for cartridge IPC files. Use the vLLM cache root instead of /dev/shm
+# for Modal compatibility; Modal volumes are shared across processes, /dev/shm is
+# not. BaseTen sets XDG_CACHE_HOME to a writable runtime cache.
+SHM_CARTRIDGE_DIR = os.path.join(_vllm_cache_root(), "cartridges")
+
+# Directory for checkpoint resolution cache. This is shared process-local state
+# for caching latest.txt timestamps across containers.
+CHECKPOINT_CACHE_DIR = os.path.join(_vllm_cache_root(), "checkpoint_cache")
 
 # How often to check for new checkpoints (seconds)
 CHECKPOINT_CHECK_INTERVAL = 30
@@ -81,9 +90,7 @@ def save_cartridge_to_shm(
     os.makedirs(SHM_CARTRIDGE_DIR, exist_ok=True)
     shm_path = _get_shm_path(cartridge_id)
     lock_path = _get_shm_lock_path(cartridge_id)
-    tmp_path = (
-        f"{shm_path}.tmp.{os.getpid()}.{threading.get_ident()}"
-    )
+    tmp_path = f"{shm_path}.tmp.{os.getpid()}.{threading.get_ident()}"
 
     with open(lock_path, "a+b") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -120,10 +127,8 @@ def save_cartridge_to_shm(
             return shm_path
         finally:
             if os.path.exists(tmp_path):
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(tmp_path)
-                except OSError:
-                    pass
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
@@ -169,12 +174,11 @@ def cleanup_all_cartridge_shm() -> None:
         for filename in os.listdir(SHM_CARTRIDGE_DIR):
             if filename.startswith("cart_") and filename.endswith(".pt"):
                 filepath = os.path.join(SHM_CARTRIDGE_DIR, filename)
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(filepath)
-                except OSError:
-                    pass
         logger.info("Cleaned up all cartridge shm files")
     _active_shm_paths.clear()
+
 
 # Compiled pattern for matching KV cache layer keys
 _KV_LAYER_PATTERN = re.compile(r"layers\.(\d+)\.attention\.prefix\.(keys|values)")
@@ -304,9 +308,9 @@ class CartridgeData:
 
         if keys_by_layer and values_by_layer:
             ordered_layers = sorted(set(keys_by_layer) & set(values_by_layer))
-            if len(ordered_layers) != len(keys_by_layer) or len(
-                ordered_layers
-            ) != len(values_by_layer):
+            if len(ordered_layers) != len(keys_by_layer) or len(ordered_layers) != len(
+                values_by_layer
+            ):
                 missing_keys = sorted(set(values_by_layer) - set(keys_by_layer))
                 missing_values = sorted(set(keys_by_layer) - set(values_by_layer))
                 raise ValueError(
@@ -354,9 +358,7 @@ class CartridgeData:
             metadata = {}
         metadata["_cartridge_type"] = "learned"
 
-        logger.info(
-            "Loaded learned cartridge with %d KV cache tensors.", len(kv_cache)
-        )
+        logger.info("Loaded learned cartridge with %d KV cache tensors.", len(kv_cache))
 
         return cls(
             kv_cache=kv_cache,
@@ -511,7 +513,7 @@ def load_cartridge(
         logger.debug("Acquiring lock for cartridge: %s", cartridge_id)
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
-            # Double-check cache after acquiring lock (another process may have loaded it)
+            # Double-check after acquiring lock; another process may have loaded it.
             if not force_redownload and cache_key in _cartridge_data_cache:
                 logger.debug("Cache hit after lock for: %s", cartridge_id)
                 _cartridge_data_cache.move_to_end(cache_key)
@@ -527,7 +529,8 @@ def load_cartridge(
 
             if not isinstance(cartridge_tensor, dict):
                 raise ValueError(
-                    f"Invalid cartridge format. Expected dict, got {type(cartridge_tensor)}"
+                    "Invalid cartridge format. Expected dict, got "
+                    f"{type(cartridge_tensor)}"
                 )
 
             cartridge_data = CartridgeData.from_dict(cartridge_tensor)
@@ -555,7 +558,11 @@ class CheckpointCache:
     Process-safe: Uses fcntl.flock() for atomic reads/writes across containers.
     """
 
-    def __init__(self, cache_dir: str = CHECKPOINT_CACHE_DIR, ttl: int = CHECKPOINT_CHECK_INTERVAL):
+    def __init__(
+        self,
+        cache_dir: str = CHECKPOINT_CACHE_DIR,
+        ttl: int = CHECKPOINT_CHECK_INTERVAL,
+    ):
         self.cache_dir = cache_dir
         self.ttl = ttl
         os.makedirs(cache_dir, exist_ok=True)
@@ -576,7 +583,7 @@ class CheckpointCache:
             return None
 
         try:
-            with open(cache_path, "r") as f:
+            with open(cache_path) as f:
                 # Acquire shared lock for reading
                 fcntl.flock(f.fileno(), fcntl.LOCK_SH)
                 try:
@@ -586,13 +593,13 @@ class CheckpointCache:
 
             # Check if cache is fresh
             if time.time() - cache.get("last_checked", 0) < self.ttl:
-                logger.debug(f"Using fresh cache for {run_dir}")
+                logger.debug("Using fresh cache for %s", run_dir)
                 return cache
 
-            logger.debug(f"Cache stale for {run_dir}")
+            logger.debug("Cache stale for %s", run_dir)
             return None
         except Exception as e:
-            logger.warning(f"Failed to read checkpoint cache: {e}")
+            logger.warning("Failed to read checkpoint cache: %s", e)
             return None
 
     def set(self, run_dir: str, checkpoint_path: str, latest_txt_mtime: float) -> None:
@@ -605,7 +612,7 @@ class CheckpointCache:
         cache = {
             "checkpoint_path": checkpoint_path,
             "latest_txt_mtime": latest_txt_mtime,
-            "last_checked": time.time()
+            "last_checked": time.time(),
         }
 
         try:
@@ -618,11 +625,13 @@ class CheckpointCache:
                     os.fsync(f.fileno())  # Ensure written to disk
                 finally:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            logger.debug(f"Wrote checkpoint cache for {run_dir}")
+            logger.debug("Wrote checkpoint cache for %s", run_dir)
         except Exception as e:
-            logger.warning(f"Failed to write checkpoint cache: {e}")
+            logger.warning("Failed to write checkpoint cache: %s", e)
 
-    def check_latest_txt(self, run_dir: str, cached_mtime: float | None = None) -> tuple[str | None, float | None]:
+    def check_latest_txt(
+        self, run_dir: str, cached_mtime: float | None = None
+    ) -> tuple[str | None, float | None]:
         """Check latest.txt for newest checkpoint using HEAD request.
 
         Returns (checkpoint_path, mtime) if updated, else (None, None).
@@ -644,21 +653,21 @@ class CheckpointCache:
 
             # Skip if unchanged
             if cached_mtime is not None and latest_txt_mtime <= cached_mtime:
-                logger.debug(f"latest.txt unchanged for {run_dir}")
+                logger.debug("latest.txt unchanged for %s", run_dir)
                 return None, None
 
             # Read latest.txt content
-            logger.info(f"Detected new checkpoint in latest.txt for {run_dir}")
+            logger.info("Detected new checkpoint in latest.txt for %s", run_dir)
             obj = s3.get_object(Bucket=bucket, Key=latest_txt_key)
             checkpoint_path = obj["Body"].read().decode("utf-8").strip()
 
             return checkpoint_path, latest_txt_mtime
 
         except s3.exceptions.NoSuchKey:
-            logger.debug(f"latest.txt not found for {run_dir}")
+            logger.debug("latest.txt not found for %s", run_dir)
             return None, None
         except Exception as e:
-            logger.warning(f"Failed to check latest.txt for {run_dir}: {e}")
+            logger.warning("Failed to check latest.txt for %s: %s", run_dir, e)
             return None, None
 
 
@@ -715,17 +724,22 @@ def _resolve_s3_glob(s3_pattern: str) -> str | None:
     if run_dir:
         cache = _checkpoint_cache.get(run_dir)
         if cache:
-            logger.debug(f"Using cached checkpoint: {cache['checkpoint_path']}")
+            logger.debug("Using cached checkpoint: %s", cache["checkpoint_path"])
             return cache["checkpoint_path"]
 
         # Cache miss or stale - check latest.txt
         cached_mtime = cache.get("latest_txt_mtime") if cache else None
-        checkpoint_path, latest_txt_mtime = _checkpoint_cache.check_latest_txt(run_dir, cached_mtime)
+        checkpoint_path, latest_txt_mtime = _checkpoint_cache.check_latest_txt(
+            run_dir, cached_mtime
+        )
 
         if checkpoint_path:
             # Found new checkpoint via latest.txt
+            assert latest_txt_mtime is not None
             _checkpoint_cache.set(run_dir, checkpoint_path, latest_txt_mtime)
-            logger.info(f"Resolved {s3_pattern} -> {checkpoint_path} (via latest.txt)")
+            logger.info(
+                "Resolved %s -> %s (via latest.txt)", s3_pattern, checkpoint_path
+            )
             return checkpoint_path
 
         # latest.txt exists but unchanged - use cached path
@@ -760,11 +774,11 @@ def _resolve_s3_glob(s3_pattern: str) -> str | None:
         latest_key = matches[0][1]
         resolved = f"s3://{bucket}/{latest_key}"
 
-        logger.info(f"Resolved {s3_pattern} -> {resolved} (via listing)")
+        logger.info("Resolved %s -> %s (via listing)", s3_pattern, resolved)
         return resolved
 
     except Exception as e:
-        logger.error(f"Failed to resolve S3 glob {s3_pattern}: {e}")
+        logger.error("Failed to resolve S3 glob %s: %s", s3_pattern, e)
         return None
 
 
@@ -810,7 +824,9 @@ def _resolve_modal_glob(modal_pattern: str) -> str | None:
                 if latest_path.startswith("modal://"):
                     if Path(latest_path).exists():
                         logger.info(
-                            f"Resolved {modal_pattern} -> {latest_path} (via latest.txt)"
+                            "Resolved %s -> %s (via latest.txt)",
+                            modal_pattern,
+                            latest_path,
                         )
                         return latest_path
                 elif latest_path.startswith("/"):
@@ -823,18 +839,22 @@ def _resolve_modal_glob(modal_pattern: str) -> str | None:
                     )
                     if Path(candidate).exists():
                         logger.info(
-                            f"Resolved {modal_pattern} -> {candidate} (via latest.txt)"
+                            "Resolved %s -> %s (via latest.txt)",
+                            modal_pattern,
+                            candidate,
                         )
                         return candidate
                 elif latest_path:
                     candidate = f"modal://{volume_name}/{latest_path.lstrip('/')}"
                     if Path(candidate).exists():
                         logger.info(
-                            f"Resolved {modal_pattern} -> {candidate} (via latest.txt)"
+                            "Resolved %s -> %s (via latest.txt)",
+                            modal_pattern,
+                            candidate,
                         )
                         return candidate
             except Exception as e:
-                logger.debug(f"Could not read latest.txt: {e}")
+                logger.debug("Could not read latest.txt: %s", e)
 
         glob_root = Path(base_prefix)
         relative_pattern = "/".join(pattern_parts[len(base_parts) :]) or "*"
@@ -844,11 +864,11 @@ def _resolve_modal_glob(modal_pattern: str) -> str | None:
 
         resolved = matches[-1]
 
-        logger.info(f"Resolved {modal_pattern} -> {resolved} (via glob)")
+        logger.info("Resolved %s -> %s (via glob)", modal_pattern, resolved)
         return resolved
 
     except Exception as e:
-        logger.error(f"Failed to resolve Modal glob {modal_pattern}: {e}")
+        logger.error("Failed to resolve Modal glob %s: %s", modal_pattern, e)
         return None
 
 
@@ -886,10 +906,12 @@ def _resolve_glob(pattern: str) -> str | None:
                 with open(latest_txt) as f:
                     latest_path = f.read().strip()
                 if os.path.exists(latest_path):
-                    logger.info(f"Resolved {pattern} -> {latest_path} (via latest.txt)")
+                    logger.info(
+                        "Resolved %s -> %s (via latest.txt)", pattern, latest_path
+                    )
                     return latest_path
             except Exception as e:
-                logger.debug(f"Could not read latest.txt: {e}")
+                logger.debug("Could not read latest.txt: %s", e)
 
         # Fallback: use glob
         matches = globlib.glob(pattern)
@@ -899,7 +921,7 @@ def _resolve_glob(pattern: str) -> str | None:
         matches_with_mtime = [(os.path.getmtime(m), m) for m in matches]
         matches_with_mtime.sort(reverse=True)
         resolved = matches_with_mtime[0][1]
-        logger.info(f"Resolved {pattern} -> {resolved} (via local glob)")
+        logger.info("Resolved %s -> %s (via local glob)", pattern, resolved)
         return resolved
     else:
         return pattern
@@ -949,7 +971,7 @@ def load_cartridges_from_request(
                 logger.warning("Could not resolve cartridge glob: %s", cartridge_id)
                 continue
             if resolved_id != cartridge_id:
-                logger.info(f"Using cartridge: {cartridge_id} -> {resolved_id}")
+                logger.info("Using cartridge: %s -> %s", cartridge_id, resolved_id)
             try:
                 cartridge_data = load_cartridge(
                     cartridge_id=resolved_id,
@@ -968,7 +990,9 @@ def load_cartridges_from_request(
                 continue
             except Exception as e:
                 logger.error("Failed to load cartridge %s: %s", resolved_id, e)
-                raise RuntimeError(f"Failed to load cartridge {resolved_id}: {e}") from e
+                raise RuntimeError(
+                    f"Failed to load cartridge {resolved_id}: {e}"
+                ) from e
 
         if not loaded:
             tried = [s.get("id") for s in sources]

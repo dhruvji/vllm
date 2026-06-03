@@ -8,8 +8,10 @@ Requires VLLM_TEST_ENABLE_CARTRIDGE=1 and a GPU.
 import asyncio
 import os
 
-import openai
 import pytest
+
+from tests.utils import RemoteOpenAIServer
+from vllm.platforms import current_platform
 
 os.environ["VLLM_PASSTHROUGH_ERRORS"] = "1"
 
@@ -18,9 +20,6 @@ pytestmark = [
     pytest.mark.asyncio(loop_scope="session"),
     pytest.mark.benchmark,
 ]
-
-from tests.utils import RemoteOpenAIServer
-from vllm.platforms import current_platform
 
 BASE_MODEL = "Qwen/Qwen3-0.6B"
 CHECKPOINT_PATH = os.environ.get(
@@ -37,8 +36,7 @@ def pipeline_server():
         pytest.skip("GPU required for cartridge tests")
     if not os.environ.get("VLLM_TEST_ENABLE_CARTRIDGE"):
         pytest.skip(
-            "Cartridge tests disabled "
-            "(set VLLM_TEST_ENABLE_CARTRIDGE=1 to enable)"
+            "Cartridge tests disabled (set VLLM_TEST_ENABLE_CARTRIDGE=1 to enable)"
         )
 
     args = [
@@ -113,9 +111,7 @@ async def test_cartridge_pipeline_update_during_generation(
         stream=True,
         extra_body={
             "adapters": {
-                "prefix": [
-                    {"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}
-                ]
+                "prefix": [{"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}]
             },
             "chat_template_kwargs": {"enable_thinking": False},
         },
@@ -181,9 +177,7 @@ async def test_cartridge_pipeline_update_then_new_request(
         max_tokens=64,
         extra_body={
             "adapters": {
-                "prefix": [
-                    {"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}
-                ]
+                "prefix": [{"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}]
             },
             "chat_template_kwargs": {"enable_thinking": False},
         },
@@ -222,9 +216,7 @@ async def test_cartridge_pipeline_update_then_new_request(
         max_tokens=64,
         extra_body={
             "adapters": {
-                "prefix": [
-                    {"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}
-                ]
+                "prefix": [{"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}]
             },
             "chat_template_kwargs": {"enable_thinking": False},
         },
@@ -250,9 +242,7 @@ async def test_cartridge_pipeline_concurrent_update_and_requests(
     async def make_request(i: int):
         return await pipeline_client.chat.completions.create(
             model=BASE_MODEL,
-            messages=[
-                {"role": "user", "content": f"Problem inputs: {i} and {i+10}"}
-            ],
+            messages=[{"role": "user", "content": f"Problem inputs: {i} and {i + 10}"}],
             temperature=0.0,
             max_tokens=64,
             extra_body={
@@ -301,20 +291,18 @@ async def test_cartridge_pipeline_concurrent_update_and_requests(
 
     # Check update succeeded
     update_result = results[-1]
-    if isinstance(update_result, Exception):
+    if isinstance(update_result, BaseException):
         raise update_result
     assert update_result.choices[0].message.content.strip()
     print("Update request succeeded")
 
     # Check all requests succeeded
     for i, result in enumerate(results[:-1]):
-        if isinstance(result, Exception):
+        if isinstance(result, BaseException):
             print(f"Request {i} failed: {result}")
             raise result
         text = result.choices[0].message.content.strip()
         print(f"  [{i}] response: {text[:80]}...")
         assert len(text) > 0, f"Empty response for request {i}"
 
-    print(
-        f"✓ All {n_concurrent} requests + update completed successfully"
-    )
+    print(f"✓ All {n_concurrent} requests + update completed successfully")
