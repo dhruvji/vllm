@@ -143,6 +143,25 @@ def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
     assert req.request_id in output.num_scheduled_tokens
 
 
+def test_mamba_block_aligned_split_allows_external_computed_tokens():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.cache_config = Mock(block_size=16)
+    scheduler.use_eagle = False
+    request = Mock(
+        num_computed_tokens=0,
+        num_prompt_tokens=100,
+        num_tokens=100,
+    )
+
+    num_new_tokens = scheduler._mamba_block_aligned_split(
+        request,
+        num_new_tokens=68,
+        num_external_computed_tokens=32,
+    )
+
+    assert num_new_tokens == 64
+
+
 def test_schedule_partial_requests():
     """Test scheduling behavior with partial requests.
 
@@ -1209,6 +1228,36 @@ def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):
         assert req_id in scheduler.finished_recving_kv_req_ids
 
     return initial_ecos
+
+
+def test_async_external_kv_load_skips_mamba_block_aligned_split():
+    block_size = 16
+    matched_tokens = block_size * 2
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=matched_tokens, is_async=True),
+        block_size=block_size,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    requests = create_requests(
+        num_requests=1,
+        num_tokens=matched_tokens * 2,
+        max_tokens=2,
+        block_size=block_size,
+    )
+    req_ids = []
+    for request in requests:
+        scheduler.add_request(request)
+        req_ids.append(request.request_id)
+
+    _step_until_kv_transfer_finished(scheduler, req_ids)
+
+    output = scheduler.schedule()
+    _assert_right_scheduler_output(
+        output,
+        num_requests=1,
+        expected_num_scheduled_tokens=matched_tokens,
+    )
 
 
 @pytest.mark.parametrize("is_async", [False, True])
