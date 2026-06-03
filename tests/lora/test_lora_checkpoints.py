@@ -158,10 +158,7 @@ def test_gemma4_moe_lora_weights_mapping():
     "name",
     [
         "base_model.model.model.layers.9.mlp.down_proj.lora_A.weight",
-        (
-            "base_model.model.model.language_model.layers.9.mlp."
-            "down_proj.lora_A.weight"
-        ),
+        ("base_model.model.model.language_model.layers.9.mlp.down_proj.lora_A.weight"),
     ],
 )
 def test_qwen3_5_lora_weights_mapping_supports_text_and_wrapped_names(name):
