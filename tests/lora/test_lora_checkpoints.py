@@ -8,6 +8,7 @@ from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.utils import parse_fine_tuned_lora_name
 from vllm.model_executor.models.baichuan import BaiChuanBaseForCausalLM
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from vllm.model_executor.models.utils import WeightsMapper
 
 lora_lst = ["baichuan7B", "baichuan7B-zero", "baichuan7B-zero-regex", "chatglm3-6b"]
@@ -150,4 +151,22 @@ def test_gemma4_moe_lora_weights_mapping():
     assert parse_fine_tuned_lora_name(name, mapper) == (
         "model.layers.9.moe.gate_up_proj",
         False,
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "base_model.model.model.layers.9.mlp.down_proj.lora_A.weight",
+        (
+            "base_model.model.model.language_model.layers.9.mlp."
+            "down_proj.lora_A.weight"
+        ),
+    ],
+)
+def test_qwen3_5_lora_weights_mapping_supports_text_and_wrapped_names(name):
+    mapper = Qwen3_5ForConditionalGeneration.hf_to_vllm_mapper
+    assert parse_fine_tuned_lora_name(name, mapper) == (
+        "language_model.model.layers.9.mlp.down_proj",
+        True,
     )
