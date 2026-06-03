@@ -58,6 +58,7 @@ EagleModelTypes = Literal[
 ]
 SpeculativeMethod = Literal[
     "ngram",
+    "ngram_gpu",
     "medusa",
     "mlp_speculator",
     "draft_model",
@@ -1050,20 +1051,20 @@ class SpeculativeConfig:
     def use_dflash(self) -> bool:
         return self.method == "dflash"
 
+    def use_ngram_gpu(self) -> bool:
+        return self.method == "ngram_gpu"
+
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"
 
-    def use_ngram_gpu(self) -> bool:
-        return self.method == "ngram_gpu"
-
     def __repr__(self) -> str:
         method = self.method
         model = (
             None
-            if method in ("ngram", "suffix", "extract_hidden_states")
+            if method in ("ngram", "ngram_gpu", "suffix", "extract_hidden_states")
             else self.draft_model_config.model
         )
         num_spec_tokens = self.num_speculative_tokens

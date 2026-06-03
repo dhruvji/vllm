@@ -202,3 +202,17 @@ def test_ngram_proposer():
     assert len(result[0]) == 2
     assert np.array_equal(result[0], np.array([middle_integer + 2, middle_integer + 3]))
     assert np.array_equal(result[1], np.array([]))
+
+
+def test_ngram_gpu_speculative_config():
+    config = SpeculativeConfig(
+        prompt_lookup_min=2,
+        prompt_lookup_max=3,
+        num_speculative_tokens=2,
+        method="ngram_gpu",
+    )
+
+    assert config.use_ngram_gpu()
+    assert repr(config) == (
+        "SpeculativeConfig(method='ngram_gpu', model=None, num_spec_tokens=2)"
+    )
