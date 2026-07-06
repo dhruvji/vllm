@@ -590,10 +590,13 @@ def do_expand_kernel_fp8(
     # Identify the C output pointers to store the results of the accumulator.
     offset_cn = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N + cur_slice_start
     offset_cm = tl.arange(0, BLOCK_M)
+    # Long prompts can make row * hidden_size exceed 2^31 elements.
+    ram_i64 = ram.to(tl.int64)
+    offset_cn_i64 = offset_cn.to(tl.int64)
     c_ptr = (
         out_ptr
-        + ram[:, None] * output_d0_stride
-        + offset_cn[None, :] * output_d1_stride
+        + ram_i64[:, None] * output_d0_stride
+        + offset_cn_i64[None, :] * output_d1_stride
     )
     c_mask = (offset_cm[:, None] < M_LEN) & (offset_cn[None, :] < (cur_slice_start + N))
 
