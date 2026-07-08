@@ -82,7 +82,13 @@ from vllm.utils import random_uuid
 from vllm.utils.adapter_manager import get_adapter_manager
 from vllm.utils.async_utils import collect_from_async_generator
 from vllm.utils.mistral import is_mistral_tool_parser
-from vllm.v1.cartridge_loader import _resolve_glob, _spec_sources
+from vllm.v1.cartridge_loader import (
+    _resolve_glob,
+    _spec_sources,
+    load_cartridges_from_request,
+    save_cartridge_to_shm,
+)
+from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
 
@@ -768,6 +774,103 @@ class OpenAIServing:
 
     def _extract_prompt_len(self, prompt: EngineInput):
         return extract_prompt_len(self.model_config, prompt)
+
+    def _get_prefix_adapter_specs(
+        self,
+        request: AnyRequest,
+    ) -> list[dict[str, Any]] | None:
+        adapters = getattr(request, "adapters", None)
+        if not isinstance(adapters, dict) or "prefix" not in adapters:
+            return None
+
+        prefix_specs = adapters["prefix"]
+        if not prefix_specs:
+            return None
+        if not isinstance(prefix_specs, list):
+            raise ValueError("`adapters.prefix` must be a list.")
+        if len(prefix_specs) != 1:
+            raise ValueError("Exactly one prefix cartridge is currently supported.")
+        if not isinstance(prefix_specs[0], dict):
+            raise ValueError("Each prefix cartridge spec must be an object.")
+        return prefix_specs
+
+    async def _maybe_build_engine_request_with_cartridge(
+        self,
+        request: AnyRequest,
+        engine_input: EngineInput,
+        request_id: str,
+        params: SamplingParams,
+        lora_request: LoRARequest | None,
+        trace_headers: Mapping[str, str] | None,
+        priority: int,
+        data_parallel_rank: int | None,
+    ) -> EngineInput | EngineCoreRequest:
+        prefix_specs = self._get_prefix_adapter_specs(request)
+        if prefix_specs is None:
+            return engine_input
+
+        logger.info("Processing prefix cartridge adapter request.")
+        loaded_cartridges = await asyncio.to_thread(
+            load_cartridges_from_request, prefix_specs
+        )
+        if len(loaded_cartridges) != 1:
+            raise ValueError("Failed to load prefix cartridge.")
+
+        cartridge = loaded_cartridges[0]
+        stacked_kv = cartridge.get_stacked_kv()
+        if stacked_kv is None:
+            raise ValueError(
+                "Only learned prefix cartridges with KV tensors are currently "
+                "supported."
+            )
+
+        stacked_keys = stacked_kv[0]
+        _, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
+        expected_kv_heads = self.model_config.get_total_num_kv_heads()
+        expected_head_size = self.model_config.get_head_size()
+        if cart_kv_heads != expected_kv_heads or cart_head_dim != expected_head_size:
+            raise ValueError(
+                "Prefix cartridge shape does not match model: "
+                f"kv_heads={cart_kv_heads} expected={expected_kv_heads}, "
+                f"head_dim={cart_head_dim} expected={expected_head_size}."
+            )
+
+        cartridge_spec = prefix_specs[0]
+        cartridge_id = cartridge_spec.get("id")
+        if not cartridge_id:
+            spec_sources = _spec_sources(cartridge_spec)
+            cartridge_id = spec_sources[0]["id"] if spec_sources else None
+        if not cartridge_id:
+            raise ValueError(
+                "Prefix cartridge spec must include `id` or `sources[].id`."
+            )
+
+        cartridge_shm_path = await asyncio.to_thread(
+            save_cartridge_to_shm, cartridge_id, stacked_kv
+        )
+        logger.info(
+            "Loaded prefix cartridge adapter: seq_len=%d kv_heads=%d head_dim=%d",
+            cart_seq_len,
+            cart_kv_heads,
+            cart_head_dim,
+        )
+
+        return self.input_processor.process_inputs(
+            request_id,
+            engine_input,
+            params,
+            supported_tasks=await self.engine_client.get_supported_tasks(),
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+            cartridge_id=cartridge_id,
+            cartridge_seq_len=cartridge.num_tokens,
+            cartridge_shm_path=cartridge_shm_path,
+            cartridge_allow_pipelining=bool(
+                cartridge_spec.get("allow_pipelining", False)
+            ),
+        )
 
     def _log_inputs(
         self,

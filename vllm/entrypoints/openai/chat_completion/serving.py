@@ -323,7 +323,21 @@ class OpenAIServingChat(OpenAIServing):
                 else await self._get_trace_headers(raw_request.headers)
             )
 
+            try:
+                has_prefix_adapter = (
+                    self._get_prefix_adapter_specs(request) is not None
+                )
+            except Exception as e:
+                logger.error("Failed to process cartridges: %s", e)
+                return self.create_error_response(
+                    f"Failed to process cartridges: {e}"
+                )
+
             if isinstance(sampling_params, BeamSearchParams):
+                if has_prefix_adapter:
+                    return self.create_error_response(
+                        "Beam search is not currently supported with cartridges."
+                    )
                 generator = self.beam_search(
                     prompt=engine_input,
                     request_id=sub_request_id,
@@ -346,8 +360,25 @@ class OpenAIServingChat(OpenAIServing):
                 else:
                     reasoning_ended = None
 
+                try:
+                    engine_prompt = await self._maybe_build_engine_request_with_cartridge(
+                        request=request,
+                        engine_input=engine_input,
+                        request_id=sub_request_id,
+                        params=sampling_params,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                        priority=request.priority,
+                        data_parallel_rank=data_parallel_rank,
+                    )
+                except Exception as e:
+                    logger.error("Failed to process cartridges: %s", e)
+                    return self.create_error_response(
+                        f"Failed to process cartridges: {e}"
+                    )
+
                 generator = self.engine_client.generate(
-                    engine_input,
+                    engine_prompt,
                     sampling_params,
                     sub_request_id,
                     lora_request=lora_request,
