@@ -23,6 +23,8 @@ COMMIT_HASH = os.environ.get("COMMIT_HASH") or os.environ.get("GITHUB_SHA")
 GPU_TYPE = os.environ.get("GPU_TYPE", "A100")
 GPU_COUNT = int(os.environ.get("GPU_COUNT", 1))
 SECRETS = os.environ.get("SECRETS", "dev-api-keys")
+USE_LOCAL_SOURCE = os.environ.get("VLLM_CI_USE_LOCAL_SOURCE") == "1"
+LOCAL_SOURCE_DIR = os.environ.get("VLLM_CI_LOCAL_SOURCE_DIR", ".")
 PRECOMPILED_WHEEL_COMMIT = os.environ.get(
     "VLLM_PRECOMPILED_WHEEL_COMMIT",
     "9da56fd18b95ff1b11360e8400f7c41b126d190b",
@@ -53,6 +55,23 @@ FLASHINFER_PACKAGES = (
     f"flashinfer-cubin=={FLASHINFER_VERSION}",
     f"flashinfer-jit-cache=={FLASHINFER_VERSION}+{CUDA_VARIANT}",
 )
+LOCAL_SOURCE_IGNORE = modal.FilePatternMatcher(
+    ".git/**",
+    ".env",
+    ".cursor/**",
+    ".claude/**",
+    ".codex/**",
+    ".venv/**",
+    "**/__pycache__/**",
+    ".pytest_cache/**",
+    ".ruff_cache/**",
+    ".mypy_cache/**",
+    "build/**",
+    "dist/**",
+    "downloads/**",
+    "wheels/**",
+    "**/*.egg-info/**",
+)
 
 
 def _clone_commands(branch: str, commit_hash: str | None) -> list[str]:
@@ -78,9 +97,37 @@ def _clone_commands(branch: str, commit_hash: str | None) -> list[str]:
     return [askpass_setup, clone_cmd, checkout_cmd]
 
 
+def _local_version_override(commit_hash: str | None) -> str:
+    if not commit_hash:
+        return "0.1.dev0+local"
+
+    suffix = "".join(
+        char.lower() if char.isalnum() else "." for char in commit_hash
+    ).strip(".")
+    return f"0.1.dev0+g{suffix[:12] or 'local'}"
+
+
+def _add_repo_source(base_image):
+    if USE_LOCAL_SOURCE:
+        return (
+            base_image.add_local_dir(
+                local_path=LOCAL_SOURCE_DIR,
+                remote_path=REPO_DIR,
+                copy=True,
+                ignore=LOCAL_SOURCE_IGNORE,
+            )
+            .env({"VLLM_VERSION_OVERRIDE": _local_version_override(COMMIT_HASH)})
+            .run_commands(f"echo 'vllm local source: {REPO_DIR}'")
+        )
+
+    return base_image.run_commands(
+        *_clone_commands(BRANCH, COMMIT_HASH), secrets=secrets
+    )
+
+
 secrets = [modal.Secret.from_name(SECRETS)]
 
-image = (
+image = _add_repo_source(
     modal.Image.from_registry(CUDA_IMAGE, add_python=PYTHON_VERSION)
     .entrypoint([])
     .apt_install("git", "rsync")
@@ -103,24 +150,23 @@ image = (
         "openai",
         "tblib",
     )
-    .run_commands(*_clone_commands(BRANCH, COMMIT_HASH), secrets=secrets)
-    .run_commands(
-        "/.uv/uv pip install --system --no-build-isolation "
-        "'vllm @ file:///tmp/vllm' "
-        "huggingface-hub[hf_transfer] fastsafetensors boto3 'fastapi<0.137' "
-        f"torch==2.11.0+{CUDA_VARIANT} "
-        f"torchvision==0.26.0+{CUDA_VARIANT} "
-        "prometheus-fastapi-instrumentator==7.1.0 "
-        f"flashinfer-python=={FLASHINFER_VERSION} "
-        f"flashinfer-cubin=={FLASHINFER_VERSION} "
-        f"flashinfer-jit-cache=={FLASHINFER_VERSION}+{CUDA_VARIANT} "
-        f"--extra-index-url {FLASHINFER_CUDA_INDEX} "
-        f"--torch-backend {CUDA_VARIANT}"
-    )
-    .env({**RUNTIME_ENV, "HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
 
-# Overlay local tests so workflow changes to tests are visible before install.
+image = image.run_commands(
+    "/.uv/uv pip install --system --no-build-isolation "
+    "'vllm @ file:///tmp/vllm' "
+    "huggingface-hub[hf_transfer] fastsafetensors boto3 'fastapi<0.137' "
+    f"torch==2.11.0+{CUDA_VARIANT} "
+    f"torchvision==0.26.0+{CUDA_VARIANT} "
+    "prometheus-fastapi-instrumentator==7.1.0 "
+    f"flashinfer-python=={FLASHINFER_VERSION} "
+    f"flashinfer-cubin=={FLASHINFER_VERSION} "
+    f"flashinfer-jit-cache=={FLASHINFER_VERSION}+{CUDA_VARIANT} "
+    f"--extra-index-url {FLASHINFER_CUDA_INDEX} "
+    f"--torch-backend {CUDA_VARIANT}"
+).env({**RUNTIME_ENV, "HF_HUB_ENABLE_HF_TRANSFER": "1"})
+
+# Overlay local tests at runtime so workflow changes are visible in clone mode.
 image = image.add_local_dir(
     local_path="./tests",
     remote_path="/mnt/local_tests",
@@ -154,6 +200,7 @@ def run_pytest(test_path: str, pytest_args: str = "", env_vars: str = ""):
     print("=" * 80)
     print(f"Branch: {BRANCH}")
     print(f"Commit: {COMMIT_HASH}")
+    print(f"Use local source: {USE_LOCAL_SOURCE}")
     print(f"Test path: {test_path}")
     print(f"Pytest args: {pytest_args}")
     print(f"GPU allocation: {GPU_COUNT}x {GPU_TYPE}")

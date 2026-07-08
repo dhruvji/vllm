@@ -27,6 +27,7 @@ jobs:
       VLLM_PRECOMPILED_WHEEL_COMMIT: "9da56fd18b95ff1b11360e8400f7c41b126d190b"
       BRANCH: ${{ github.head_ref || github.ref_name }}
       COMMIT_HASH: ${{ github.event.pull_request.head.sha || github.sha }}
+      VLLM_CI_USE_LOCAL_SOURCE: "1"
 
     steps:
       - name: Checkout code
