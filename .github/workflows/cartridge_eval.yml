@@ -1,0 +1,50 @@
+name: Cartridge Regression Eval
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cartridge-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      GPU_TYPE: "H200"
+      GPU_COUNT: "1"
+      SECRETS: "dev-api-keys"
+      VLLM_PRECOMPILED_WHEEL_COMMIT: "9da56fd18b95ff1b11360e8400f7c41b126d190b"
+      BRANCH: ${{ github.head_ref || github.ref_name }}
+      COMMIT_HASH: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Modal CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install modal
+
+      - name: Run missing-cartridge regression
+        run: |
+          modal run --env=ci .github/scripts/modal_ci_pytest.py \
+            --test-path tests/test_cartridge_addition_eval.py::test_cartridge_not_found_returns_http_error \
+            --pytest-args "-v -x -m benchmark" \
+            --env-vars "VLLM_TEST_ENABLE_CARTRIDGE=1,VLLM_PASSTHROUGH_ERRORS=1"
