@@ -190,14 +190,10 @@ class OpenAIServingCompletion(OpenAIServing):
             )
 
             try:
-                has_prefix_adapter = (
-                    self._get_prefix_adapter_specs(request) is not None
-                )
+                has_prefix_adapter = self._get_prefix_adapter_specs(request) is not None
             except Exception as e:
                 logger.error("Failed to process cartridges: %s", e)
-                return self.create_error_response(
-                    f"Failed to process cartridges: {e}"
-                )
+                return self.create_error_response(f"Failed to process cartridges: {e}")
 
             if isinstance(sampling_params, BeamSearchParams):
                 if has_prefix_adapter:
@@ -213,15 +209,17 @@ class OpenAIServingCompletion(OpenAIServing):
                 )
             else:
                 try:
-                    engine_prompt = await self._maybe_build_engine_request_with_cartridge(
-                        request=request,
-                        engine_input=engine_input,
-                        request_id=request_id_item,
-                        params=sampling_params,
-                        lora_request=lora_request,
-                        trace_headers=trace_headers,
-                        priority=request.priority,
-                        data_parallel_rank=data_parallel_rank,
+                    engine_prompt = (
+                        await self._maybe_build_engine_request_with_cartridge(
+                            request=request,
+                            engine_input=engine_input,
+                            request_id=request_id_item,
+                            params=sampling_params,
+                            lora_request=lora_request,
+                            trace_headers=trace_headers,
+                            priority=request.priority,
+                            data_parallel_rank=data_parallel_rank,
+                        )
                     )
                 except Exception as e:
                     logger.error("Failed to process cartridges: %s", e)
