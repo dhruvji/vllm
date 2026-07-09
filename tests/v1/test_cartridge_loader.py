@@ -8,6 +8,7 @@ from concurrent.futures import Future
 
 import torch
 
+from vllm.sampling_params import SamplingParams
 from vllm.v1 import cartridge_loader
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine.core import EngineCore
@@ -185,6 +186,82 @@ def test_real_model_layer_indices_stack_in_sorted_attention_order():
 
     assert torch.equal(stacked_keys, torch.stack(expected_keys))
     assert torch.equal(stacked_values, torch.stack(expected_values))
+
+
+def test_prepare_prefix_cartridge_request_builds_engine_fields(monkeypatch):
+    kv_cache = {
+        "layers.0.attention.prefix.keys": torch.zeros(1, 2, 4, 5),
+        "layers.0.attention.prefix.values": torch.ones(1, 2, 4, 5),
+    }
+    cartridge = cartridge_loader.CartridgeData(kv_cache=kv_cache, is_learned=True)
+    prefix_specs = [
+        {
+            "sources": [{"id": "missing"}, {"id": "fallback-*"}],
+            "force_redownload": True,
+            "allow_pipelining": True,
+        }
+    ]
+    request = type(
+        "Request",
+        (),
+        {"adapters": {"prefix": prefix_specs}, "truncate_prompt_tokens": None},
+    )()
+    saved = {}
+
+    def fake_load_cartridges(cartridges_spec):
+        assert cartridges_spec is prefix_specs
+        return [("fallback-resolved", cartridge)]
+
+    def fake_save_cartridge(cartridge_id, stacked_kv, overwrite=False):
+        saved["cartridge_id"] = cartridge_id
+        saved["stacked_kv"] = stacked_kv
+        saved["overwrite"] = overwrite
+        return "/tmp/fallback-resolved.pt"
+
+    monkeypatch.setattr(
+        cartridge_loader,
+        "load_cartridges_from_request_with_ids",
+        fake_load_cartridges,
+    )
+    monkeypatch.setattr(cartridge_loader, "save_cartridge_to_shm", fake_save_cartridge)
+
+    params = SamplingParams(max_tokens=10)
+    prepared = cartridge_loader.prepare_prefix_cartridge_request(
+        request,
+        prompt_len=5,
+        max_model_len=8,
+        expected_kv_heads=4,
+        expected_head_size=5,
+        sampling_params=params,
+        truncate_prompt_tokens=None,
+    )
+
+    assert prepared is not None
+    assert prepared.cartridge_id == "fallback-resolved"
+    assert prepared.cartridge_seq_len == 2
+    assert prepared.cartridge_shm_path == "/tmp/fallback-resolved.pt"
+    assert prepared.cartridge_allow_pipelining is True
+    assert prepared.sampling_params is not params
+    assert prepared.sampling_params.max_tokens == 1
+    assert saved["cartridge_id"] == "fallback-resolved"
+    assert saved["overwrite"] is True
+    assert saved["stacked_kv"] is cartridge.get_stacked_kv()
+
+
+def test_prepare_prefix_cartridge_request_returns_none_without_prefix():
+    request = type("Request", (), {"adapters": {"lora": []}})()
+
+    prepared = cartridge_loader.prepare_prefix_cartridge_request(
+        request,
+        prompt_len=5,
+        max_model_len=8,
+        expected_kv_heads=4,
+        expected_head_size=5,
+        sampling_params=SamplingParams(max_tokens=1),
+        truncate_prompt_tokens=None,
+    )
+
+    assert prepared is None
 
 
 def test_engine_update_cartridge_tracks_shm_for_cleanup(monkeypatch):

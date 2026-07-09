@@ -85,10 +85,9 @@ from vllm.utils.mistral import is_mistral_tool_parser
 from vllm.v1.cartridge_loader import (
     _resolve_glob,
     _spec_sources,
-    load_cartridges_from_request_with_ids,
-    save_cartridge_to_shm,
+    get_prefix_cartridge_specs,
+    prepare_prefix_cartridge_request,
 )
-from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
 
@@ -779,20 +778,7 @@ class OpenAIServing:
         self,
         request: AnyRequest,
     ) -> list[dict[str, Any]] | None:
-        adapters = getattr(request, "adapters", None)
-        if not isinstance(adapters, dict) or "prefix" not in adapters:
-            return None
-
-        prefix_specs = adapters["prefix"]
-        if not prefix_specs:
-            return None
-        if not isinstance(prefix_specs, list):
-            raise ValueError("`adapters.prefix` must be a list.")
-        if len(prefix_specs) != 1:
-            raise ValueError("Exactly one prefix cartridge is currently supported.")
-        if not isinstance(prefix_specs[0], dict):
-            raise ValueError("Each prefix cartridge spec must be an object.")
-        return prefix_specs
+        return get_prefix_cartridge_specs(request)
 
     async def _maybe_build_engine_request_with_cartridge(
         self,
@@ -804,90 +790,33 @@ class OpenAIServing:
         trace_headers: Mapping[str, str] | None,
         priority: int,
         data_parallel_rank: int | None,
-    ) -> EngineInput | EngineCoreRequest:
-        prefix_specs = self._get_prefix_adapter_specs(request)
-        if prefix_specs is None:
+    ):
+        prepared_cartridge = await asyncio.to_thread(
+            prepare_prefix_cartridge_request,
+            request,
+            prompt_len=self._extract_prompt_len(engine_input),
+            max_model_len=self.model_config.max_model_len,
+            expected_kv_heads=self.model_config.get_total_num_kv_heads(),
+            expected_head_size=self.model_config.get_head_size(),
+            sampling_params=params,
+            truncate_prompt_tokens=getattr(request, "truncate_prompt_tokens", None),
+        )
+        if prepared_cartridge is None:
             return engine_input
-
-        logger.info("Processing prefix cartridge adapter request.")
-        loaded_cartridges = await asyncio.to_thread(
-            load_cartridges_from_request_with_ids, prefix_specs
-        )
-        if len(loaded_cartridges) != 1:
-            raise ValueError("Failed to load prefix cartridge.")
-
-        cartridge_id, cartridge = loaded_cartridges[0]
-        stacked_kv = cartridge.get_stacked_kv()
-        if stacked_kv is None:
-            raise ValueError(
-                "Only learned prefix cartridges with KV tensors are currently "
-                "supported."
-            )
-
-        stacked_keys = stacked_kv[0]
-        _, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
-        expected_kv_heads = self.model_config.get_total_num_kv_heads()
-        expected_head_size = self.model_config.get_head_size()
-        if cart_kv_heads != expected_kv_heads or cart_head_dim != expected_head_size:
-            raise ValueError(
-                "Prefix cartridge shape does not match model: "
-                f"kv_heads={cart_kv_heads} expected={expected_kv_heads}, "
-                f"head_dim={cart_head_dim} expected={expected_head_size}."
-            )
-
-        cartridge_spec = prefix_specs[0]
-        prompt_len = self._extract_prompt_len(engine_input)
-        truncate_prompt_tokens = getattr(request, "truncate_prompt_tokens", None)
-        if truncate_prompt_tokens is not None:
-            prompt_len = min(
-                prompt_len,
-                self.model_config.max_model_len
-                if truncate_prompt_tokens == -1
-                else truncate_prompt_tokens,
-            )
-        effective_input_len = prompt_len + cartridge.num_tokens
-        if effective_input_len > self.model_config.max_model_len:
-            raise ValueError(
-                "Input length plus prefix cartridge length exceeds model's "
-                "maximum context length: "
-                f"{prompt_len} + {cartridge.num_tokens} > "
-                f"{self.model_config.max_model_len}."
-            )
-        max_tokens_with_cartridge = (
-            self.model_config.max_model_len - effective_input_len
-        )
-        if params.max_tokens is None or params.max_tokens > max_tokens_with_cartridge:
-            params = params.clone()
-            params.max_tokens = max_tokens_with_cartridge
-
-        cartridge_shm_path = await asyncio.to_thread(
-            save_cartridge_to_shm,
-            cartridge_id,
-            stacked_kv,
-            overwrite=bool(cartridge_spec.get("force_redownload", False)),
-        )
-        logger.info(
-            "Loaded prefix cartridge adapter: seq_len=%d kv_heads=%d head_dim=%d",
-            cart_seq_len,
-            cart_kv_heads,
-            cart_head_dim,
-        )
 
         return self.input_processor.process_inputs(
             request_id,
             engine_input,
-            params,
+            prepared_cartridge.sampling_params,
             supported_tasks=await self.engine_client.get_supported_tasks(),
             lora_request=lora_request,
             trace_headers=trace_headers,
             priority=priority,
             data_parallel_rank=data_parallel_rank,
-            cartridge_id=cartridge_id,
-            cartridge_seq_len=cartridge.num_tokens,
-            cartridge_shm_path=cartridge_shm_path,
-            cartridge_allow_pipelining=bool(
-                cartridge_spec.get("allow_pipelining", False)
-            ),
+            cartridge_id=prepared_cartridge.cartridge_id,
+            cartridge_seq_len=prepared_cartridge.cartridge_seq_len,
+            cartridge_shm_path=prepared_cartridge.cartridge_shm_path,
+            cartridge_allow_pipelining=(prepared_cartridge.cartridge_allow_pipelining),
         )
 
     def _log_inputs(
