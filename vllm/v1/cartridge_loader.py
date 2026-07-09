@@ -77,12 +77,14 @@ def _get_shm_lock_path(cartridge_id: str) -> str:
 def save_cartridge_to_shm(
     cartridge_id: str,
     stacked_kv: list[torch.Tensor],
+    overwrite: bool = False,
 ) -> str:
     """Save cartridge KV tensors to shared memory for zero-copy IPC.
 
     Args:
         cartridge_id: Unique identifier for the cartridge
         stacked_kv: List of [stacked_keys, stacked_values] tensors
+        overwrite: If True, replace any existing shared-memory payload
 
     Returns:
         Path to the shared memory file
@@ -95,20 +97,24 @@ def save_cartridge_to_shm(
     with open(lock_path, "a+b") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
-            # Another request may already have finished writing the cartridge.
-            # Because writes are lock-protected and completed via atomic rename,
-            # an existing target path is safe to reuse once we hold the lock.
             if os.path.exists(shm_path):
-                if zipfile.is_zipfile(shm_path):
+                if overwrite:
+                    logger.info("Overwriting cartridge shm: %s", shm_path)
+                    os.unlink(shm_path)
+                elif zipfile.is_zipfile(shm_path):
+                    # Another request may already have finished writing the
+                    # cartridge. Because writes are lock-protected and completed
+                    # via atomic rename, an existing target path is safe to
+                    # reuse once we hold the lock.
                     logger.debug("Cartridge already in shm: %s", shm_path)
                     _active_shm_paths[cartridge_id] = shm_path
                     return shm_path
-
-                logger.warning(
-                    "Found invalid cartridge shm file, rewriting: %s",
-                    shm_path,
-                )
-                os.unlink(shm_path)
+                else:
+                    logger.warning(
+                        "Found invalid cartridge shm file, rewriting: %s",
+                        shm_path,
+                    )
+                    os.unlink(shm_path)
 
             # Write to a unique temp path and atomically publish once complete
             # so concurrent readers never observe a partial torch archive.
@@ -948,10 +954,10 @@ def _spec_sources(spec: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"id": cartridge_id, "source": spec.get("source")}]
 
 
-def load_cartridges_from_request(
+def load_cartridges_from_request_with_ids(
     cartridges_spec: list[dict[str, Any]],
-) -> list[CartridgeData]:
-    """Load multiple cartridges from a request specification."""
+) -> list[tuple[str, CartridgeData]]:
+    """Load cartridges and return the resolved ID used for each one."""
     loaded_cartridges = []
 
     for spec in cartridges_spec:
@@ -977,7 +983,7 @@ def load_cartridges_from_request(
                     cartridge_id=resolved_id,
                     force_redownload=spec.get("force_redownload", False),
                 )
-                loaded_cartridges.append(cartridge_data)
+                loaded_cartridges.append((resolved_id, cartridge_data))
                 loaded = True
                 break
             except FileNotFoundError as e:
@@ -1001,3 +1007,13 @@ def load_cartridges_from_request(
             raise RuntimeError(msg) from last_err
 
     return loaded_cartridges
+
+
+def load_cartridges_from_request(
+    cartridges_spec: list[dict[str, Any]],
+) -> list[CartridgeData]:
+    """Load multiple cartridges from a request specification."""
+    return [
+        cartridge
+        for _, cartridge in load_cartridges_from_request_with_ids(cartridges_spec)
+    ]

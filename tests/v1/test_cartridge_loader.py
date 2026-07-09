@@ -41,6 +41,30 @@ def test_save_cartridge_to_shm_rewrites_invalid_existing_file(tmp_path, monkeypa
     assert torch.equal(loaded[1], stacked_kv[1])
 
 
+def test_save_cartridge_to_shm_overwrites_existing_file_when_requested(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        cartridge_loader, "SHM_CARTRIDGE_DIR", str(tmp_path / "cartridges")
+    )
+    _reset_shm_state()
+
+    cartridge_id = "s3://bucket/path/to/cartridge.pt"
+    stale_kv = [torch.zeros(1, 1, 2, 3), torch.zeros(1, 1, 2, 3)]
+    fresh_kv = [torch.ones(1, 1, 2, 3), torch.ones(1, 1, 2, 3)]
+
+    shm_path = cartridge_loader.save_cartridge_to_shm(cartridge_id, stale_kv)
+    saved_path = cartridge_loader.save_cartridge_to_shm(
+        cartridge_id, fresh_kv, overwrite=True
+    )
+    loaded = cartridge_loader.load_cartridge_from_shm(saved_path)
+
+    assert saved_path == shm_path
+    assert loaded is not None
+    assert torch.equal(loaded[0], fresh_kv[0])
+    assert torch.equal(loaded[1], fresh_kv[1])
+
+
 def test_save_cartridge_to_shm_serializes_concurrent_writers(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cartridge_loader, "SHM_CARTRIDGE_DIR", str(tmp_path / "cartridges")
@@ -97,6 +121,36 @@ def test_save_cartridge_to_shm_serializes_concurrent_writers(tmp_path, monkeypat
     assert loaded is not None
     assert torch.equal(loaded[0], stacked_kv[0])
     assert torch.equal(loaded[1], stacked_kv[1])
+
+
+def test_load_cartridges_from_request_with_ids_uses_successful_source(monkeypatch):
+    cartridge = cartridge_loader.CartridgeData(token_ids=[1, 2, 3])
+
+    def fake_resolve_glob(cartridge_id):
+        return {
+            "missing": "missing",
+            "fallback-*": "fallback-resolved",
+        }[cartridge_id]
+
+    def fake_load_cartridge(cartridge_id, force_redownload=False):
+        if cartridge_id == "missing":
+            raise FileNotFoundError(cartridge_id)
+        assert force_redownload is True
+        return cartridge
+
+    monkeypatch.setattr(cartridge_loader, "_resolve_glob", fake_resolve_glob)
+    monkeypatch.setattr(cartridge_loader, "load_cartridge", fake_load_cartridge)
+
+    loaded = cartridge_loader.load_cartridges_from_request_with_ids(
+        [
+            {
+                "sources": [{"id": "missing"}, {"id": "fallback-*"}],
+                "force_redownload": True,
+            }
+        ]
+    )
+
+    assert loaded == [("fallback-resolved", cartridge)]
 
 
 def test_real_model_layer_indices_stack_in_sorted_attention_order():
