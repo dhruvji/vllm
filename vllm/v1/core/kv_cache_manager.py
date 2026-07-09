@@ -356,9 +356,11 @@ class KVCacheManager:
             self.max_model_len,
         )
 
+        cart_seq_len = getattr(request, "cartridge_seq_len", 0)
+
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
-            full_num_tokens = min(request.num_tokens, self.max_model_len)
+            full_num_tokens = min(request.num_tokens + cart_seq_len, self.max_model_len)
 
             num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,
@@ -372,7 +374,11 @@ class KVCacheManager:
             if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
                 return None
 
-        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        # Cartridge KV occupies the leading cache slots, but it is not part of
+        # request.num_computed_tokens because the model should only process the
+        # real prompt/output tokens. Allocate for the full cache slot span so
+        # the worker can prepopulate cartridge blocks before prompt slots.
+        num_tokens_main_model = cart_seq_len + total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
@@ -433,10 +439,9 @@ class KVCacheManager:
         # "finalized" tokens are cached.
         # For cartridge requests, include cartridge in both the total and cap
         # so cartridge blocks get cached for prefix sharing.
-        cart_seq_len_alloc = getattr(request, "cartridge_seq_len", 0)
         num_tokens_to_cache = min(
-            total_computed_tokens + num_new_tokens + cart_seq_len_alloc,
-            request.num_tokens + cart_seq_len_alloc,
+            total_computed_tokens + num_new_tokens + cart_seq_len,
+            request.num_tokens + cart_seq_len,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
