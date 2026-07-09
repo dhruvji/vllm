@@ -2370,6 +2370,20 @@ class GPUModelRunner(
         )
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
+        cartridge_offsets_cpu = None
+        if self.cartridge_position_offsets:
+            cartridge_offsets = [
+                self.cartridge_position_offsets.get(req_id, 0)
+                for req_id in self.input_batch.req_ids[:num_reqs]
+            ]
+            if any(cartridge_offsets):
+                cartridge_offsets_cpu = torch.tensor(
+                    cartridge_offsets,
+                    dtype=self.optimistic_seq_lens_cpu.dtype,
+                    device="cpu",
+                )
+                self.optimistic_seq_lens_cpu[:num_reqs] += cartridge_offsets_cpu
+
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
@@ -2441,6 +2455,16 @@ class GPUModelRunner(
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
+        if cartridge_offsets_cpu is not None:
+            cartridge_offsets_gpu = cartridge_offsets_cpu.to(
+                device=self.device,
+                dtype=self.seq_lens.dtype,
+                non_blocking=True,
+            )
+            self.positions[:total_num_scheduled_tokens] += cartridge_offsets_gpu[
+                req_indices_gpu
+            ].to(torch.int64)
+            self.seq_lens[:num_reqs] += cartridge_offsets_gpu
         self.seq_lens[num_reqs:].fill_(0)
 
         self.input_batch.block_table.compute_slot_mapping(
