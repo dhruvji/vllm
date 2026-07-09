@@ -2658,7 +2658,7 @@ class GPUModelRunner(
         mamba_max_seq_len = None
         if self.cartridge_position_offsets:
             mamba_seq_lens_np = strip_cartridge_offsets_from_seq_lens(
-                self.seq_lens.np[:num_reqs_padded],
+                self.seq_lens[:num_reqs_padded],
                 self.input_batch.req_ids[:num_reqs],
                 self.cartridge_position_offsets,
             )
@@ -4604,6 +4604,9 @@ class GPUModelRunner(
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            def _cartridge_debug_max_seq_len() -> int:
+                return int(self.seq_lens[:num_reqs].max().item()) if num_reqs else 0
+
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -4615,9 +4618,7 @@ class GPUModelRunner(
                         postprocess_ms = (
                             time.perf_counter() - postprocess_start
                         ) * 1000.0
-                        max_seq_len = (
-                            int(self.seq_lens.np[:num_reqs].max()) if num_reqs else 0
-                        )
+                        max_seq_len = _cartridge_debug_max_seq_len()
                         logger.info(
                             "[cartridge-step] num_reqs=%d tokens=%d max_query_len=%d "
                             "max_seq_len=%d prepare_inputs_ms=%.2f build_attn_ms=%.2f "
@@ -4646,9 +4647,7 @@ class GPUModelRunner(
                         postprocess_ms = (
                             time.perf_counter() - postprocess_start
                         ) * 1000.0
-                        max_seq_len = (
-                            int(self.seq_lens.np[:num_reqs].max()) if num_reqs else 0
-                        )
+                        max_seq_len = _cartridge_debug_max_seq_len()
                         logger.info(
                             "[cartridge-step] num_reqs=%d tokens=%d max_query_len=%d "
                             "max_seq_len=%d prepare_inputs_ms=%.2f build_attn_ms=%.2f "
@@ -4669,9 +4668,7 @@ class GPUModelRunner(
                 logits = self.model.compute_logits(sample_hidden_states)
                 if _CARTRIDGE_DEBUG_TIMING and step_has_cartridge:
                     postprocess_ms = (time.perf_counter() - postprocess_start) * 1000.0
-                    max_seq_len = (
-                        int(self.seq_lens.np[:num_reqs].max()) if num_reqs else 0
-                    )
+                    max_seq_len = _cartridge_debug_max_seq_len()
                     logger.info(
                         "[cartridge-step] num_reqs=%d tokens=%d max_query_len=%d "
                         "max_seq_len=%d prepare_inputs_ms=%.2f build_attn_ms=%.2f "
@@ -4717,9 +4714,7 @@ class GPUModelRunner(
                 logits = broadcasted["logits"]
                 if _CARTRIDGE_DEBUG_TIMING and step_has_cartridge:
                     postprocess_ms = (time.perf_counter() - postprocess_start) * 1000.0
-                    max_seq_len = (
-                        int(self.seq_lens.np[:num_reqs].max()) if num_reqs else 0
-                    )
+                    max_seq_len = _cartridge_debug_max_seq_len()
                     logger.info(
                         "[cartridge-step] num_reqs=%d tokens=%d max_query_len=%d "
                         "max_seq_len=%d prepare_inputs_ms=%.2f build_attn_ms=%.2f "
