@@ -23,3 +23,4 @@
 - Reasoning configuration must not register duplicate CLI arguments. (#66)
 - Modal volume reload and commit calls must not block an active async event loop. (#52)
 - Modal local-source images must preinstall every no-build-isolation backend.
+- Modal source overlays must use the matching upstream wheel and cartridge runner.
