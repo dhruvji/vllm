@@ -39,6 +39,21 @@ except ModuleNotFoundError:
     PYTHON_VERSION = "3.12"
     REPO_URL = "https://$GITHUB_TOKEN@github.com/engram-lab/vllm.git"
     REPO_DIR = "/tmp/vllm"
+    USE_LOCAL_SOURCE = os.environ.get("VLLM_CI_USE_LOCAL_SOURCE") == "1"
+    LOCAL_SOURCE_DIR = os.environ.get("VLLM_CI_LOCAL_SOURCE_DIR", ".")
+    LOCAL_SOURCE_IGNORE = modal.FilePatternMatcher(
+        ".git/**",
+        ".venv/**",
+        "**/__pycache__/**",
+        ".pytest_cache/**",
+        ".ruff_cache/**",
+        ".mypy_cache/**",
+        "build/**",
+        "dist/**",
+        "downloads/**",
+        "wheels/**",
+        "**/*.egg-info/**",
+    )
     PRECOMPILED_WHEEL_COMMIT = os.environ.get(
         "VLLM_PRECOMPILED_WHEEL_COMMIT",
         "877dae9c684cd8cb2f66eed33f1c3261c6792c10",
@@ -113,10 +128,23 @@ except ModuleNotFoundError:
         if pre_repo_packages:
             image = image.uv_pip_install(*_as_tuple(pre_repo_packages))
 
+        if USE_LOCAL_SOURCE:
+            image = image.add_local_dir(
+                local_path=LOCAL_SOURCE_DIR,
+                remote_path=REPO_DIR,
+                copy=True,
+                ignore=LOCAL_SOURCE_IGNORE,
+            ).env({"VLLM_VERSION_OVERRIDE": "0.1.dev0+ci"})
+        else:
+            image = image.run_commands(
+                *_clone_commands(branch, commit_hash),
+                secrets=secrets,
+            )
+
         image = image.run_commands(
-            *_clone_commands(branch, commit_hash),
-            secrets=secrets,
-        ).uv_pip_install("vllm @ file:///tmp/vllm")
+            "/.uv/uv pip install --system --no-build-isolation "
+            "'vllm @ file:///tmp/vllm' --torch-backend cu130"
+        )
 
         if post_repo_packages:
             image = image.uv_pip_install(*_as_tuple(post_repo_packages))
@@ -152,6 +180,11 @@ image = build_ci_image(
     commit_hash=COMMIT_HASH,
     secrets=[secrets],
     pre_repo_packages=(
+        "packaging",
+        "setuptools>=77,<82",
+        "setuptools-rust>=1.9.0",
+        "setuptools-scm",
+        "wheel",
         "huggingface-hub[hf_transfer]==0.36.0",
         "boto3",
     ),
