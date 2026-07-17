@@ -165,7 +165,6 @@ image = image.run_commands(
     "huggingface-hub[hf_transfer] fastsafetensors boto3 'fastapi<0.137' "
     f"torch==2.11.0+{CUDA_VARIANT} "
     f"torchvision==0.26.0+{CUDA_VARIANT} "
-    "prometheus-fastapi-instrumentator==7.1.0 "
     f"flashinfer-python=={FLASHINFER_VERSION} "
     f"flashinfer-cubin=={FLASHINFER_VERSION} "
     f"--extra-index-url {FLASHINFER_CUDA_INDEX} "
