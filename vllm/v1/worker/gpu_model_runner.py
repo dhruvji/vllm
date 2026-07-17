@@ -211,8 +211,8 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
-from vllm.v1.worker.cartridge_utils import strip_cartridge_offsets_from_seq_lens
 from vllm.v1.worker.block_table import SlotMappingMode
+from vllm.v1.worker.cartridge_utils import strip_cartridge_offsets_from_seq_lens
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_dcp_dummy_context_len,
@@ -221,7 +221,6 @@ from vllm.v1.worker.cp_utils import (
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
-from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper

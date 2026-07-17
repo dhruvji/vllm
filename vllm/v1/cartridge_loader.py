@@ -40,10 +40,13 @@ logger = init_logger(__name__)
 
 
 def _vllm_cache_root() -> str:
+    cache_root = os.environ.get("VLLM_CACHE_ROOT")
+    if cache_root:
+        return os.path.expanduser(cache_root)
     cache_home = os.environ.get("XDG_CACHE_HOME")
     if cache_home:
         return os.path.join(cache_home, "vllm")
-    return "/root/.cache/vllm"
+    return os.path.expanduser("~/.cache/vllm")
 
 
 # Directory for cartridge IPC files. Use the vLLM cache root instead of /dev/shm

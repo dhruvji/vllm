@@ -376,7 +376,7 @@ def test_cartridge_cache_miss_allocates_prefix_slots(hash_fn):
     block_size = 16
     cartridge_seq_len = 4096
     prompt_token_ids = [42]
-    manager = KVCacheManager(
+    manager = make_kv_cache_manager(
         make_kv_cache_config(block_size, 300),
         max_model_len=8192,
         enable_caching=True,
@@ -386,7 +386,7 @@ def test_cartridge_cache_miss_allocates_prefix_slots(hash_fn):
     req = make_cartridge_request(
         "cart-miss", prompt_token_ids, block_size, hash_fn, cartridge_seq_len
     )
-    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req)
 
     assert not computed_blocks.blocks[0]
     assert num_computed_tokens == 0
@@ -410,7 +410,7 @@ def test_cartridge_cache_hit_still_allocates_prompt_slot(hash_fn):
     block_size = 16
     cartridge_seq_len = 4096
     prompt_token_ids = [42]
-    manager = KVCacheManager(
+    manager = make_kv_cache_manager(
         make_kv_cache_config(block_size, 300),
         max_model_len=8192,
         enable_caching=True,
@@ -420,7 +420,7 @@ def test_cartridge_cache_hit_still_allocates_prompt_slot(hash_fn):
     req0 = make_cartridge_request(
         "cart-hit-0", prompt_token_ids, block_size, hash_fn, cartridge_seq_len
     )
-    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
     assert manager.allocate_slots(
         req0, len(prompt_token_ids), num_computed_tokens, computed_blocks
     )
@@ -429,7 +429,7 @@ def test_cartridge_cache_hit_still_allocates_prompt_slot(hash_fn):
     req1 = make_cartridge_request(
         "cart-hit-1", prompt_token_ids, block_size, hash_fn, cartridge_seq_len
     )
-    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
 
     num_cartridge_blocks = cartridge_seq_len // block_size
     assert computed_blocks.get_block_ids() == (req0_block_ids[:num_cartridge_blocks],)

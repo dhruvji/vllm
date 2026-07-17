@@ -59,6 +59,8 @@ def get_mamba_manager(mamba_spec, block_pool, enable_caching=True):
         block_pool=block_pool,
         enable_caching=enable_caching,
         kv_cache_group_id=0,
+        scheduler_block_size=mamba_spec.block_size,
+        max_admission_blocks_per_request=10**9,
     )
 
 
@@ -480,7 +482,7 @@ def test_mamba_align_drops_oversized_computed_blocks_before_allocation():
 
     request_id = "req"
     cartridge_like_blocks = block_pool.blocks[1:5]
-    manager.allocate_new_computed_blocks(
+    manager.add_local_computed_blocks(
         request_id,
         cartridge_like_blocks,
         num_local_computed_tokens=4 * block_size,

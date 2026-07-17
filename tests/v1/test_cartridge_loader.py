@@ -325,7 +325,7 @@ def test_batch_queue_attaches_pending_cartridge_overwrites():
         def has_requests(self):
             return True
 
-        def schedule(self):
+        def schedule(self, defer_prefills=False):
             return scheduler_output
 
         def update_from_output(self, scheduler_output, model_output):
@@ -346,7 +346,7 @@ def test_batch_queue_attaches_pending_cartridge_overwrites():
 
     outputs, model_executed = engine.step_with_batch_queue()
 
-    assert outputs == {}
+    assert outputs is None
     assert model_executed is False
     assert executed_outputs == [scheduler_output]
     assert scheduler_output.cartridge_overwrites == {"cart-1": stacked_kv}

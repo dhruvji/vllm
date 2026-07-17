@@ -13,6 +13,7 @@ from pydantic import ConfigDict
 from starlette.datastructures import Headers
 
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.generate.adapter_serving import EngramAdapterServingMixin
 from vllm.entrypoints.generate.beam_search.online import BeamSearchOnlineMixin
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
@@ -37,11 +38,11 @@ from vllm.tracing import (
     extract_trace_headers,
     log_tracing_disabled_warning,
 )
-from vllm.v1.metrics.stats import RequestStateStats
 from vllm.v1.cartridge_loader import (
     get_prefix_cartridge_specs,
     prepare_prefix_cartridge_request,
 )
+from vllm.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
 
@@ -116,7 +117,9 @@ class ServeContext(Generic[RequestT]):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
-class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
+class GenerateBaseServing(
+    EngramAdapterServingMixin, BaseServing, BeamSearchOnlineMixin
+):
     request_id_prefix: ClassVar[str] = """
     A short string prepended to every request’s ID.
     """
@@ -139,6 +142,7 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         self.return_tokens_as_token_ids = return_tokens_as_token_ids
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
+        self._init_engram_adapter_serving()
         vllm_config = getattr(engine_client, "vllm_config", None)
         kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
         self.has_kv_connector = kv_transfer_config is not None
@@ -173,6 +177,9 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         priority: int,
         data_parallel_rank: int | None,
     ) -> EngineInput:
+        if self._get_prefix_adapter_specs(request) is None:
+            return engine_input
+
         prepared = await asyncio.to_thread(
             prepare_prefix_cartridge_request,
             request,

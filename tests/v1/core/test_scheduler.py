@@ -230,11 +230,14 @@ def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
 def test_mamba_block_aligned_split_allows_external_computed_tokens():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.cache_config = Mock(block_size=16)
+    scheduler.hash_block_size = 16
+    scheduler.mamba_partial_cache_hit = False
     scheduler.use_eagle = False
     request = Mock(
         num_computed_tokens=0,
         num_prompt_tokens=100,
         num_tokens=100,
+        shared_prefix_boundary=0,
     )
 
     num_new_tokens = scheduler._mamba_block_aligned_split(
