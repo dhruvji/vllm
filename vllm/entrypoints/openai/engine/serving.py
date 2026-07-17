@@ -82,7 +82,12 @@ from vllm.utils import random_uuid
 from vllm.utils.adapter_manager import get_adapter_manager
 from vllm.utils.async_utils import collect_from_async_generator
 from vllm.utils.mistral import is_mistral_tool_parser
-from vllm.v1.cartridge_loader import _resolve_glob, _spec_sources
+from vllm.v1.cartridge_loader import (
+    _resolve_glob,
+    _spec_sources,
+    get_prefix_cartridge_specs,
+    prepare_prefix_cartridge_request,
+)
 
 logger = init_logger(__name__)
 
@@ -768,6 +773,51 @@ class OpenAIServing:
 
     def _extract_prompt_len(self, prompt: EngineInput):
         return extract_prompt_len(self.model_config, prompt)
+
+    def _get_prefix_adapter_specs(
+        self,
+        request: AnyRequest,
+    ) -> list[dict[str, Any]] | None:
+        return get_prefix_cartridge_specs(request)
+
+    async def _maybe_build_engine_request_with_cartridge(
+        self,
+        request: AnyRequest,
+        engine_input: EngineInput,
+        request_id: str,
+        params: SamplingParams,
+        lora_request: LoRARequest | None,
+        trace_headers: Mapping[str, str] | None,
+        priority: int,
+        data_parallel_rank: int | None,
+    ):
+        prepared_cartridge = await asyncio.to_thread(
+            prepare_prefix_cartridge_request,
+            request,
+            prompt_len=self._extract_prompt_len(engine_input),
+            max_model_len=self.model_config.max_model_len,
+            expected_kv_heads=self.model_config.get_total_num_kv_heads(),
+            expected_head_size=self.model_config.get_head_size(),
+            sampling_params=params,
+            truncate_prompt_tokens=getattr(request, "truncate_prompt_tokens", None),
+        )
+        if prepared_cartridge is None:
+            return engine_input
+
+        return self.input_processor.process_inputs(
+            request_id,
+            engine_input,
+            prepared_cartridge.sampling_params,
+            supported_tasks=await self.engine_client.get_supported_tasks(),
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+            cartridge_id=prepared_cartridge.cartridge_id,
+            cartridge_seq_len=prepared_cartridge.cartridge_seq_len,
+            cartridge_shm_path=prepared_cartridge.cartridge_shm_path,
+            cartridge_allow_pipelining=(prepared_cartridge.cartridge_allow_pipelining),
+        )
 
     def _log_inputs(
         self,

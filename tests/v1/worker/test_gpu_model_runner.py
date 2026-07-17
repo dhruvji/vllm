@@ -322,6 +322,31 @@ def test_update_states_new_request(model_runner, dist_init):
     assert _is_req_state_block_table_match(model_runner, req_id)
 
 
+def test_prepare_inputs_applies_cartridge_position_offsets(model_runner, dist_init):
+    req_id = "req_0"
+    scheduler_output = _schedule_new_request(req_id)
+    model_runner._update_states(scheduler_output)
+
+    model_runner.cartridge_position_offsets[req_id] = 4
+
+    _, spec_decode_metadata = model_runner._prepare_inputs(
+        scheduler_output,
+        np.array([3], dtype=np.int32),
+    )
+
+    assert spec_decode_metadata is None
+    assert model_runner.optimistic_seq_lens_cpu[0].item() == 7
+    assert model_runner.seq_lens[0].item() == 7
+    torch.testing.assert_close(
+        model_runner.positions[:3].cpu(),
+        torch.tensor([4, 5, 6], dtype=torch.int64),
+    )
+    torch.testing.assert_close(
+        model_runner.input_batch.block_table[0].slot_mapping.gpu[:3].cpu(),
+        torch.tensor([4, 5, 6], dtype=torch.int64),
+    )
+
+
 def test_update_states_request_finished(model_runner, dist_init):
     req_id = "req_0"
 
