@@ -16,9 +16,9 @@ REPO_URL = "https://github.com/engram-lab/vllm.git"
 REPO_DIR = "/tmp/vllm"
 SECONDS_PER_MINUTE = 60
 CUDA_VARIANT = "cu130"
-FLASHINFER_CUDA_INDEX = "https://flashinfer.ai/whl/cu130"
+FLASHINFER_CUDA_INDEX = "https://flashinfer.ai/whl/"
 PYTORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu130"
-FLASHINFER_VERSION = "0.6.8.post1"
+FLASHINFER_VERSION = "0.6.14"
 
 BRANCH = os.environ.get("BRANCH", "main")
 COMMIT_HASH = os.environ.get("COMMIT_HASH") or os.environ.get("GITHUB_SHA")
@@ -55,7 +55,6 @@ TORCH_PACKAGES = (
 FLASHINFER_PACKAGES = (
     f"flashinfer-python=={FLASHINFER_VERSION}",
     f"flashinfer-cubin=={FLASHINFER_VERSION}",
-    f"flashinfer-jit-cache=={FLASHINFER_VERSION}+{CUDA_VARIANT}",
 )
 LOCAL_SOURCE_IGNORE = modal.FilePatternMatcher(
     ".git/**",
@@ -169,7 +168,6 @@ image = image.run_commands(
     "prometheus-fastapi-instrumentator==7.1.0 "
     f"flashinfer-python=={FLASHINFER_VERSION} "
     f"flashinfer-cubin=={FLASHINFER_VERSION} "
-    f"flashinfer-jit-cache=={FLASHINFER_VERSION}+{CUDA_VARIANT} "
     f"--extra-index-url {FLASHINFER_CUDA_INDEX} "
     f"--torch-backend {CUDA_VARIANT}"
 ).env({**RUNTIME_ENV, "HF_HUB_ENABLE_HF_TRANSFER": "1"})
