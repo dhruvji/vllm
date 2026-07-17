@@ -1243,18 +1243,11 @@ class GPUModelRunner(
 
     @staticmethod
     def _get_cartridge_cache_writer(backend_name: str):
-        if "FlashAttention" in backend_name:
-            kv_dim = 0
-            from vllm.v1.attention.backends.fa_utils import (
-                reshape_and_cache_flash as reshape_and_cache,
-            )
-        elif "FlashInfer" in backend_name:
-            kv_dim = 1
+        if "FlashAttention" in backend_name or "FlashInfer" in backend_name:
             from vllm.v1.attention.backends.fa_utils import (
                 reshape_and_cache_flash as reshape_and_cache,
             )
         elif "TritonAttention" in backend_name:
-            kv_dim = 1
             from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
                 triton_reshape_and_cache_flash as reshape_and_cache,
             )
@@ -1264,7 +1257,20 @@ class GPUModelRunner(
                 f"{backend_name}. Only FlashAttention, FlashInfer, and Triton "
                 f"are supported."
             )
-        return kv_dim, reshape_and_cache
+        return reshape_and_cache
+
+    @staticmethod
+    def _split_cartridge_kv_cache(
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return K/V writer views from the unified packed cache layout."""
+        if kv_cache.ndim != 4 or kv_cache.shape[-1] % 2:
+            raise RuntimeError(
+                "Cartridge prepopulation requires packed KV cache shape "
+                "(num_blocks, num_kv_heads, block_size, 2 * head_size), got "
+                f"{tuple(kv_cache.shape)}."
+            )
+        return kv_cache.transpose(1, 2).chunk(2, dim=-1)
 
     def _get_cartridge_layer_targets(
         self,
@@ -1273,7 +1279,7 @@ class GPUModelRunner(
         targets: list[tuple[int, str]] = []
         for attn_group in self.attn_groups[kv_cache_group_id]:
             backend_name = attn_group.backend.__name__
-            if not self._is_cartridge_supported_backend(backend_name):
+            if not GPUModelRunner._is_cartridge_supported_backend(backend_name):
                 continue
             for layer_name in attn_group.layer_names:
                 targets.append((extract_layer_index(layer_name), backend_name))
@@ -1377,9 +1383,9 @@ class GPUModelRunner(
         for (layer_idx, backend_name), (layer_keys, layer_values) in zip(
             cartridge_targets, layer_kv_list, strict=False
         ):
-            kv_dim, reshape_and_cache = self._get_cartridge_cache_writer(backend_name)
+            reshape_and_cache = self._get_cartridge_cache_writer(backend_name)
             kv_cache = self.kv_caches[layer_idx]
-            key_cache, value_cache = kv_cache.unbind(kv_dim)
+            key_cache, value_cache = self._split_cartridge_kv_cache(kv_cache)
             reshape_and_cache(
                 layer_keys,
                 layer_values,

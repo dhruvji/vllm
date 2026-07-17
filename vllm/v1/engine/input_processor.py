@@ -262,6 +262,13 @@ class InputProcessor:
     ) -> EngineCoreRequest:
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
+        if self.use_v2_model_runner and (
+            cartridge_kv is not None or cartridge_shm_path is not None
+        ):
+            raise ValueError(
+                "Prefix cartridges require the V1 model runner; set "
+                "VLLM_USE_V2_MODEL_RUNNER=0 before starting vLLM."
+            )
 
         parallel_config = self.vllm_config.parallel_config
         dp_size = parallel_config.data_parallel_size

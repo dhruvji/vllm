@@ -1384,6 +1384,16 @@ def test_cartridge_prepopulate_targets_skip_gdn_attention_groups():
     ]
 
 
+def test_split_cartridge_kv_cache_uses_packed_upstream_layout():
+    kv_cache = torch.arange(2 * 3 * 5 * 14).reshape(2, 3, 5, 14)
+
+    key_cache, value_cache = GPUModelRunner._split_cartridge_kv_cache(kv_cache)
+
+    assert key_cache.shape == value_cache.shape == (2, 5, 3, 7)
+    assert torch.equal(key_cache, kv_cache.transpose(1, 2)[..., :7])
+    assert torch.equal(value_cache, kv_cache.transpose(1, 2)[..., 7:])
+
+
 def test_update_hybrid_attention_mamba_layout_with_num_block_2_rewrites_stride():
     from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 
