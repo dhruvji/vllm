@@ -24,7 +24,7 @@ jobs:
       GPU_TYPE: "H200"
       GPU_COUNT: "1"
       SECRETS: "dev-api-keys"
-      VLLM_PRECOMPILED_WHEEL_COMMIT: "9da56fd18b95ff1b11360e8400f7c41b126d190b"
+      VLLM_PRECOMPILED_WHEEL_COMMIT: "877dae9c684cd8cb2f66eed33f1c3261c6792c10"
       BRANCH: ${{ github.head_ref || github.ref_name }}
       COMMIT_HASH: ${{ github.event.pull_request.head.sha || github.sha }}
       VLLM_CI_USE_LOCAL_SOURCE: "1"
