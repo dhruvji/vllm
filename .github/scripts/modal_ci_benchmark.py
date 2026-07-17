@@ -71,6 +71,7 @@ except ModuleNotFoundError:
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "300",
         "VLLM_PASSTHROUGH_ERRORS": "1",
+        "VLLM_USE_V2_MODEL_RUNNER": "0",
     }
     TORCH_PACKAGES = ("torch==2.11.0+cu130", "torchvision==0.26.0+cu130")
     FLASHINFER_PACKAGES = (
