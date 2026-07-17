@@ -22,3 +22,4 @@
 - Speculative decoding must accept the `ngram_gpu` configuration helper. (#65)
 - Reasoning configuration must not register duplicate CLI arguments. (#66)
 - Modal volume reload and commit calls must not block an active async event loop. (#52)
+- Modal local-source images must preinstall every no-build-isolation backend.

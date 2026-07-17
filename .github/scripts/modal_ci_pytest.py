@@ -134,7 +134,13 @@ image = _add_repo_source(
     .entrypoint([])
     .apt_install("git", "rsync")
     .env(BASE_ENV)
-    .pip_install("packaging", "setuptools>=77,<82", "wheel", "setuptools-scm")
+    .pip_install(
+        "packaging",
+        "setuptools>=77,<82",
+        "setuptools-rust>=1.9.0",
+        "wheel",
+        "setuptools-scm",
+    )
     .uv_pip_install(
         *TORCH_PACKAGES,
         index_url=PYTORCH_CUDA_INDEX,
