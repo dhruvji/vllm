@@ -266,7 +266,6 @@ def run_benchmarks_with_server(
         str(GPU_MEMORY_UTILIZATION),
         "--uvicorn-log-level",
         "warning",
-        "--disable-log-requests",
         "--enable-prefix-caching",
         "--enable-chunked-prefill",
     ]
