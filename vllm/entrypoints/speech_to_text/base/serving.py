@@ -465,7 +465,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        lora_request = await self._maybe_get_adapters(request)
+        lora_request = self._maybe_get_adapters(request)
 
         engine_inputs, duration_s = await self._preprocess_speech_to_text(
             request=request,

@@ -151,7 +151,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        lora_request = await self._maybe_get_adapters(request)
+        lora_request = await self._maybe_get_engram_adapters(request)
 
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)

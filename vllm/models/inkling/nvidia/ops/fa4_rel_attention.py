@@ -135,7 +135,9 @@ def inkling_fa4_rel_attention(
 
         bias_kwargs: dict[str, Any] = {"rel_bias": rel_logits}
     else:
-        from vllm.vllm_flash_attn.cute import flash_attn_varlen_func
+        from vllm.vllm_flash_attn.cute import (  # type: ignore[assignment]
+            flash_attn_varlen_func,
+        )
 
         bias_kwargs = {
             "score_mod": _get_score_mod(rel_extent),

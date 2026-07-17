@@ -9,11 +9,12 @@ import tempfile
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from safetensors.torch import save_file as safetensors_save_file
 
 from vllm import envs
+from vllm.entrypoints.pooling.typing import AnyPoolingRequest
 from vllm.entrypoints.serve.engine.typing import AnyRequest
 from vllm.exceptions import VLLMNotFoundError
 from vllm.logger import init_logger
@@ -50,6 +51,20 @@ def _lora_config_source_ids(lora_id: str) -> list[str]:
 
 class EngramAdapterServingMixin:
     """Request-body LoRA loading shared by upstream generation entrypoints."""
+
+    # Supplied by GenerateBaseServing. Keeping these structural declarations
+    # here lets the mixin remain independent of the concrete serving class.
+    models: Any
+    model_config: Any
+    engine_client: Any
+
+    if TYPE_CHECKING:
+
+        def _get_active_default_mm_loras(
+            self, request: AnyRequest | AnyPoolingRequest
+        ) -> LoRARequest | None: ...
+
+        def _is_model_supported(self, model_name: str | None) -> bool: ...
 
     def _init_engram_adapter_serving(self) -> None:
         self._prepared_lora_dirs: OrderedDict[str, str] = OrderedDict()
@@ -200,7 +215,7 @@ class EngramAdapterServingMixin:
             self.models.lora_requests[resolved_id] = lora_request
             return lora_request
 
-    async def _maybe_get_adapters(
+    async def _maybe_get_engram_adapters(
         self,
         request: AnyRequest,
         supports_default_mm_loras: bool = False,

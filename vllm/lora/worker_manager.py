@@ -175,7 +175,7 @@ class WorkerLoRAManager:
                         lora_request.lora_path,
                         ", ".join(sorted(expected_lora_modules_lst)),
                     )
-                elif not is_in_target_modules(
+                elif target_modules is not None and not is_in_target_modules(
                     module_name,
                     target_modules,
                     packed_modules_mapping,

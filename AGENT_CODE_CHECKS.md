@@ -1,6 +1,7 @@
 # Engram regression checks
 
 - Learned prefix cartridges must reach the engine from OpenAI chat and completion `adapters.prefix` requests. (#83)
+- Async request-body adapters must not change sync adapter APIs used by other serving endpoints.
 - Prefix cartridges must use V1 model runner or fail loudly; V2 must never ignore them.
 - Missing cartridge sources must return an HTTP error, not silently run the base model. (#24, #83)
 - Cartridge fallback sources must preserve the resolved ID and honor forced reloads. (#53, #83)

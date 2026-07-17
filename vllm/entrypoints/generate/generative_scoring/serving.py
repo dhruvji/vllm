@@ -225,7 +225,7 @@ class ServingGenerativeScoring(BaseServing):
         # Pydantic at request parsing time, so we don't need to check here.
 
         try:
-            lora_request = await self._maybe_get_adapters(request)  # type: ignore[arg-type]
+            lora_request = self._maybe_get_adapters(request)  # type: ignore[arg-type]
         except (ValueError, TypeError, RuntimeError) as e:
             logger.exception("Error preparing request components")
             return self.create_error_response(e)

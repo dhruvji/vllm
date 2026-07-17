@@ -118,10 +118,7 @@ class ServingTokens(GenerateBaseServing):
             raise self.engine_client.dead_error
 
         lora_request = None
-        lora_request = await self._maybe_get_adapters(
-            request,
-            supports_default_mm_loras=True,
-        )
+        lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
 
         model_name = self.models.model_name(lora_request)
 
