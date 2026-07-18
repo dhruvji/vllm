@@ -4,6 +4,7 @@
 import os
 
 from vllm import SamplingParams
+from vllm.outputs import RequestOutput
 from vllm.v1.cartridge_loader import load_cartridge
 
 QWEN35_MODEL = "Qwen/Qwen3.5-0.8B"
@@ -34,7 +35,8 @@ def test_qwen35_prefix_cache_smoke(vllm_runner) -> None:
         assert output_text.strip(), "Expected non-empty generated text"
 
 
-def test_qwen3_loads_zeroed_cartridge_and_generates(vllm_runner) -> None:
+def test_qwen3_loads_zeroed_cartridge_and_generates(vllm_runner, monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     prompt = "Write one short sentence about the ocean."
     cartridge = load_cartridge(ZEROED_CARTRIDGE)
     stacked_kv = cartridge.get_stacked_kv()
@@ -58,7 +60,7 @@ def test_qwen3_loads_zeroed_cartridge_and_generates(vllm_runner) -> None:
             cartridge_seq_len=cartridge.num_tokens,
         )
         engine.add_request("0", request, params, prompt_text=prompt)
-        outputs = llm._run_engine(use_tqdm=False)
+        outputs = llm._run_engine(RequestOutput, use_tqdm=False)
 
     assert len(outputs) == 1, f"Expected one completed request, got {len(outputs)}"
     assert outputs[0].finished, "Expected request to finish successfully"

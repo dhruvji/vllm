@@ -8,6 +8,7 @@ from concurrent.futures import Future
 
 import torch
 
+from vllm.sampling_params import SamplingParams
 from vllm.v1 import cartridge_loader
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine.core import EngineCore
@@ -39,6 +40,30 @@ def test_save_cartridge_to_shm_rewrites_invalid_existing_file(tmp_path, monkeypa
     assert len(loaded) == 2
     assert torch.equal(loaded[0], stacked_kv[0])
     assert torch.equal(loaded[1], stacked_kv[1])
+
+
+def test_save_cartridge_to_shm_overwrites_existing_file_when_requested(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        cartridge_loader, "SHM_CARTRIDGE_DIR", str(tmp_path / "cartridges")
+    )
+    _reset_shm_state()
+
+    cartridge_id = "s3://bucket/path/to/cartridge.pt"
+    stale_kv = [torch.zeros(1, 1, 2, 3), torch.zeros(1, 1, 2, 3)]
+    fresh_kv = [torch.ones(1, 1, 2, 3), torch.ones(1, 1, 2, 3)]
+
+    shm_path = cartridge_loader.save_cartridge_to_shm(cartridge_id, stale_kv)
+    saved_path = cartridge_loader.save_cartridge_to_shm(
+        cartridge_id, fresh_kv, overwrite=True
+    )
+    loaded = cartridge_loader.load_cartridge_from_shm(saved_path)
+
+    assert saved_path == shm_path
+    assert loaded is not None
+    assert torch.equal(loaded[0], fresh_kv[0])
+    assert torch.equal(loaded[1], fresh_kv[1])
 
 
 def test_save_cartridge_to_shm_serializes_concurrent_writers(tmp_path, monkeypatch):
@@ -99,6 +124,36 @@ def test_save_cartridge_to_shm_serializes_concurrent_writers(tmp_path, monkeypat
     assert torch.equal(loaded[1], stacked_kv[1])
 
 
+def test_load_cartridges_from_request_with_ids_uses_successful_source(monkeypatch):
+    cartridge = cartridge_loader.CartridgeData(token_ids=[1, 2, 3])
+
+    def fake_resolve_glob(cartridge_id):
+        return {
+            "missing": "missing",
+            "fallback-*": "fallback-resolved",
+        }[cartridge_id]
+
+    def fake_load_cartridge(cartridge_id, force_redownload=False):
+        if cartridge_id == "missing":
+            raise FileNotFoundError(cartridge_id)
+        assert force_redownload is True
+        return cartridge
+
+    monkeypatch.setattr(cartridge_loader, "_resolve_glob", fake_resolve_glob)
+    monkeypatch.setattr(cartridge_loader, "load_cartridge", fake_load_cartridge)
+
+    loaded = cartridge_loader.load_cartridges_from_request_with_ids(
+        [
+            {
+                "sources": [{"id": "missing"}, {"id": "fallback-*"}],
+                "force_redownload": True,
+            }
+        ]
+    )
+
+    assert loaded == [("fallback-resolved", cartridge)]
+
+
 def test_real_model_layer_indices_stack_in_sorted_attention_order():
     kv_cache = {}
     expected_keys = []
@@ -131,6 +186,82 @@ def test_real_model_layer_indices_stack_in_sorted_attention_order():
 
     assert torch.equal(stacked_keys, torch.stack(expected_keys))
     assert torch.equal(stacked_values, torch.stack(expected_values))
+
+
+def test_prepare_prefix_cartridge_request_builds_engine_fields(monkeypatch):
+    kv_cache = {
+        "layers.0.attention.prefix.keys": torch.zeros(1, 2, 4, 5),
+        "layers.0.attention.prefix.values": torch.ones(1, 2, 4, 5),
+    }
+    cartridge = cartridge_loader.CartridgeData(kv_cache=kv_cache, is_learned=True)
+    prefix_specs = [
+        {
+            "sources": [{"id": "missing"}, {"id": "fallback-*"}],
+            "force_redownload": True,
+            "allow_pipelining": True,
+        }
+    ]
+    request = type(
+        "Request",
+        (),
+        {"adapters": {"prefix": prefix_specs}, "truncate_prompt_tokens": None},
+    )()
+    saved = {}
+
+    def fake_load_cartridges(cartridges_spec):
+        assert cartridges_spec is prefix_specs
+        return [("fallback-resolved", cartridge)]
+
+    def fake_save_cartridge(cartridge_id, stacked_kv, overwrite=False):
+        saved["cartridge_id"] = cartridge_id
+        saved["stacked_kv"] = stacked_kv
+        saved["overwrite"] = overwrite
+        return "/tmp/fallback-resolved.pt"
+
+    monkeypatch.setattr(
+        cartridge_loader,
+        "load_cartridges_from_request_with_ids",
+        fake_load_cartridges,
+    )
+    monkeypatch.setattr(cartridge_loader, "save_cartridge_to_shm", fake_save_cartridge)
+
+    params = SamplingParams(max_tokens=10)
+    prepared = cartridge_loader.prepare_prefix_cartridge_request(
+        request,
+        prompt_len=5,
+        max_model_len=8,
+        expected_kv_heads=4,
+        expected_head_size=5,
+        sampling_params=params,
+        truncate_prompt_tokens=None,
+    )
+
+    assert prepared is not None
+    assert prepared.cartridge_id == "fallback-resolved"
+    assert prepared.cartridge_seq_len == 2
+    assert prepared.cartridge_shm_path == "/tmp/fallback-resolved.pt"
+    assert prepared.cartridge_allow_pipelining is True
+    assert prepared.sampling_params is not params
+    assert prepared.sampling_params.max_tokens == 1
+    assert saved["cartridge_id"] == "fallback-resolved"
+    assert saved["overwrite"] is True
+    assert saved["stacked_kv"] is cartridge.get_stacked_kv()
+
+
+def test_prepare_prefix_cartridge_request_returns_none_without_prefix():
+    request = type("Request", (), {"adapters": {"lora": []}})()
+
+    prepared = cartridge_loader.prepare_prefix_cartridge_request(
+        request,
+        prompt_len=5,
+        max_model_len=8,
+        expected_kv_heads=4,
+        expected_head_size=5,
+        sampling_params=SamplingParams(max_tokens=1),
+        truncate_prompt_tokens=None,
+    )
+
+    assert prepared is None
 
 
 def test_engine_update_cartridge_tracks_shm_for_cleanup(monkeypatch):
@@ -194,7 +325,7 @@ def test_batch_queue_attaches_pending_cartridge_overwrites():
         def has_requests(self):
             return True
 
-        def schedule(self):
+        def schedule(self, defer_prefills=False):
             return scheduler_output
 
         def update_from_output(self, scheduler_output, model_output):
@@ -215,7 +346,7 @@ def test_batch_queue_attaches_pending_cartridge_overwrites():
 
     outputs, model_executed = engine.step_with_batch_queue()
 
-    assert outputs == {}
+    assert outputs is None
     assert model_executed is False
     assert executed_outputs == [scheduler_output]
     assert scheduler_output.cartridge_overwrites == {"cart-1": stacked_kv}

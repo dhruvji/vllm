@@ -4,14 +4,18 @@
 from collections.abc import Mapping, Sequence
 
 import numpy as np
+import torch
 
 
 def strip_cartridge_offsets_from_seq_lens(
-    seq_lens: np.ndarray,
+    seq_lens: np.ndarray | torch.Tensor,
     req_ids: Sequence[str],
     cartridge_position_offsets: Mapping[str, int],
 ) -> np.ndarray:
     """Remove attention-only cartridge offsets from sequence lengths."""
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.detach().cpu().numpy()
+
     adjusted = seq_lens.copy()
     for req_idx, req_id in enumerate(req_ids):
         adjusted[req_idx] -= cartridge_position_offsets.get(req_id, 0)

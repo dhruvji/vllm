@@ -1,0 +1,27 @@
+# Engram regression checks
+
+- Learned prefix cartridges must reach the engine from OpenAI chat and completion `adapters.prefix` requests. (#83)
+- Async request-body adapters must not change sync adapter APIs used by other serving endpoints.
+- Prefix cartridges must use V1 model runner or fail loudly; V2 must never ignore them.
+- Missing cartridge sources must return an HTTP error, not silently run the base model. (#24, #83)
+- Cartridge fallback sources must preserve the resolved ID and honor forced reloads. (#53, #83)
+- Concurrent cartridge SHM writes must be atomic; forced reloads must replace stale payloads. (#26, #83)
+- Prefix-cartridge tokens must count toward context limits, truncation, and output-token clamping. (#22, #51, #83)
+- Cartridge block allocation and prefix-cache hits must not double-count cartridge tokens. (#5, #51, #83)
+- Cartridge cache cleanup must not evict another live request's cartridge. (#63)
+- FlashInfer and Triton attention backends must populate cartridge KV with their native layouts. (#14, #45)
+- Cartridge prepopulation must split upstream's packed K/V cache layout along the head dimension.
+- Hybrid Qwen3.5/3.6 caches must map cartridge KV only to attention layers, never GDN/Mamba layers. (#45, #50, #62)
+- Mamba alignment and scheduling must tolerate cartridge/external-KV prefix hits. (#63, #68)
+- Qwen3.5 text-only inference must not require multimodal inputs. (#55)
+- Qwen3.5/3.6 LoRA names must map packed, aliased, and GDN modules correctly. (#55, #56, #57, #67)
+- LoRA expansion offsets must not overflow on long prompts. (#82)
+- Hot LoRA checkpoints must reload atomically without stale adapter weights. (#18, #26, #29, #61)
+- Adapter fallback sources must retry only missing sources and surface real load failures. (#53)
+- Tensor-parallel inference must keep adapter tensors and request metadata rank-consistent. (#34)
+- Prompt logprobs with LoRA or suffix-only calculation must preserve token IDs and positions. (#36, #54, #56, #58)
+- Speculative decoding must accept the `ngram_gpu` configuration helper. (#65)
+- Reasoning configuration must not register duplicate CLI arguments. (#66)
+- Modal volume reload and commit calls must not block an active async event loop. (#52)
+- Modal local-source images must preinstall every no-build-isolation backend.
+- Modal source overlays must use the matching upstream wheel and cartridge runner.
