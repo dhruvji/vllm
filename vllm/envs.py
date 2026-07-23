@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
+    VLLM_FASTSAFETENSORS_NOGDS: bool = False
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
@@ -1081,6 +1082,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FASTSAFETENSORS_QUEUE_SIZE": lambda: int(
         os.getenv("VLLM_FASTSAFETENSORS_QUEUE_SIZE", "0")
     ),
+    "VLLM_FASTSAFETENSORS_NOGDS": lambda: os.getenv("VLLM_FASTSAFETENSORS_NOGDS", "0")
+    .strip()
+    .lower()
+    in ("1", "true"),
     # Timeout in seconds for keeping HTTP connections alive in API server
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
         os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")

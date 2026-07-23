@@ -8,12 +8,19 @@ import huggingface_hub.constants
 import pytest
 import torch
 
+from vllm import envs
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
 )
 from vllm.platforms import current_platform
+
+
+def test_fastsafetensors_nogds_env(monkeypatch):
+    monkeypatch.setenv("VLLM_FASTSAFETENSORS_NOGDS", "1")
+
+    assert envs.VLLM_FASTSAFETENSORS_NOGDS is True
 
 
 @pytest.mark.skipif(
