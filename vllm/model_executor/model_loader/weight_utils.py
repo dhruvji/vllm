@@ -1062,10 +1062,9 @@ def fastsafetensors_weights_iterator(
     device = torch.device(f"cuda:{current_platform.current_device()}")
     hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
 
-    # Use nogds=True for TP > 1 to avoid cuFileDriverOpen() which
-    # initializes the GDS DMA subsystem for all visible GPUs, creating
-    # unwanted CUDA contexts on every device.
-    nogds = pg.size() > 1
+    # TP > 1 cannot use GDS without creating unwanted CUDA contexts on every
+    # visible device. Deployments may also disable GDS when cuFile is unavailable.
+    nogds = pg.size() > 1 or envs.VLLM_FASTSAFETENSORS_NOGDS
 
     queue_size = envs.VLLM_FASTSAFETENSORS_QUEUE_SIZE
     tqdm_enabled = enable_tqdm(use_tqdm_on_load)
