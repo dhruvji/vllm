@@ -364,7 +364,9 @@ template <typename idx_t>
 __device__ __forceinline__ bool moe_sum_pad_aware_skip(
     const idx_t* __restrict__ topk_ids, const int32_t* __restrict__ expert_map,
     int64_t idx) {
-  int64_t expert_id = static_cast<int64_t>(topk_ids[idx]);
+  const idx_t raw_expert_id = topk_ids[idx];
+  if (raw_expert_id == static_cast<idx_t>(-1)) return true;
+  int64_t expert_id = static_cast<int64_t>(raw_expert_id);
   if (expert_id < 0) return true;
   if (expert_map != nullptr && expert_map[expert_id] < 0) return true;
   return false;
