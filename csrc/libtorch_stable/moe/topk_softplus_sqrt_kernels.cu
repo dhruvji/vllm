@@ -491,11 +491,11 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
         if (correction_bias != nullptr && should_process_row) {
           max_val -= correction_bias[expert];
         }
-        output[idx] = max_val;
+        output[idx] = is_pad_row ? 0.f : max_val;
         indices[idx] =
             !is_pad_row ? expert - start_expert : static_cast<IndType>(-1);
         source_rows[idx] = k_idx * num_rows + thread_row;
-        if (renormalize) {
+        if (renormalize && !is_pad_row) {
           selected_sum += max_val;
         }
       }
