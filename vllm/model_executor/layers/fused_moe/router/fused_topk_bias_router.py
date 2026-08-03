@@ -199,12 +199,17 @@ def fused_topk_bias(
         )
 
         output_indices_dtype = torch.int32 if indices_type is None else indices_type
-        if scoring_func == "sqrtsoftplus" and can_use_dsv4_topk(
-            gating_output,
-            e_score_correction_bias,
-            topk,
-            renormalize,
-            output_indices_dtype,
+        if (
+            scoring_func == "sqrtsoftplus"
+            and input_tokens is None
+            and hash_indices_table is None
+            and can_use_dsv4_topk(
+                gating_output,
+                e_score_correction_bias,
+                topk,
+                renormalize,
+                output_indices_dtype,
+            )
         ):
             assert e_score_correction_bias is not None
             return dsv4_topk(

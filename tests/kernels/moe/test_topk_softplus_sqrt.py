@@ -194,6 +194,57 @@ def test_fused_topk_softplus_sqrt_hash(
     not current_platform.is_cuda(),
     reason="The DeepSeek V4 fast path is CUDA-only.",
 )
+def test_fused_topk_softplus_sqrt_hash_with_bias():
+    """Hash routing takes precedence when the DSv4 fast path is eligible."""
+    torch.manual_seed(0)
+    num_tokens = 17
+    hidden_size = 128
+    num_experts = 256
+    topk = 6
+    vocab_size = 64
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), dtype=torch.float32, device="cuda"
+    )
+    gating_output = torch.randn(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    )
+    correction_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+    hash_indices_table = torch.stack(
+        [torch.randperm(num_experts)[:topk] for _ in range(vocab_size)]
+    ).to(device="cuda", dtype=torch.long)
+    input_ids = torch.randint(
+        0, vocab_size, (num_tokens,), dtype=torch.long, device="cuda"
+    )
+
+    topk_weights_ref, topk_ids_ref = _torch_topk_softplus_sqrt(
+        gating_output=gating_output,
+        topk=topk,
+        renormalize=True,
+        routed_scaling_factor=1.5,
+        e_score_correction_bias=correction_bias,
+        input_ids=input_ids,
+        hash_indices_table=hash_indices_table,
+    )
+    topk_weights, topk_ids = fused_topk_bias(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        scoring_func="sqrtsoftplus",
+        e_score_correction_bias=correction_bias,
+        topk=topk,
+        renormalize=True,
+        input_tokens=input_ids,
+        hash_indices_table=hash_indices_table,
+        routed_scaling_factor=1.5,
+    )
+
+    torch.testing.assert_close(topk_ids_ref, topk_ids, atol=0, rtol=0)
+    torch.testing.assert_close(topk_weights_ref, topk_weights, atol=2e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="The DeepSeek V4 fast path is CUDA-only.",
+)
 @pytest.mark.parametrize(
     ("num_tokens", "num_experts", "indices_type"),
     [

@@ -8,6 +8,7 @@ Run `pytest tests/kernels/moe/test_fused_topk.py`.
 import pytest
 import torch
 
+import vllm._custom_ops as ops
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
@@ -135,6 +136,47 @@ def test_fused_topk_bias(
         topk_weights_ref.to(torch.float32), topk_weights, atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(topk_ids_ref.to(torch.int32), topk_ids, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
+)
+@pytest.mark.parametrize("num_experts", [6, 16])
+@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("scoring_func", ["softmax", "sigmoid"])
+def test_fused_topk_padding_outputs_sentinel(
+    num_experts: int, renormalize: bool, scoring_func: str
+):
+    """Padded rows have sentinel IDs and zero weights on every kernel path."""
+    torch.manual_seed(0)
+    num_tokens = 5
+    topk = 3
+    gating_output = torch.randn(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    )
+    correction_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+    is_padding = torch.tensor(
+        [False, True, False, True, False], dtype=torch.bool, device="cuda"
+    )
+    topk_weights = torch.empty(num_tokens, topk, dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty(num_tokens, topk, dtype=torch.int32, device="cuda")
+    token_expert_indices = torch.empty_like(topk_ids)
+
+    topk_op = ops.topk_softmax if scoring_func == "softmax" else ops.topk_sigmoid
+    topk_op(
+        topk_weights,
+        topk_ids,
+        token_expert_indices,
+        gating_output,
+        renormalize,
+        correction_bias,
+        is_padding=is_padding,
+    )
+
+    assert torch.equal(topk_ids[is_padding], torch.full_like(topk_ids[is_padding], -1))
+    assert torch.equal(
+        topk_weights[is_padding], torch.zeros_like(topk_weights[is_padding])
+    )
 
 
 @pytest.mark.skipif(

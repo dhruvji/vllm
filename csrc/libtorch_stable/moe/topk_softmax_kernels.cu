@@ -233,13 +233,15 @@ __launch_bounds__(TPB) __global__ void moeTopK(
 
             const int idx = k * block_row + k_idx;
             // Return the unbiased scores for output weights
-            output[idx] = inputs_after_softmax[thread_read_offset + expert];
+            const float selected_score =
+                inputs_after_softmax[thread_read_offset + expert];
+            output[idx] = is_pad_row ? 0.f : selected_score;
             indices[idx] = is_pad_row ? static_cast<IndType>(-1)
                                        : (should_process_row ? (expert - start_expert) : num_experts);
             assert(is_pad_row || indices[idx] >= 0);
             source_rows[idx] = k_idx * num_rows + block_row;
-            if (renormalize) {
-                selected_sum += inputs_after_softmax[thread_read_offset + expert];
+            if (renormalize && !is_pad_row) {
+                selected_sum += selected_score;
             }
         }
         __syncthreads();
@@ -553,11 +555,11 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
             // The lead thread from each sub-group will write out the final results to global memory. (This will be a
             // single) thread per row of the input/output matrices.
             const int idx = k * thread_row + k_idx;
-            output[idx] = max_val;
+            output[idx] = is_pad_row ? 0.f : max_val;
             indices[idx] = is_pad_row ? static_cast<IndType>(-1)
                                        : (should_process_row ? (expert - start_expert) : NUM_EXPERTS);
             source_rows[idx] = k_idx * num_rows + thread_row;
-            if (renormalize) {
+            if (renormalize && !is_pad_row) {
                 selected_sum += max_val;
             }
         }
