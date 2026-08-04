@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trace Engram Stack"
+  short_description: "Map Engrams, TorchTitan, and vLLM"
+  default_prompt: "Use $trace-engram-stack to trace this change across Engrams, TorchTitan, and vLLM."
