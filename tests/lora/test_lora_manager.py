@@ -28,6 +28,8 @@ from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager, WorkerLoRAManager
 from vllm.model_executor.layers.fused_moe import GateLinear
+from vllm.model_executor.models.interfaces import supports_lora
+from vllm.model_executor.models.kimi_k25 import KimiK25ForConditionalGeneration
 from vllm.platforms import current_platform
 
 from .utils import create_peft_lora
@@ -45,6 +47,25 @@ DEVICES = (
 )
 
 DEFAULT_DTYPE = torch.get_default_dtype()
+
+
+@pytest.mark.skip_global_cleanup
+def test_kimi_k25_exposes_language_modules_to_lora() -> None:
+    assert supports_lora(KimiK25ForConditionalGeneration)
+    assert KimiK25ForConditionalGeneration.embedding_modules == {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
+    assert KimiK25ForConditionalGeneration.packed_modules_mapping == {
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    model = object.__new__(KimiK25ForConditionalGeneration)
+    mapping = model.get_mm_mapping()
+    assert mapping.language_model == ["language_model"]
+    assert mapping.connector == ["mm_projector"]
+    assert mapping.tower_model == ["vision_tower"]
 
 
 @pytest.mark.parametrize("device", DEVICES)

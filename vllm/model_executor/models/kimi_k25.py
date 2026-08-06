@@ -25,6 +25,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors import (
 from vllm.model_executor.models.interfaces import (
     SupportsEagle,
     SupportsEagle3,
+    SupportsLoRA,
     SupportsMultiModal,
     SupportsPP,
     SupportsQuant,
@@ -34,6 +35,7 @@ from vllm.model_executor.models.kimi_k25_vit import (
     MoonViT3dPretrainedModel,
     vision_tower_forward,
 )
+from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -289,6 +291,7 @@ class KimiK25MultiModalProcessor(BaseMultiModalProcessor[KimiK25ProcessingInfo])
 class KimiK25ForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
+    SupportsLoRA,
     SupportsPP,
     SupportsQuant,
     SupportsEagle,
@@ -302,6 +305,14 @@ class KimiK25ForConditionalGeneration(
     """
 
     supports_encoder_tp_data = True
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
+    packed_modules_mapping = {
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -473,3 +484,10 @@ class KimiK25ForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def get_mm_mapping(self) -> MultiModelKeys:
+        return MultiModelKeys.from_string_field(
+            language_model="language_model",
+            connector="mm_projector",
+            tower_model="vision_tower",
+        )
