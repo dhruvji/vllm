@@ -1055,6 +1055,8 @@ class S3Path(Path):
 
 
 class S3ReadFile:
+    _SIGNATURE_RETRY_DELAYS = (0.25, 0.5)
+
     def __init__(self, bucket, key, client, mode="r"):
         self.bucket = bucket
         self.key = key
@@ -1104,6 +1106,29 @@ class S3ReadFile:
             self._handle_s3_error(e)
             raise
 
+    def _get_object(self, byte_range: str):
+        from botocore.exceptions import ClientError
+
+        for attempt, delay in enumerate((*self._SIGNATURE_RETRY_DELAYS, None)):
+            try:
+                return self.client.get_object(
+                    Bucket=self.bucket, Key=self.key, Range=byte_range
+                )
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code != "SignatureDoesNotMatch" or delay is None:
+                    raise
+                logging.warning(
+                    "S3 rejected the signature for %s range %s; retrying (%d/%d)",
+                    self.s3_path,
+                    byte_range,
+                    attempt + 1,
+                    len(self._SIGNATURE_RETRY_DELAYS),
+                )
+                time.sleep(delay)
+
+        raise AssertionError("unreachable")
+
     def seek(self, pos, mode=os.SEEK_SET):
         if self.size is None:
             self.size = self._get_size()
@@ -1127,9 +1152,7 @@ class S3ReadFile:
             if self.pos >= self.size:
                 return b"" if "b" in self.mode else ""
             byte_range = f"bytes={self.pos}-"
-            response = self.client.get_object(
-                Bucket=self.bucket, Key=self.key, Range=byte_range
-            )
+            response = self._get_object(byte_range)
             content = response["Body"].read()
             self.pos = self.size
         else:
@@ -1137,9 +1160,7 @@ class S3ReadFile:
                 return b"" if "b" in self.mode else ""
             end = min(self.pos + size - 1, self.size - 1)
             byte_range = f"bytes={self.pos}-{end}"
-            response = self.client.get_object(
-                Bucket=self.bucket, Key=self.key, Range=byte_range
-            )
+            response = self._get_object(byte_range)
             content = response["Body"].read()
             self.pos += len(content)
 
