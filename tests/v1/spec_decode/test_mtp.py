@@ -61,10 +61,19 @@ def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
     return EagleProposer(vllm_config=vllm_config, device=DEVICE_TYPE)
 
 
+@mock.patch(
+    "vllm.v1.spec_decode.llm_base_proposer.current_platform."
+    "update_block_size_for_backend"
+)
 @mock.patch("vllm.v1.spec_decode.llm_base_proposer.get_pp_group")
 @mock.patch("vllm.v1.spec_decode.llm_base_proposer.get_layers_from_vllm_config")
 @mock.patch("vllm.v1.spec_decode.llm_base_proposer.get_model")
-def test_mtp_load_model_unified(mock_get_model, mock_get_layers, mock_get_pp_group):
+def test_mtp_load_model_unified(
+    mock_get_model,
+    mock_get_layers,
+    mock_get_pp_group,
+    mock_update_block_size,
+):
     """Test MTP-specific model loading with unified model approach."""
 
     # Setup mocks
@@ -77,7 +86,8 @@ def test_mtp_load_model_unified(mock_get_model, mock_get_layers, mock_get_pp_gro
     mock_model.has_own_lm_head = False
 
     target_attn_layers = {"target_attn_1": mock.MagicMock()}
-    all_attn_layers = {**target_attn_layers, "draft_attn_1": mock.MagicMock()}
+    draft_attn_layer = mock.MagicMock()
+    all_attn_layers = {**target_attn_layers, "draft_attn_1": draft_attn_layer}
     target_indexer_layers: dict = {}
     all_indexer_layers: dict = {}
 
@@ -91,6 +101,16 @@ def test_mtp_load_model_unified(mock_get_model, mock_get_layers, mock_get_pp_gro
     mock_pp_group = mock.MagicMock()
     mock_pp_group.world_size = 1
     mock_get_pp_group.return_value = mock_pp_group
+
+    def resolve_block_size(vllm_config):
+        vllm_config.cache_config.block_size = 128
+
+    def get_draft_kv_cache_spec(vllm_config):
+        assert vllm_config.cache_config.block_size == 128
+        return mock.MagicMock()
+
+    mock_update_block_size.side_effect = resolve_block_size
+    draft_attn_layer.get_kv_cache_spec.side_effect = get_draft_kv_cache_spec
 
     # Create target model
     class _TargetModelStub(LlamaForCausalLM):
@@ -109,6 +129,7 @@ def test_mtp_load_model_unified(mock_get_model, mock_get_layers, mock_get_pp_gro
     # Verify MTP-specific behavior:
     # Model is loaded
     mock_get_model.assert_called_once()
+    mock_update_block_size.assert_called_once_with(proposer.vllm_config)
     # MTP shares lm_head with target model
     assert proposer.model.lm_head == target_model.lm_head
     # MTP shares embed_tokens with target model

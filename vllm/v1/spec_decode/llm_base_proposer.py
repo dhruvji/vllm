@@ -1341,6 +1341,8 @@ class SpecDecodeBaseProposer:
         )
 
         self.model = self._get_model()
+        # Draft cache specs are read before the executor's normal resolution.
+        current_platform.update_block_size_for_backend(self.vllm_config)
 
         # Find draft layers (attention layers added by draft model)
         all_attn_layers = get_layers_from_vllm_config(
