@@ -7,8 +7,10 @@ import pytest
 import torch
 
 from vllm.v1.attention.backend import AttentionMetadataBuilder
+from vllm.v1.attention.backends.mla.indexer import KpoolTailBackend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
@@ -177,6 +179,69 @@ def test_reshape_packed_compressed_indexer_uses_kernel_state_size(monkeypatch):
     assert runner_kv_cache.shape == kv_cache.shape
     assert runner_kv_cache.stride() == kv_cache.stride()
     assert runner_kv_cache.storage_offset() == offset
+
+
+@pytest.mark.skip_global_cleanup
+def test_reshape_packed_kpool_tail_uses_storage_backend_shape(monkeypatch):
+    spec = KpoolTailSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=3,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+        sliding_window=16,
+    )
+    num_blocks = 2
+    offset = 8
+    raw_tensor = torch.zeros(
+        offset + num_blocks * spec.page_size_bytes,
+        dtype=torch.uint8,
+    )
+    group = AttentionGroup(KpoolTailBackend, ["tail"], spec, 0)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=raw_tensor.numel(),
+                shared_by=["tail"],
+                offset=offset,
+                block_stride=spec.page_size_bytes,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["tail"], spec)],
+    )
+
+    kv_cache = _reshape_kv_cache(
+        [group],
+        {"tail": raw_tensor},
+        "auto",
+        [spec.block_size],
+        {},
+        kv_cache_config,
+    )["tail"]
+
+    assert kv_cache.shape == (num_blocks, 2, 16, 3)
+    assert kv_cache.stride() == (96, 48, 3, 1)
+    assert kv_cache.storage_offset() == offset // 2
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.kv_cache_config = kv_cache_config
+    runner.attn_groups = [[group]]
+    runner.runner_only_attn_layers = set()
+    runner.cache_config = SimpleNamespace(cache_dtype="auto")  # type: ignore[assignment]
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "_has_mixed_attention_kv_layout",
+        lambda *args: False,
+    )
+
+    runner_kv_cache = runner._reshape_kv_cache_tensors({"tail": raw_tensor}, [16])[
+        "tail"
+    ]
+
+    assert runner_kv_cache.shape == kv_cache.shape
+    assert runner_kv_cache.stride() == kv_cache.stride()
+    assert runner_kv_cache.storage_offset() == offset // 2
 
 
 class WidthAwareMetadataBuilder:

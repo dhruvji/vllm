@@ -161,6 +161,23 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
     """Storage-only backend for the GLM-5.3-Flash kpool tail cache."""
 
     @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        return num_blocks, num_kv_heads, block_size, head_size
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        assert not include_num_layers_dimension
+        return 0, 1, 2, 3
+
+    @staticmethod
     def get_name() -> str:
         return "KPOOL_TAIL"
 
