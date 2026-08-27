@@ -292,6 +292,11 @@ class EngramAdapterServingMixin:
     ) -> LoRARequest | None:
         if not expert_specs:
             return None
+        lora_config = self.engine_client.vllm_config.lora_config
+        if lora_config is None or not lora_config.enable_structural_experts:
+            raise ValueError(
+                "Structural expert adapters require `--enable-structural-experts`."
+            )
         if not isinstance(expert_specs, list) or len(expert_specs) != 1:
             raise ValueError("`adapters.expert` must contain exactly one adapter.")
         expert_spec = expert_specs[0]

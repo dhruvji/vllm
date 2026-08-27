@@ -84,7 +84,7 @@ def _get_kv_block_len(
     virtually_split_kv_in_blocks: bool,
 ) -> int:
     if isinstance(layer_spec, KpoolTailSpec):
-        return layer_spec.unpadded_page_size_bytes // 2
+        return layer_spec.unpadded_page_size_bytes
     if isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
         return layer_spec.page_size_bytes
     if virtually_split_kv_in_blocks and not isinstance(layer_spec, MambaSpec):

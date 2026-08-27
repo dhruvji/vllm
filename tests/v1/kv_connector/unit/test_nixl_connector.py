@@ -41,6 +41,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlHandshakePayload,
     NixlKVConnectorStats,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    NixlBaseConnectorWorker,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     compute_nixl_compatibility_hash,
 )
@@ -60,9 +63,12 @@ from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
+    SlidingWindowMLASpec,
 )
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -563,6 +569,30 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
             remote_agents[(0, remote_tp_rank)] = remote_agent_name
         # Handshake bypasses zmq, so report a zero clock offset to the peer.
         return remote_agents, 0.0
+
+
+def test_shared_glm_region_preserves_each_group_block_id():
+    worker = NixlBaseConnectorWorker.__new__(NixlBaseConnectorWorker)
+    worker.num_regions = 1
+    worker._has_mamba = True
+    worker._conv_decomp = MagicMock(local_conv_offsets=((0, 1), (1, 1), (2, 1)))
+    worker._mamba_region_indices = [0]
+    worker.block_len_per_layer = [4096]
+    worker._group_spec_types = (
+        SlidingWindowMLASpec,
+        KpoolTailSpec,
+        MambaSpec,
+    )
+
+    num_blocks = 8
+    desc_ids = worker._compute_desc_ids(
+        block_ids=[[1], [3], [5]],
+        dst_num_blocks=num_blocks,
+        block_size_ratio=None,
+        physical_blocks_per_logical=1,
+    )
+
+    assert (desc_ids % num_blocks).tolist() == [1, 3, 5, 5, 5, 5]
 
 
 class TestNixlHandshake:

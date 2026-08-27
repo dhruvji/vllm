@@ -267,6 +267,46 @@ async def test_serving_completion_with_request_body_lora(mock_serving_setup):
 
 @pytest.mark.asyncio
 @pytest.mark.skip_global_cleanup
+async def test_request_body_structural_expert_requires_feature_flag(monkeypatch):
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+    adapter_path = "/fake/path/structural-expert"
+    counter = MagicMock()
+    counter.inc.return_value = 7
+    serving.models = SimpleNamespace(
+        lora_resolver_lock=defaultdict(asyncio.Lock),
+        lora_requests={},
+        lora_id_counter=counter,
+        is_base_model=lambda _model: True,
+    )
+    serving.model_config = SimpleNamespace(model=MODEL_NAME)
+    serving.engine_client = SimpleNamespace(
+        add_lora=AsyncMock(),
+        vllm_config=SimpleNamespace(
+            lora_config=SimpleNamespace(enable_structural_experts=False)
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving._resolve_glob",
+        lambda expert_id: expert_id,
+    )
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.asyncio.to_thread",
+        run_inline,
+    )
+
+    with pytest.raises(ValueError, match="--enable-structural-experts"):
+        await serving._process_expert([{"id": adapter_path}])
+
+    serving.engine_client.add_lora.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
 async def test_request_body_structural_expert_uses_lora_scheduler_slot(monkeypatch):
     serving = EngramAdapterServingMixin()
     serving._init_engram_adapter_serving()
@@ -285,7 +325,12 @@ async def test_request_body_structural_expert_uses_lora_scheduler_slot(monkeypat
         is_base_model=lambda _model: True,
     )
     serving.model_config = SimpleNamespace(model=MODEL_NAME)
-    serving.engine_client = SimpleNamespace(add_lora=AsyncMock())
+    serving.engine_client = SimpleNamespace(
+        add_lora=AsyncMock(),
+        vllm_config=SimpleNamespace(
+            lora_config=SimpleNamespace(enable_structural_experts=True)
+        ),
+    )
     monkeypatch.setattr(
         "vllm.entrypoints.generate.adapter_serving._resolve_glob",
         lambda expert_id: expert_id,

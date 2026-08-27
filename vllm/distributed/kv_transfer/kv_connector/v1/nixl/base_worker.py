@@ -1136,6 +1136,8 @@ class NixlBaseConnectorWorker:
                 base_addr = cache.data_ptr()
                 if base_addr in seen_base_addresses:
                     idx = seen_base_addresses.index(base_addr)
+                    # Hybrid groups share one BlockPool, so their block IDs are
+                    # disjoint even when their cache views alias this region.
                     is_mla_region = isinstance(
                         layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
                     )
