@@ -424,8 +424,11 @@ class Glm5NextMoE(nn.Module):
 
         extra_logits = (hidden_states * self.structural_router[safe_slots]).sum(dim=-1)
         base_bias = self.structural_expert_bias[safe_slots]
-        if self.gate.e_score_correction_bias is not None:
-            default_bias = self.gate.e_score_correction_bias.unsqueeze(0)
+        base_gate = self.gate
+        if hasattr(self.gate, "base_layer"):
+            base_gate = self.gate.base_layer
+        if base_gate.e_score_correction_bias is not None:
+            default_bias = base_gate.e_score_correction_bias.unsqueeze(0)
             base_bias = torch.where(active.unsqueeze(-1), base_bias, default_bias)
         else:
             base_bias = base_bias * active.unsqueeze(-1)

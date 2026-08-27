@@ -11,6 +11,7 @@ from vllm.lora.structural_expert import (
     extract_structural_experts,
     route_structural_expert,
 )
+from vllm.models.glm5next.nvidia import model as glm5next_model
 from vllm.models.glm5next.nvidia.model import Glm5NextMoE
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -127,3 +128,39 @@ def test_structural_slot_indices_follow_sequence_parallel_chunk():
     indices = moe._get_structural_slot_indices(torch.empty(2, 6))
 
     assert indices.tolist() == [1, -1]
+
+
+def test_structural_routing_reads_base_gate_bias_after_lora_wrapping(monkeypatch):
+    class GateWithLoRA(nn.Module):
+        def __init__(self, correction_bias: torch.Tensor):
+            super().__init__()
+            self.base_layer = nn.Module()
+            self.base_layer.e_score_correction_bias = nn.Parameter(correction_bias)
+
+    moe = Glm5NextMoE.__new__(Glm5NextMoE)
+    nn.Module.__init__(moe)
+    moe.gate = GateWithLoRA(torch.tensor([0.25, -0.5]))
+    moe.experts = nn.Module()
+    moe.is_sequence_parallel = False
+    moe.structural_present = torch.tensor([False])
+    moe.structural_routed = torch.tensor([False])
+    moe.structural_router = torch.zeros(1, 2)
+    moe.structural_expert_bias = torch.zeros(1, 2)
+    moe.scoring_func = "sigmoid"
+    moe.routed_scaling_factor = 1.0
+    captured = {}
+
+    def capture_route(*args, **kwargs):
+        captured["base_bias"] = args[3]
+        return torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.long), torch.zeros(1)
+
+    monkeypatch.setattr(glm5next_model, "route_structural_expert", capture_route)
+
+    moe._structural_expert_routing(
+        hidden_states=torch.ones(1, 2),
+        gating_output=torch.zeros(1, 2),
+        topk=1,
+        renormalize=True,
+    )
+
+    torch.testing.assert_close(captured["base_bias"], torch.tensor([[0.25, -0.5]]))
