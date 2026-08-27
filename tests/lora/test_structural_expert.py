@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from safetensors.torch import save_file
 from torch import nn
 
 from vllm.lora.lora_model import LoRAModel
@@ -57,6 +58,25 @@ def test_lora_model_accepts_structural_only_artifact():
     assert weights.gate_up_proj.dtype == torch.bfloat16
     assert weights.down_proj.dtype == torch.bfloat16
     assert weights.expert_bias.dtype == torch.float32
+
+
+def test_structural_only_checkpoint_does_not_require_adapter_config(tmp_path):
+    save_file(
+        structural_tensors(),
+        tmp_path / "adapter_model.safetensors",
+    )
+
+    model = LoRAModel.from_local_checkpoint(
+        str(tmp_path),
+        expected_lora_modules=set(),
+        peft_helper=PEFTHelper(r=1, lora_alpha=1, target_modules=[]),
+        lora_model_id=1,
+        device="cpu",
+        dtype=torch.bfloat16,
+    )
+
+    assert not (tmp_path / "adapter_config.json").exists()
+    assert set(model.structural_experts) == {"model.layers.0.mlp"}
 
 
 def test_extract_structural_expert_rejects_incomplete_layer():
