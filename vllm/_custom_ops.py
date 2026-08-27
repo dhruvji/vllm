@@ -2366,6 +2366,7 @@ def topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
+    is_padding: torch.Tensor | None = None,
 ) -> None:
     torch.ops._moe_C.topk_softmax(
         topk_weights,
@@ -2374,6 +2375,7 @@ def topk_softmax(
         gating_output,
         renormalize,
         e_score_correction_bias,
+        is_padding,
     )
 
 
@@ -2385,6 +2387,7 @@ def topk_sigmoid(
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
+    is_padding: torch.Tensor | None = None,
 ) -> None:
     torch.ops._moe_C.topk_sigmoid(
         topk_weights,
@@ -2394,6 +2397,7 @@ def topk_sigmoid(
         renormalize,
         e_score_correction_bias,
         routed_scaling_factor,
+        is_padding,
     )
 
 
@@ -2407,6 +2411,7 @@ def topk_hash_softplus_sqrt(
     e_score_correction_bias: torch.Tensor | None = None,
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
+    is_padding: torch.Tensor | None = None,
 ) -> None:
     torch.ops._moe_C.topk_softplus_sqrt(
         topk_weights,
@@ -2418,6 +2423,7 @@ def topk_hash_softplus_sqrt(
         e_score_correction_bias,
         input_tokens,
         hash_indices_table,
+        is_padding,
     )
 
 

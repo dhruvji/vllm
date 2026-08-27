@@ -19,6 +19,16 @@ from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
 logger = init_logger(__name__)
 
 
+def remap_expert_ids(
+    expert_ids: torch.Tensor, expert_id_map: torch.Tensor
+) -> torch.Tensor:
+    """Map valid expert IDs while preserving the invalid-ID sentinel."""
+    valid_ids = (expert_ids >= 0) & (expert_ids < expert_id_map.shape[0])
+    safe_ids = expert_ids.masked_fill(~valid_ids, 0)
+    mapped_ids = expert_id_map[safe_ids]
+    return mapped_ids.masked_fill(~valid_ids, -1)
+
+
 def determine_expert_map(
     ep_size: int,
     ep_rank: int,

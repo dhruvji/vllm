@@ -2,10 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     determine_expert_map,
+    remap_expert_ids,
 )
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_remap_expert_ids_preserves_invalid_ids(dtype: torch.dtype):
+    expert_id_map = torch.tensor([2, 0, 3, 1], dtype=dtype)
+    expert_ids = torch.tensor([[0, -1, 3, 4]], dtype=dtype)
+
+    mapped_ids = remap_expert_ids(expert_ids, expert_id_map)
+
+    torch.testing.assert_close(mapped_ids, torch.tensor([[2, -1, 1, -1]], dtype=dtype))
 
 
 def verify_round_robin_pattern(expert_map, ep_rank, ep_size, global_num_experts):

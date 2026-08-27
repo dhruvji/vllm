@@ -10,6 +10,7 @@ from vllm.distributed import get_ep_group
 from vllm.distributed.device_communicators.all2all import NixlEPAll2AllManager
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.expert_map_manager import remap_expert_ids
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
@@ -158,12 +159,12 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def _map_global_to_physical_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
         if self.global_to_physical is None:
             return topk_ids
-        return self.global_to_physical[topk_ids]
+        return remap_expert_ids(topk_ids, self.global_to_physical)
 
     def _map_local_to_global_ids(self, expert_topk_ids: torch.Tensor) -> torch.Tensor:
         if self.local_expert_global_ids is None:
             return expert_topk_ids
-        return self.local_expert_global_ids[expert_topk_ids]
+        return remap_expert_ids(expert_topk_ids, self.local_expert_global_ids)
 
     def _do_quant(
         self,
