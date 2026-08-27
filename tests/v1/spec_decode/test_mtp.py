@@ -62,6 +62,10 @@ def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
 
 
 @mock.patch(
+    "vllm.v1.spec_decode.llm_base_proposer.supports_multimodal",
+    return_value=True,
+)
+@mock.patch(
     "vllm.v1.spec_decode.llm_base_proposer.current_platform."
     "update_block_size_for_backend"
 )
@@ -73,6 +77,7 @@ def test_mtp_load_model_unified(
     mock_get_layers,
     mock_get_pp_group,
     mock_update_block_size,
+    _mock_supports_multimodal,
 ):
     """Test MTP-specific model loading with unified model approach."""
 
@@ -121,9 +126,14 @@ def test_mtp_load_model_unified(
     target_model.model = mock.MagicMock()
     target_model.model.embed_tokens.weight.shape = (131072, 4096)
     target_model.lm_head = mock.MagicMock()
+    target_model.config = mock.Mock(spec_set=["image_token_id"], image_token_id=151363)
+    target_model.get_language_model = mock.MagicMock(return_value=target_model)
 
     # Create MTP proposer
     proposer = _create_mtp_proposer(num_speculative_tokens=4)
+    proposer.get_model_name = mock.MagicMock(
+        return_value="Glm5NextForConditionalGeneration"
+    )
     proposer.load_model(target_model)
 
     # Verify MTP-specific behavior:
@@ -134,6 +144,7 @@ def test_mtp_load_model_unified(
     assert proposer.model.lm_head == target_model.lm_head
     # MTP shares embed_tokens with target model
     assert proposer.model.model.embed_tokens == target_model.model.embed_tokens
+    assert proposer.model.config.image_token_index == 151363
 
 
 @pytest.mark.parametrize("num_speculative_tokens", [1])
