@@ -469,7 +469,6 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # mismatches the page_table when index_kpool > 1.
         sparse_topk_capacity = topk_indices_physical.shape[1]
 
-        extra_kwargs: dict[str, torch.Tensor] = {}
         empty_rows: torch.Tensor | None = None
         if self.is_nope_mla:
             # The native no-rope kernel takes the active top-k length per query
@@ -483,7 +482,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             topk_indices_physical[:, 0] = topk_indices_physical[:, 0].masked_fill(
                 empty_rows, 0
             )
-            extra_kwargs["sparse_mla_top_k_lens"] = seq_lens.clamp(min=1)
+            seq_lens_arg = seq_lens.clamp(min=1)
 
         kernel_out = trtllm_batch_decode_with_kv_cache_mla(
             query=query,
@@ -499,7 +498,6 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             bmm2_scale=self.bmm2_scale,
             sparse_mla_top_k=sparse_topk_capacity,
             return_lse=self.need_to_return_lse_for_decode,
-            **extra_kwargs,
         )
         if self.need_to_return_lse_for_decode:
             assert isinstance(kernel_out, tuple)

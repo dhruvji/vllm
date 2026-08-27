@@ -86,6 +86,7 @@ def test_nope_flashinfer_sparse_mla_uses_model_scale(monkeypatch):
         block_size=1,
     )
     recorded_scale = None
+    recorded_seq_lens = None
 
     impl = object.__new__(FlashInferMLASparseImpl)
     impl.scale = model_scale
@@ -109,8 +110,10 @@ def test_nope_flashinfer_sparse_mla_uses_model_scale(monkeypatch):
     import flashinfer.decode
 
     def fake_flashinfer(**kwargs):
-        nonlocal recorded_scale
+        nonlocal recorded_scale, recorded_seq_lens
         recorded_scale = kwargs["bmm1_scale"]
+        recorded_seq_lens = kwargs["seq_lens"]
+        assert "sparse_mla_top_k_lens" not in kwargs
         return torch.zeros((1, 1, 1, kv_lora_rank))
 
     monkeypatch.setattr(
@@ -127,6 +130,7 @@ def test_nope_flashinfer_sparse_mla_uses_model_scale(monkeypatch):
 
     assert recorded_scale == model_scale
     assert recorded_scale != kv_lora_rank**-0.5
+    torch.testing.assert_close(recorded_seq_lens, torch.ones(1, dtype=torch.int32))
 
 
 def _float_to_e8m0_truncate(f: float) -> float:
