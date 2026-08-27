@@ -39,6 +39,49 @@ from vllm.v1.attention.backend import AttentionCGSupport
 DEVICE_TYPE = current_platform.device_type
 
 
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextMTPModel",
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_glm5next_defaults_to_breakable_cudagraph(architecture, monkeypatch):
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=[architecture]),
+        compilation_config=CompilationConfig(),
+    )
+    config._uses_breakable_cudagraph_by_default = lambda: (
+        VllmConfig._uses_breakable_cudagraph_by_default(config)
+    )
+
+    assert VllmConfig._maybe_enable_breakable_cudagraph(config)
+    assert config.compilation_config.mode == CompilationMode.NONE
+
+
+@pytest.mark.skip_global_cleanup
+def test_rocm_default_v2_architecture_exclusions_are_applied(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    vllm_config_module.default_v2_model_runner_architectures.cache_clear()
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"],
+            runner_type="generate",
+            is_moe=True,
+            is_hybrid=False,
+            is_attention_free=False,
+        )
+    )
+
+    try:
+        assert not VllmConfig._is_default_v2_model_runner_model(config)
+    finally:
+        vllm_config_module.default_v2_model_runner_architectures.cache_clear()
+
+
 def test_compile_config_repr_succeeds():
     # setup: VllmBackend mutates the config object
     config = VllmConfig()
