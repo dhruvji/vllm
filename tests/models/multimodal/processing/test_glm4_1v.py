@@ -4,11 +4,32 @@
 import pytest
 
 from vllm.assets.video import VideoAsset
+from vllm.model_executor.models.glm4_1v import Glm4vProcessingInfo
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import batched_tensors_equal
 from vllm.multimodal.video import DynamicVideoBackend, VideoBackend
 
 from ...utils import build_model_context
+
+
+@pytest.mark.skip_global_cleanup
+def test_max_video_frame_search_stops_at_profile_cap():
+    class ProcessingInfo:
+        def get_image_size_with_most_features(self):
+            return 28, 28
+
+        def get_num_video_tokens(self, *, num_frames, **kwargs):
+            assert num_frames <= 600
+            return num_frames
+
+    info = ProcessingInfo()
+
+    assert (
+        Glm4vProcessingInfo._get_max_video_frames(
+            info, max_tokens=100_000, max_frames=600
+        )
+        == 600
+    )
 
 
 @pytest.mark.parametrize("model_id", ["zai-org/GLM-4.1V-9B-Thinking"])

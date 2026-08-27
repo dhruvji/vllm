@@ -1190,12 +1190,14 @@ class Glm4vProcessingInfo(BaseProcessingInfo):
         )
         return num_video_tokens
 
-    def _get_max_video_frames(self, max_tokens: int) -> int:
+    def _get_max_video_frames(
+        self, max_tokens: int, max_frames: int | None = None
+    ) -> int:
         target_width, target_height = self.get_image_size_with_most_features()
 
         num_frames = 0
 
-        while True:
+        while max_frames is None or num_frames < max_frames:
             next_num_frames = num_frames + 1
             next_max_tokens = self.get_num_video_tokens(
                 image_width=target_width,
@@ -1218,9 +1220,13 @@ class Glm4vProcessingInfo(BaseProcessingInfo):
         max_videos = mm_counts.get("video", 0)
 
         max_image_tokens = self.get_max_image_tokens() * max_images
-        max_total_frames = self._get_max_video_frames(seq_len - max_image_tokens)
+        max_videos_or_one = max(max_videos, 1)
+        max_total_frames = self._get_max_video_frames(
+            seq_len - max_image_tokens,
+            max_frames=_MAX_FRAMES_PER_VIDEO * max_videos_or_one,
+        )
         max_frames_per_video = min(
-            max_total_frames // max(max_videos, 1), _MAX_FRAMES_PER_VIDEO
+            max_total_frames // max_videos_or_one, _MAX_FRAMES_PER_VIDEO
         )
 
         return max(max_frames_per_video, 1)
