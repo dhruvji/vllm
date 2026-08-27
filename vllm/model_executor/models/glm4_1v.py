@@ -1175,41 +1175,29 @@ class Glm4vProcessingInfo(BaseProcessingInfo):
             image_height=target_height,
         )
 
-    def get_num_video_tokens(
-        self,
-        *,
-        image_width: int,
-        image_height: int,
-        num_frames: int,
-    ) -> int:
-        _, num_video_tokens = self._get_vision_info(
-            image_width=image_width,
-            image_height=image_height,
-            num_frames=num_frames,
-            max_image_pixels=28 * 28 * 2 * 30000,
-        )
-        return num_video_tokens
-
-    def _get_max_video_frames(
-        self, max_tokens: int, max_frames: int | None = None
-    ) -> int:
+    def _get_max_video_frames(self, max_tokens: int) -> int:
         target_width, target_height = self.get_image_size_with_most_features()
 
-        num_frames = 0
+        max_video_pixels = self._get_video_max_pixels()
+        num_frames_with_most_features = 1
+        max_vision_tokens = 0
 
-        while max_frames is None or num_frames < max_frames:
-            next_num_frames = num_frames + 1
-            next_max_tokens = self.get_num_video_tokens(
+        for num_frames in range(1, _MAX_FRAMES_PER_VIDEO + 1):
+            _, num_vision_tokens = self._get_vision_info(
                 image_width=target_width,
                 image_height=target_height,
-                num_frames=next_num_frames,
+                num_frames=num_frames,
+                max_image_pixels=max_video_pixels,
             )
-            if next_max_tokens > max_tokens or next_max_tokens == 0:
-                break
 
-            num_frames = next_num_frames
+            if (
+                0 < num_vision_tokens <= max_tokens
+                and num_vision_tokens > max_vision_tokens
+            ):
+                num_frames_with_most_features = num_frames
+                max_vision_tokens = num_vision_tokens
 
-        return num_frames
+        return num_frames_with_most_features
 
     def get_num_frames_with_most_features(
         self,
@@ -1217,19 +1205,9 @@ class Glm4vProcessingInfo(BaseProcessingInfo):
         mm_counts: Mapping[str, int],
     ) -> int:
         max_images = mm_counts.get("image", 0)
-        max_videos = mm_counts.get("video", 0)
 
         max_image_tokens = self.get_max_image_tokens() * max_images
-        max_videos_or_one = max(max_videos, 1)
-        max_total_frames = self._get_max_video_frames(
-            seq_len - max_image_tokens,
-            max_frames=_MAX_FRAMES_PER_VIDEO * max_videos_or_one,
-        )
-        max_frames_per_video = min(
-            max_total_frames // max_videos_or_one, _MAX_FRAMES_PER_VIDEO
-        )
-
-        return max(max_frames_per_video, 1)
+        return self._get_max_video_frames(seq_len - max_image_tokens)
 
     def _get_video_second_idx_glm4v(
         self, metadata: dict[str, Any], total_frames: int
