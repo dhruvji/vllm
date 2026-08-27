@@ -300,11 +300,12 @@ class AttentionGroup:
                 max_num_blocks, self.kv_cache_spec.block_size, kernel_block_size
             )
         self.metadata_builders = [
-            self.backend.get_builder_cls()(
+            builder_cls(
                 kv_cache_spec_builder,
                 self.layer_names,
                 vllm_config,
                 device,
+                **builder_kwargs,
             )
             for _ in range(num_metadata_builders)
         ]

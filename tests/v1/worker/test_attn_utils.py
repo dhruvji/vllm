@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
+from vllm.v1.attention.backend import AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
 from vllm.v1.worker.utils import AttentionGroup
@@ -25,6 +29,46 @@ class FakeFlashAttentionBackend:
     ) -> tuple[int, ...]:
         assert not include_num_layers_dimension
         return (0, 1, 2, 3, 4)
+
+
+class WidthAwareMetadataBuilder:
+    requires_block_table_width = True
+
+    def __init__(self, *args, block_table_width: int, **kwargs):
+        self.block_table_width = block_table_width
+
+
+class WidthAwareBackend:
+    @staticmethod
+    def get_builder_cls():
+        return WidthAwareMetadataBuilder
+
+
+@pytest.mark.skip_global_cleanup
+def test_metadata_builder_block_table_width_contract():
+    assert AttentionMetadataBuilder.requires_block_table_width is False
+    spec = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+    )
+    group = AttentionGroup(WidthAwareBackend, ["layer"], spec, 0)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1024),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+    )
+
+    group.create_metadata_builders(
+        vllm_config,
+        torch.device("cpu"),
+        kernel_block_size=32,
+    )
+
+    assert group.metadata_builders[0].block_table_width == 32
 
 
 class FakeHNDFlashAttentionBackend(FakeFlashAttentionBackend):
