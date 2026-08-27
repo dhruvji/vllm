@@ -81,27 +81,61 @@ class EngramAdapterServingMixin:
         staged_dir.parent.mkdir(parents=True, exist_ok=True)
         return filelock.FileLock(f"{staged_dir}.lock", timeout=300)
 
+    @staticmethod
+    def _current_staged_adapter_dir(
+        staging_root: Path,
+        required_files: tuple[str, ...],
+    ) -> Path | None:
+        try:
+            generation = (staging_root / "current").read_text().strip()
+        except FileNotFoundError:
+            return None
+        if (
+            not generation.startswith("generation-")
+            or Path(generation).name != generation
+        ):
+            return None
+        published_dir = staging_root / generation
+        if not (published_dir / ".ready").is_file():
+            return None
+        if not all((published_dir / filename).is_file() for filename in required_files):
+            return None
+        return published_dir
+
+    @staticmethod
+    def _publish_staged_adapter_dir(
+        staging_root: Path,
+        temp_dir: Path,
+    ) -> Path:
+        (temp_dir / ".ready").touch()
+        published_dir = staging_root / temp_dir.name.removeprefix(".")
+        os.rename(temp_dir, published_dir)
+
+        file_descriptor, current_temp_name = tempfile.mkstemp(
+            dir=staging_root,
+            prefix=".current.",
+        )
+        current_temp_path = Path(current_temp_name)
+        try:
+            with os.fdopen(file_descriptor, "w") as current_file:
+                current_file.write(published_dir.name)
+            os.replace(current_temp_path, staging_root / "current")
+        finally:
+            current_temp_path.unlink(missing_ok=True)
+        return published_dir
+
     def _prepare_staged_lora_dir(
         self,
         lora_id: str,
         force_redownload: bool,
     ) -> str:
-        local_lora_dir = self._staged_adapter_dir("lora", lora_id)
-        adapter_model_path = local_lora_dir / "adapter_model.safetensors"
-        adapter_config_path = local_lora_dir / "adapter_config.json"
-        ready_path = local_lora_dir / ".ready"
+        staging_root = self._staged_adapter_dir("lora", lora_id)
+        required_files = ("adapter_model.safetensors", "adapter_config.json")
 
-        def can_reuse() -> bool:
-            return (
-                not force_redownload
-                and ready_path.exists()
-                and adapter_model_path.exists()
-                and adapter_config_path.exists()
-            )
-
-        with self._staged_adapter_lock(local_lora_dir):
-            if can_reuse():
-                return str(local_lora_dir)
+        with self._staged_adapter_lock(staging_root):
+            current_dir = self._current_staged_adapter_dir(staging_root, required_files)
+            if not force_redownload and current_dir is not None:
+                return str(current_dir)
 
             manager = get_adapter_manager()
             lora_data = manager.get_adapter(
@@ -109,16 +143,15 @@ class EngramAdapterServingMixin:
                 force_redownload=force_redownload,
             )
 
-            local_lora_dir.mkdir(parents=True, exist_ok=True)
-            ready_path.unlink(missing_ok=True)
+            staging_root.mkdir(parents=True, exist_ok=True)
             temp_dir = Path(
                 tempfile.mkdtemp(
-                    dir=local_lora_dir.parent,
-                    prefix=f".{local_lora_dir.name}.",
+                    dir=staging_root,
+                    prefix=".generation-",
                 )
             )
-            temp_model_path = temp_dir / adapter_model_path.name
-            temp_config_path = temp_dir / adapter_config_path.name
+            temp_model_path = temp_dir / required_files[0]
+            temp_config_path = temp_dir / required_files[1]
             try:
                 safetensors_save_file(lora_data, str(temp_model_path))
 
@@ -139,47 +172,43 @@ class EngramAdapterServingMixin:
                         f"{config_ids}: {last_error}"
                     ) from last_error
 
-                os.replace(temp_model_path, adapter_model_path)
-                os.replace(temp_config_path, adapter_config_path)
-                ready_path.touch()
+                published_dir = self._publish_staged_adapter_dir(staging_root, temp_dir)
             finally:
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-            return str(local_lora_dir)
+            return str(published_dir)
 
     def _prepare_staged_expert_dir(
         self,
         expert_id: str,
         force_redownload: bool,
     ) -> str:
-        local_dir = self._staged_adapter_dir("expert", expert_id)
-        model_path = local_dir / "adapter_model.safetensors"
-        ready_path = local_dir / ".ready"
+        staging_root = self._staged_adapter_dir("expert", expert_id)
+        required_files = ("adapter_model.safetensors",)
 
-        with self._staged_adapter_lock(local_dir):
-            if not force_redownload and ready_path.exists() and model_path.exists():
-                return str(local_dir)
+        with self._staged_adapter_lock(staging_root):
+            current_dir = self._current_staged_adapter_dir(staging_root, required_files)
+            if not force_redownload and current_dir is not None:
+                return str(current_dir)
 
             expert_data = get_adapter_manager().get_adapter(
                 adapter_id=expert_id,
                 force_redownload=force_redownload,
             )
-            local_dir.mkdir(parents=True, exist_ok=True)
-            ready_path.unlink(missing_ok=True)
+            staging_root.mkdir(parents=True, exist_ok=True)
             temp_dir = Path(
                 tempfile.mkdtemp(
-                    dir=local_dir.parent,
-                    prefix=f".{local_dir.name}.",
+                    dir=staging_root,
+                    prefix=".generation-",
                 )
             )
-            temp_model_path = temp_dir / model_path.name
+            temp_model_path = temp_dir / required_files[0]
             try:
                 safetensors_save_file(expert_data, str(temp_model_path))
-                os.replace(temp_model_path, model_path)
-                ready_path.touch()
+                published_dir = self._publish_staged_adapter_dir(staging_root, temp_dir)
             finally:
                 shutil.rmtree(temp_dir, ignore_errors=True)
-            return str(local_dir)
+            return str(published_dir)
 
     async def _process_lora(
         self,

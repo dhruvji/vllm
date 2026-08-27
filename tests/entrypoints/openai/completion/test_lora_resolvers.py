@@ -318,12 +318,14 @@ def test_staged_adapter_cache_reuses_durable_disk_path(monkeypatch, tmp_path):
     serving = EngramAdapterServingMixin()
     serving._init_engram_adapter_serving()
 
-    staged_dir = serving._staged_adapter_dir("expert", "first")
-    assert staged_dir.parent == tmp_path / "adapters" / "staged"
+    staging_root = serving._staged_adapter_dir("expert", "first")
+    assert staging_root.parent == tmp_path / "adapters" / "staged"
+    staged_dir = staging_root / "generation-existing"
     staged_dir.mkdir(parents=True)
     model_path = staged_dir / "adapter_model.safetensors"
     model_path.touch()
     (staged_dir / ".ready").touch()
+    (staging_root / "current").write_text(staged_dir.name)
     manager = MagicMock()
     monkeypatch.setattr(
         "vllm.entrypoints.generate.adapter_serving.get_adapter_manager", manager
@@ -423,22 +425,49 @@ def test_staged_adapter_lock_serializes_shared_disk_writes(monkeypatch, tmp_path
 
 
 @pytest.mark.skip_global_cleanup
+def test_force_redownload_publishes_immutable_adapter_generation(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+    manager = MagicMock()
+    manager.get_adapter.side_effect = [b"first", b"second"]
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.get_adapter_manager",
+        lambda: manager,
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.safetensors_save_file",
+        lambda data, path: Path(path).write_bytes(data),
+    )
+
+    first_dir = Path(serving._prepare_staged_expert_dir("shared", False))
+    second_dir = Path(serving._prepare_staged_expert_dir("shared", True))
+
+    assert second_dir != first_dir
+    assert (first_dir / "adapter_model.safetensors").read_bytes() == b"first"
+    assert (second_dir / "adapter_model.safetensors").read_bytes() == b"second"
+    assert serving._prepare_staged_expert_dir("shared", False) == str(second_dir)
+
+
+@pytest.mark.skip_global_cleanup
 def test_failed_force_redownload_preserves_published_adapter(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
     serving = EngramAdapterServingMixin()
     serving._init_engram_adapter_serving()
-    staged_dir = serving._staged_adapter_dir("expert", "shared")
-    staged_dir.mkdir(parents=True)
-    model_path = staged_dir / "adapter_model.safetensors"
-    model_path.write_bytes(b"published")
-    (staged_dir / ".ready").touch()
-
     manager = MagicMock()
     manager.get_adapter.return_value = {}
     monkeypatch.setattr(
         "vllm.entrypoints.generate.adapter_serving.get_adapter_manager",
         lambda: manager,
     )
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.safetensors_save_file",
+        lambda _data, path: Path(path).write_bytes(b"published"),
+    )
+    staged_dir = Path(
+        serving._prepare_staged_expert_dir("shared", force_redownload=False)
+    )
+    model_path = staged_dir / "adapter_model.safetensors"
 
     def fail_save(_data, _path):
         raise RuntimeError("write failed")
@@ -452,7 +481,8 @@ def test_failed_force_redownload_preserves_published_adapter(monkeypatch, tmp_pa
         serving._prepare_staged_expert_dir("shared", force_redownload=True)
 
     assert model_path.read_bytes() == b"published"
-    assert not (staged_dir / ".ready").exists()
+    assert (staged_dir / ".ready").exists()
+    assert serving._prepare_staged_expert_dir("shared", False) == str(staged_dir)
 
 
 @pytest.mark.asyncio
