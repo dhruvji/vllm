@@ -11,6 +11,7 @@ from PIL import Image
 from transformers.image_utils import PILImageResampling
 from transformers.video_utils import VideoMetadata
 
+import vllm.transformers_utils.processors.glm5next as glm5next
 from vllm.transformers_utils.processors.glm5next import (
     Glm5NextImageProcessor,
     Glm5NextProcessor,
@@ -33,6 +34,51 @@ MIN_TOKENS = 16
 MAX_TOKENS = 800  # serving-cap equivalent budget, keeps test canvases small
 MIN_PIXELS = MIN_TOKENS * PIXELS_PER_TOKEN
 MAX_PIXELS = MAX_TOKENS * PIXELS_PER_TOKEN
+
+
+def test_from_pretrained_resolves_remote_processor_config(monkeypatch):
+    tokenizer = object()
+    image_config_kwargs = {}
+
+    class CapturingProcessor(Glm5NextProcessor):
+        def __init__(self, image_processor, tokenizer, video_processor, **kwargs):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.video_processor = video_processor
+
+    def get_image_processor_config(model, **kwargs):
+        assert model == "org/model"
+        image_config_kwargs.update(kwargs)
+        return {"image_processor_type": "GLM", "max_image_tokens": 8000}
+
+    def get_processor_config(file_name, model, revision):
+        assert file_name == "processor_config.json"
+        assert model == "org/model"
+        assert revision == "revision"
+        return {
+            "video_processor": {
+                "video_processor_type": "GLM",
+                "max_image_tokens": 240000,
+            }
+        }
+
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained",
+        lambda model, **kwargs: tokenizer,
+    )
+    monkeypatch.setattr(
+        glm5next, "get_image_processor_config", get_image_processor_config
+    )
+    monkeypatch.setattr(glm5next, "get_hf_file_to_dict", get_processor_config)
+    monkeypatch.setattr(glm5next, "Glm5NextImageProcessor", lambda **kwargs: kwargs)
+    monkeypatch.setattr(glm5next, "Glm5NextVideoProcessor", lambda **kwargs: kwargs)
+
+    processor = CapturingProcessor.from_pretrained("org/model", revision="revision")
+
+    assert image_config_kwargs["revision"] == "revision"
+    assert processor.tokenizer is tokenizer
+    assert processor.image_processor["max_image_tokens"] == 8000
+    assert processor.video_processor["max_image_tokens"] == 30000
 
 
 def test_video_only_multimodal_token_count_uses_video_merge_size():

@@ -628,7 +628,10 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
     def _glm5_hf_processor(self):
         from vllm.transformers_utils.processors.glm5next import Glm5NextProcessor
 
-        return Glm5NextProcessor.from_pretrained(self.ctx.model_config.model)
+        return Glm5NextProcessor.from_pretrained(
+            self.ctx.model_config.model,
+            revision=self.ctx.model_config.revision,
+        )
 
     def get_hf_processor(self, **kwargs: object):
         return self._glm5_hf_processor
