@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+import pytest
 
 from vllm.lora.utils import is_in_target_modules, is_supported_lora_module
+from vllm.model_executor.models.interfaces import supports_lora
 
 
 class TestIsSupportedLoraModule:
@@ -79,3 +80,32 @@ class TestIsInTargetModules:
             ["q_a_proj", "kv_a_proj_with_mqa"],
             {"fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"]},
         )
+
+
+@pytest.mark.skip_global_cleanup
+def test_glm5next_exposes_all_fused_lora_targets():
+    from vllm.models.glm5next.nvidia.model import (
+        Glm5NextForCausalLM,
+        Glm5NextForConditionalGeneration,
+    )
+
+    expected = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "wk_weights_proj": ["wk", "weights_proj"],
+        "in_proj_qkvbfg_a": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+        ],
+    }
+
+    assert supports_lora(Glm5NextForCausalLM)
+    assert Glm5NextForCausalLM.packed_modules_mapping == expected
+    assert Glm5NextForConditionalGeneration.packed_modules_mapping == {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        **expected,
+    }

@@ -17,6 +17,7 @@ from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.utils.math_utils import largest_power_of_2_divisor
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -36,8 +37,25 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
+
+
+def compressed_kernel_block_size(spec: AttentionSpec) -> int:
+    """Choose a token block whose compressed state count tiles DeepGEMM."""
+    assert isinstance(spec.tokens_per_state, int) and spec.tokens_per_state > 1
+    num_states = spec.num_states
+    max_page = max(PAGED_MQA_PAGE_SIZES)
+    min_page = min(PAGED_MQA_PAGE_SIZES)
+    page_states = (
+        num_states
+        if num_states <= max_page
+        else max_page
+        if num_states % max_page == 0
+        else min_page
+    )
+    return page_states * spec.tokens_per_state
 
 
 @triton.jit
@@ -259,11 +277,28 @@ class AttentionGroup:
         kernel_block_size: int | None = None,
         num_metadata_builders: int = 1,
     ):
-        kv_cache_spec_builder = (
-            self.kv_cache_spec.copy_with_new_block_size(kernel_block_size)
-            if kernel_block_size is not None
-            else self.kv_cache_spec
-        )
+        if kernel_block_size is None:
+            kv_cache_spec_builder = self.kv_cache_spec
+        elif (
+            isinstance(self.kv_cache_spec, AttentionSpec)
+            and self.kv_cache_spec.tokens_per_state > 1
+        ):
+            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+                compressed_kernel_block_size(self.kv_cache_spec)
+            )
+        else:
+            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+                kernel_block_size
+            )
+        builder_cls = self.backend.get_builder_cls()
+        builder_kwargs = {}
+        if builder_cls.requires_block_table_width:
+            max_num_blocks = self.kv_cache_spec.max_num_blocks_per_req(
+                vllm_config, vllm_config.model_config.max_model_len
+            )
+            builder_kwargs["block_table_width"] = get_block_table_width(
+                max_num_blocks, self.kv_cache_spec.block_size, kernel_block_size
+            )
         self.metadata_builders = [
             self.backend.get_builder_cls()(
                 kv_cache_spec_builder,
@@ -273,6 +308,9 @@ class AttentionGroup:
             )
             for _ in range(num_metadata_builders)
         ]
+        if kernel_block_size is not None:
+            for builder in self.metadata_builders:
+                builder.kernel_block_size = kernel_block_size  # type: ignore[attr-defined]
 
     def get_metadata_builder(self, ubatch_id: int = 0) -> AttentionMetadataBuilder:
         assert len(self.metadata_builders) > ubatch_id

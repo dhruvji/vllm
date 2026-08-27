@@ -23,6 +23,7 @@ def _convert_req_index_to_global_index_kernel(
     BLOCK_N: tl.constexpr,  # tile width along columns
     HAS_PREFILL: tl.constexpr,
     COUNT_VALID: tl.constexpr,  # whether to count valid indices
+    SINGLE_TILE: tl.constexpr,
     # When set, scatter valid slots to a contiguous prefix [0, valid_count) using
     # valid_count_ptr as an atomic slot allocator (DCP filtering leaves interior
     # -1 gaps; the trtllm-gen sparse kernel reads the first valid_count entries).
@@ -111,10 +112,25 @@ def _convert_req_index_to_global_index_kernel(
         out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
         tl.store(out_ptr_ij, out_val)
 
-        # Count valid indices in this tile and atomically add to row total
+        # Count valid indices in this tile and update the row total.
         if COUNT_VALID:
             tile_valid_count = tl.sum((~is_invalid_tok).to(tl.int32))
-            tl.atomic_add(valid_count_ptr + token_id, tile_valid_count)
+            if SINGLE_TILE:
+                tl.store(valid_count_ptr + token_id, tile_valid_count)
+            else:
+                tl.atomic_add(valid_count_ptr + token_id, tile_valid_count)
+
+
+def _remap_tiling(
+    num_topk_tokens: int, block_n: int, count_valid: bool
+) -> tuple[bool, int, int, int]:
+    """Choose the column tiling for the index-remap kernel."""
+    single_tile = (
+        count_valid and triton.next_power_of_2(num_topk_tokens) == num_topk_tokens
+    )
+    if single_tile:
+        return True, num_topk_tokens, 1, 8
+    return False, block_n, num_topk_tokens // block_n, 4
 
 
 def triton_convert_req_index_to_global_index(
@@ -172,20 +188,27 @@ def triton_convert_req_index_to_global_index(
 
     num_tokens = req_id.shape[0]
     max_num_blocks_per_req = block_table.shape[1]
-    tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
+    single_tile, block_n, tiles_per_row, num_warps = _remap_tiling(
+        NUM_TOPK_TOKENS, BLOCK_N, return_valid_counts
+    )
 
     # Ensure contiguous tensors on the same device
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
-    out = torch.empty_like(token_indices_c)
+    # When return_valid_counts, the kernel scatters valid entries to a
+    # contiguous prefix [0, valid_count) and leaves the tail unwritten, so
+    # pre-fill -1 there. flash_mla_sparse_fwd then bounds attention to
+    # [:topk_length] == exactly the valid set (no dropped tokens).
+    if return_valid_counts:
+        out = torch.full_like(token_indices_c, -1)
+    else:
+        out = torch.empty_like(token_indices_c)
 
-    # Allocate valid count buffer if needed (must be zero-initialized for atomics)
     valid_counts: torch.Tensor | None = None
     if return_valid_counts:
-        valid_counts = torch.zeros(
-            num_tokens, dtype=torch.int32, device=token_indices.device
-        )
+        alloc = torch.empty if single_tile else torch.zeros
+        valid_counts = alloc(num_tokens, dtype=torch.int32, device=token_indices.device)
 
     # Strides in elements
     bt_stride0, bt_stride1 = block_table_c.stride()
@@ -213,10 +236,11 @@ def triton_convert_req_index_to_global_index(
         # shapes / constexprs
         max_num_blocks_per_req,
         BLOCK_SIZE,
-        BLOCK_N,
+        block_n,
         HAS_PREFILL_WORKSPACE,
         return_valid_counts,
-        False,  # COMPACT_TO_FRONT: keep input column == output column
+        single_tile,
+        return_valid_counts,  # COMPACT_TO_FRONT: scatter valid to [0,count)
         # DCP disabled (no-op de-interleave)
         1,
         0,
@@ -228,6 +252,7 @@ def triton_convert_req_index_to_global_index(
         ti_stride1,
         out_stride0,
         out_stride1,
+        num_warps=num_warps,
     )
 
     if return_valid_counts:
@@ -287,7 +312,9 @@ def triton_filter_and_convert_dcp_index(
 
     num_tokens = req_id.shape[0]
     max_num_blocks_per_req = block_table.shape[1]
-    tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
+    single_tile, block_n, tiles_per_row, num_warps = _remap_tiling(
+        NUM_TOPK_TOKENS, BLOCK_N, count_valid=True
+    )
 
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
@@ -322,9 +349,10 @@ def triton_filter_and_convert_dcp_index(
         None,
         max_num_blocks_per_req,
         BLOCK_SIZE,
-        BLOCK_N,
+        block_n,
         False,  # HAS_PREFILL
         count_valid,
+        single_tile,
         compact_valid_to_front,
         dcp_size,
         dcp_rank,
@@ -335,6 +363,7 @@ def triton_filter_and_convert_dcp_index(
         ti_stride1,
         out_stride0,
         out_stride1,
+        num_warps=num_warps,
     )
 
     if return_valid_counts:

@@ -103,7 +103,12 @@ class NixlBaseConnectorWorker:
             # NIXL regions per SSM layer = conv sub-projections + 1 SSM temporal
             # (Mamba2/GDN: 3+1=4; Mamba1: 1+1=2).
             ssm_regions_per_layer = len(self._conv_decomp.local_conv_offsets) + 1
-            num_ssm_regions = len(self.block_len_per_layer) * ssm_regions_per_layer
+            num_ssm_tensors = (
+                len(self._mamba_region_indices)
+                if self._mamba_region_indices
+                else len(self.block_len_per_layer)
+            )
+            num_ssm_regions = num_ssm_tensors * ssm_regions_per_layer
 
         num_blocks = dst_num_blocks
         if block_size_ratio is not None:
@@ -531,6 +536,7 @@ class NixlBaseConnectorWorker:
         # (MLA), False -> SPLIT (head-sharded full-attn). Mixed only for models
         # combining both (e.g. GQA main + MLA Eagle-3 draft).
         self._region_is_mla = list[bool]()
+        self._mamba_region_indices = list[int]()
 
         # Enable different block lengths for different layers *only* when MLA is used.
         # This is not used for SSM layers, which use the counterpart `mamba_ssm_size`.
@@ -1079,24 +1085,14 @@ class NixlBaseConnectorWorker:
         )
 
         caches_data = []
-        # With hybrid allocator, layers can share a kv cache tensor
-        seen_base_addresses = []
-
-        # Note(tms): I modified this from the original region setup code.
-        # K and V are now in different regions. Advantage is that we can
-        # elegantly support MLA and any cases where the K and V tensors
-        # are non-contiguous (it's not locally guaranteed that they will be)
-        # Disadvantage is that the encoded NixlAgentMetadata is now larger
-        # (roughly 8KB vs 5KB).
-        # Conversely for FlashInfer, K and V are registered in the same region
-        # to better exploit the memory layout (ie num_blocks is the first dim).
+        seen_base_addresses: list[int] = []
+        self._mamba_region_indices = []
         tensor_size_bytes = None
 
         for layer_name, cache_or_caches in xfer_buffers.items():
-            # NOTE (NickLucche) Hybrid SSM models assume a layout that is similar to
-            # that of FI, with block laid out as in `get_backend_aware_kv_block_len`.
-            # However, physical page_size may differ when kernel requires a specific
-            # block size. This leads to SSM and FA layers having different num_blocks.
+            # NOTE (NickLucche) Hybrid SSM mamba/FA physical page_size may differ when
+            # kernel requires a specific block size. This leads to SSM and FA layers
+            # having different num_blocks.
             # `_physical_blocks_per_logical_kv_block` ratio is used to adjust for this.
             layer_spec = self._layer_specs.get(layer_name)
             if layer_spec is None:
@@ -1136,15 +1132,19 @@ class NixlBaseConnectorWorker:
             # [`num_blocks` * `page_size`]
             curr_tensor_size_bytes = num_blocks * physical_page_size
 
-            # TODO (NickLucche) we could eventually unify how we handle FA/FI regions,
-            # registering a single tensor for both K/V and splitting logically like FI.
             for cache in cache_list:
                 base_addr = cache.data_ptr()
                 if base_addr in seen_base_addresses:
-                    # NOTE (NickLucche) HMA employs memory pooling to share tensors
-                    # across groups. This results in skipping all tensors but the ones
-                    # pointed to by group0. Also, generally we will have more blocks
-                    # per tensor but fewer regions.
+                    idx = seen_base_addresses.index(base_addr)
+                    is_mla_region = isinstance(
+                        layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+                    )
+                    self._region_is_mla[idx] |= is_mla_region
+                    if (
+                        isinstance(layer_spec, MambaSpec)
+                        and idx not in self._mamba_region_indices
+                    ):
+                        self._mamba_region_indices.append(idx)
                     logger.debug("Skipping %s because it's already seen", layer_name)
                     continue
                 logger.debug(
@@ -1156,6 +1156,7 @@ class NixlBaseConnectorWorker:
                     self.block_len_per_layer.append(
                         physical_page_size // self._physical_blocks_per_logical_kv_block
                     )
+                    self._mamba_region_indices.append(len(seen_base_addresses) - 1)
                 else:
                     self.block_len_per_layer.append(physical_page_size)
                 is_mla_region = isinstance(
@@ -1170,8 +1171,6 @@ class NixlBaseConnectorWorker:
                         "All non-MLA kv cache tensors must have the same size"
                     )
 
-                # When there's a mismatch between kbs<>bs, we rely on HMA to ensure
-                # caches are either [NB, PS] or [NB*r, PS/r] where r is bs/kbs.
                 if (
                     self._physical_blocks_per_logical_kv_block == 1
                     and cache.shape[0] != num_blocks
@@ -1295,7 +1294,9 @@ class NixlBaseConnectorWorker:
         block_arange = np.arange(num_blocks, dtype=np.uint64)
 
         parts: list[np.ndarray] = []
-        for i, base_addr in enumerate(base_addresses):
+        region_indices = self._mamba_region_indices or range(len(base_addresses))
+        for i in region_indices:
+            base_addr = base_addresses[i]
             # Jump one page_size, but ssm page_size may be bigger when kernel
             # locks block size to a specific value (physical_per_logical scale).
             page_stride = (
@@ -1341,7 +1342,11 @@ class NixlBaseConnectorWorker:
         parts: list[np.ndarray] = []
         # NOTE (ZhanqiuHu): use per-layer block_lens[i], not [0], in case
         # block lengths vary across layers (e.g. MLA).
-        for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
+        region_indices = self._mamba_region_indices or range(
+            len(nixl_agent_meta.kv_caches_base_addr)
+        )
+        for i in region_indices:
+            base_addr = nixl_agent_meta.kv_caches_base_addr[i]
             page_stride = nixl_agent_meta.block_lens[i] * remote_physical_per_logical
             blk_addrs = base_addr + block_arange * page_stride
             for off, sz in conv_offsets:

@@ -147,6 +147,23 @@ class LoRAModelManager:
         )
         self._init_punica_wrapper(max_num_batched_tokens, vllm_config)
         self._create_lora_modules()
+        self.structural_expert_modules = {
+            name: module
+            for name, module in self.model.named_modules()
+            if hasattr(module, "create_structural_expert_weights")
+        }
+        if lora_config.enable_structural_experts:
+            if not self.structural_expert_modules:
+                raise ValueError(
+                    "--enable-structural-experts is only supported by models "
+                    "with structural expert modules."
+                )
+            for module in self.structural_expert_modules.values():
+                module.create_structural_expert_weights(
+                    max_loras=lora_config.max_loras,
+                    dtype=lora_config.lora_dtype,
+                    device=device,
+                )
 
         self.moe_ep_load_spec: MoEEPLoadSpec | None = self._build_moe_ep_load_spec()
 
@@ -338,6 +355,14 @@ class LoRAModelManager:
                 module_lora.lora_b,
             )
             logger.debug("Successfully loaded LoRA weights for module %s.", module_name)
+        if self.lora_config.enable_structural_experts:
+            for module_name, module in self.structural_expert_modules.items():
+                weights = lora_model.structural_experts.get(module_name)
+                if weights is None:
+                    weights = lora_model.structural_experts.get(
+                        module_name.removeprefix("language_model.")
+                    )
+                module.set_structural_expert(index, weights)
         return True
 
     def _deactivate_adapter(self, lora_id: int):

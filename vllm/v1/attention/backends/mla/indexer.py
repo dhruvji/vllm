@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import torch
@@ -131,7 +133,7 @@ class DeepseekV32IndexerBackend(AttentionBackend):
         return [32, 64, 128]
 
     @staticmethod
-    def get_builder_cls() -> type["DeepseekV32IndexerMetadataBuilder"]:
+    def get_builder_cls() -> type[DeepseekV32IndexerMetadataBuilder]:
         return DeepseekV32IndexerMetadataBuilder
 
     @staticmethod
@@ -155,6 +157,26 @@ class DeepseekV32IndexerBackend(AttentionBackend):
             # first, signaling incompatibility.
             return (0, 1, 2, 3)
         return (0, 1, 2)
+
+
+class KpoolTailBackend(DeepseekV32IndexerBackend):
+    """Storage-only backend for the GLM-5.3-Flash kpool tail cache."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "KPOOL_TAIL"
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        return []
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [MultipleOf(1)]
+
+    @staticmethod
+    def get_builder_cls() -> type[KpoolTailMetadataBuilder]:  # type: ignore[override]
+        return KpoolTailMetadataBuilder
 
 
 class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
@@ -189,6 +211,7 @@ class DeepseekV32IndexerPrefillChunkMetadata:
 @dataclass
 class DeepseekV32IndexerPrefillMetadata:
     chunks: list[DeepseekV32IndexerPrefillChunkMetadata]
+    max_prefill_seq_len: int = -1
 
 
 @dataclass
@@ -203,6 +226,10 @@ class DeepSeekV32IndexerDecodeMetadata:
     requires_padding: bool
     schedule_metadata: torch.Tensor
     global_seq_lens: torch.Tensor | None = None
+    per_req_decode_lens: torch.Tensor | None = None
+    decode_is_uniform: bool = True
+    write_max_decode_len: int = 0
+    indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -222,6 +249,76 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+
+
+def compute_kpool_tail_slot_mapping(
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    num_actual_tokens: int,
+    num_reqs: int,
+    kpool: int,
+) -> torch.Tensor:
+    """Map every token to its request's one circular tail block."""
+    out = slot_mapping.clone()
+    if num_actual_tokens == 0:
+        return out
+    tokens = torch.arange(num_actual_tokens, device=slot_mapping.device)
+    req = torch.searchsorted(query_start_loc, tokens, right=True) - 1
+    req = req.clamp_(min=0, max=num_reqs - 1)
+    own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
+    pos = positions[:num_actual_tokens].to(torch.int64)
+    out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
+    return out
+
+
+class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
+    """Build only the circular slot mapping needed by the storage-only tail."""
+
+    _cudagraph_support = AttentionCGSupport.ALWAYS
+    supports_update_block_table = False
+    reorder_batch_threshold = None
+
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> DeepseekV32IndexerMetadata:
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(common_attn_metadata)
+        )
+        slot_mapping = common_attn_metadata.slot_mapping
+        positions = common_attn_metadata.positions
+        if positions is not None:
+            slot_mapping = compute_kpool_tail_slot_mapping(
+                slot_mapping,
+                common_attn_metadata.block_table_tensor,
+                common_attn_metadata.query_start_loc,
+                positions,
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.num_reqs,
+                self.kv_cache_spec.block_size,
+            )
+        return DeepseekV32IndexerMetadata(
+            seq_lens=common_attn_metadata.seq_lens,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            slot_mapping=slot_mapping,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+        )
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -252,6 +349,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.kernel_block_size: int | None = None
         scheduler_config = self.vllm_config.scheduler_config
         parallel_config = self.vllm_config.parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
@@ -312,6 +410,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             next_n, device=self.device, dtype=torch.int32
         )
         self.decode_lens_buffer = torch.zeros(
+            (scheduler_config.max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.per_req_decode_lens_buffer = torch.zeros(
             (scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
             device=self.device,
@@ -381,6 +484,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+        self.indexer_decode_block_table_buffer: torch.Tensor | None = None
+        self._max_num_batched_tokens = scheduler_config.max_num_batched_tokens
 
     def _dcp_localize_decode_seq_lens(
         self,
@@ -578,13 +683,22 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         compressed_slot_mapping = slot_mapping
         compressed_seq_lens = seq_lens
+        indexer_block_table = block_table
         if self.compress_ratio > 1:
+            kernel_block_size = self.kernel_block_size
+            if (
+                kernel_block_size is not None
+                and self.kv_cache_spec.block_size != kernel_block_size
+                and self.kv_cache_spec.block_size % kernel_block_size == 0
+            ):
+                factor = self.kv_cache_spec.block_size // kernel_block_size
+                indexer_block_table = (block_table[:, ::factor] // factor).contiguous()
             compressed_slot_mapping = get_compressed_slot_mapping(
                 num_tokens,
                 query_start_loc,
                 seq_lens,
-                block_table,
-                self.kv_cache_spec.storage_block_size,
+                indexer_block_table,
+                self.kv_cache_spec.num_states,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
@@ -628,7 +742,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     seq_lens,
                     compressed_seq_lens,
                     compressed_seq_lens_cpu,
-                    common_attn_metadata.block_table_tensor,
+                    indexer_block_table,
                     self.compress_ratio,
                     query_slice=query_slice,
                     skip_kv_gather=query_slice.start > 0,
@@ -639,7 +753,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
                 if metadata is not None:
                     chunks.append(metadata)
-            prefill_metadata = DeepseekV32IndexerPrefillMetadata(chunks)
+            prefill_metadata = DeepseekV32IndexerPrefillMetadata(
+                chunks,
+                max_prefill_seq_len=(
+                    int(seq_lens_cpu[num_decodes:].max().item())
+                    if num_prefills > 0
+                    else 0
+                ),
+            )
 
         decode_metadata = None
         if num_decodes > 0:
@@ -648,6 +769,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 out=self.decode_lens_buffer[:num_decodes],
             )
             decode_lens = self.decode_lens_buffer[:num_decodes]
+            self.per_req_decode_lens_buffer[:num_decodes].copy_(decode_lens)
             decode_lens_cpu = torch.diff(
                 common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
             )
@@ -667,6 +789,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
 
             max_decode_len = int(decode_lens_cpu.max().item())
+            min_decode_len = int(decode_lens_cpu.min().item())
+            write_is_uniform = min_decode_len == max_decode_len
             next_n = 1 + self.num_speculative_tokens
             use_native = not self.use_flattening and max_decode_len <= next_n
 
@@ -694,6 +818,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     max_decode_len=max_decode_len,
                 )
             )
+
+            if self.compress_ratio > 1:
+                kernel_block_size = self.kernel_block_size
+                if (
+                    kernel_block_size is not None
+                    and self.kv_cache_spec.block_size != kernel_block_size
+                    and self.kv_cache_spec.block_size % kernel_block_size == 0
+                ):
+                    factor = self.kv_cache_spec.block_size // kernel_block_size
+                    compressed = block_table[:, ::factor] // factor
+                    rows, cols = compressed.shape
+                    if self.indexer_decode_block_table_buffer is None:
+                        self.indexer_decode_block_table_buffer = torch.zeros(
+                            (self._max_num_batched_tokens, cols),
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                    self.indexer_decode_block_table_buffer[:rows, :cols].copy_(
+                        compressed
+                    )
+                    block_table = self.indexer_decode_block_table_buffer[:rows, :cols]
 
             seq_lens_is_buffer_view = (use_native and next_n > 1) or (
                 not use_native and max_decode_len > 1
@@ -741,6 +886,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,
                 global_seq_lens=global_seq_lens_for_decode,
+                per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
+                decode_is_uniform=write_is_uniform,
+                write_max_decode_len=max_decode_len,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

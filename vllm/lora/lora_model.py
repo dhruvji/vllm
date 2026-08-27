@@ -10,6 +10,11 @@ import torch
 from vllm.logger import init_logger
 from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
+from vllm.lora.structural_expert import (
+    StructuralExpertWeights,
+    extract_structural_experts,
+    is_structural_expert_tensor_name,
+)
 from vllm.lora.utils import (
     get_lora_id,
     is_base_embedding_weights,
@@ -66,6 +71,7 @@ class LoRAModel:
         rank: int,
         loras: dict[str, LoRALayerWeights],
         is_3d_lora_weight: bool = False,
+        structural_experts: dict[str, StructuralExpertWeights] | None = None,
     ) -> None:
         """
         Args:
@@ -86,6 +92,7 @@ class LoRAModel:
         self.rank = rank
         self.loras: dict[str, LoRALayerWeights] = loras
         self.is_3d_lora_weight = is_3d_lora_weight
+        self.structural_experts = structural_experts or {}
 
     def clone(self, lora_model_id: int) -> "LoRAModel":
         """Return a copy of the object with different ids.
@@ -96,6 +103,7 @@ class LoRAModel:
             rank=self.rank,
             loras=self.loras.copy(),
             is_3d_lora_weight=self.is_3d_lora_weight,
+            structural_experts=self.structural_experts.copy(),
         )
 
     def get_lora(self, module_name: str) -> LoRALayerWeights | None:
@@ -126,6 +134,7 @@ class LoRAModel:
         skip_prefixes: list[str] | None = None,
     ) -> "LoRAModel":
         """Create a LoRAModel from a dictionary of tensors."""
+        tensors, structural_experts = extract_structural_experts(tensors)
         pin_memory = str(device) == "cpu" and PIN_MEMORY
         loras: dict[str, LoRALayerWeights] = {}
         for tensor_name, tensor in tensors.items():
@@ -161,7 +170,23 @@ class LoRAModel:
                 if pin_memory:
                     loras[module_name].lora_b = loras[module_name].lora_b.pin_memory()
 
-        return cls(lora_model_id, peft_helper.r, loras)
+        structural_experts = {
+            name: StructuralExpertWeights(
+                gate_up_proj=weights.gate_up_proj.to(device=device, dtype=dtype),
+                down_proj=weights.down_proj.to(device=device, dtype=dtype),
+                router=None
+                if weights.router is None
+                else weights.router.to(device=device, dtype=dtype),
+                expert_bias=weights.expert_bias.to(device=device, dtype=torch.float32),
+            )
+            for name, weights in structural_experts.items()
+        }
+        return cls(
+            lora_model_id,
+            peft_helper.r,
+            loras,
+            structural_experts=structural_experts,
+        )
 
     @classmethod
     def from_local_checkpoint(
@@ -211,6 +236,8 @@ class LoRAModel:
 
         def check_unexpected_modules(modules: dict):
             for lora_module in modules.keys():  # noqa
+                if is_structural_expert_tensor_name(lora_module):
+                    continue
                 if is_base_embedding_weights(lora_module):
                     continue
                 # Handle PEFT file format where experts.base_layer is the

@@ -139,6 +139,47 @@ class EngramAdapterServingMixin:
                 self._prepared_lora_dirs.popitem(last=False)
             return str(local_lora_dir)
 
+    def _prepare_staged_expert_dir(
+        self,
+        expert_id: str,
+        force_redownload: bool,
+    ) -> str:
+        expert_hash = hashlib.sha256(("expert:" + expert_id).encode()).hexdigest()[:16]
+        cache_dir = envs.VLLM_LORA_RESOLVER_CACHE_DIR or tempfile.gettempdir()
+        local_dir = Path(cache_dir) / expert_hash
+        model_path = local_dir / "adapter_model.safetensors"
+
+        cached = self._prepared_lora_dirs.get(expert_id)
+        if not force_redownload and cached == str(local_dir) and model_path.exists():
+            self._prepared_lora_dirs.move_to_end(expert_id)
+            return str(local_dir)
+
+        with self._lora_staging_locks_meta:
+            lock = self._lora_staging_locks.setdefault(expert_id, threading.Lock())
+        with lock:
+            cached = self._prepared_lora_dirs.get(expert_id)
+            if (
+                not force_redownload
+                and cached == str(local_dir)
+                and model_path.exists()
+            ):
+                self._prepared_lora_dirs.move_to_end(expert_id)
+                return str(local_dir)
+
+            expert_data = get_adapter_manager().get_adapter(
+                adapter_id=expert_id,
+                force_redownload=force_redownload,
+            )
+            if local_dir.exists():
+                shutil.rmtree(local_dir)
+            local_dir.mkdir(parents=True, exist_ok=True)
+            safetensors_save_file(expert_data, str(model_path))
+            self._prepared_lora_dirs[expert_id] = str(local_dir)
+            self._prepared_lora_dirs.move_to_end(expert_id)
+            while len(self._prepared_lora_dirs) > self._prepared_lora_dirs_max_size:
+                self._prepared_lora_dirs.popitem(last=False)
+            return str(local_dir)
+
     async def _process_lora(
         self,
         lora_specs: list[dict[str, Any]] | None,
@@ -215,6 +256,74 @@ class EngramAdapterServingMixin:
             self.models.lora_requests[resolved_id] = lora_request
             return lora_request
 
+    async def _process_expert(
+        self,
+        expert_specs: list[dict[str, Any]] | None,
+    ) -> LoRARequest | None:
+        if not expert_specs:
+            return None
+        if not isinstance(expert_specs, list) or len(expert_specs) != 1:
+            raise ValueError("`adapters.expert` must contain exactly one adapter.")
+        expert_spec = expert_specs[0]
+        if not isinstance(expert_spec, dict):
+            raise ValueError("Each structural expert spec must be an object.")
+        sources = _spec_sources(expert_spec)
+        if not sources:
+            raise ValueError("Structural expert spec missing `id`/`sources`.")
+
+        force_redownload = bool(expert_spec.get("force_redownload", False))
+        resolved_id: str | None = None
+        runtime_path: str | None = None
+        last_error: Exception | None = None
+        for source_ref in sources:
+            expert_id = source_ref.get("id")
+            if not expert_id:
+                continue
+            try:
+                candidate_id = await asyncio.to_thread(_resolve_glob, expert_id)
+                if candidate_id is None:
+                    continue
+                if _requires_staged_lora_dir(candidate_id):
+                    candidate_path = await asyncio.to_thread(
+                        self._prepare_staged_expert_dir,
+                        candidate_id,
+                        force_redownload,
+                    )
+                else:
+                    candidate_path = _normalize_lora_runtime_path(candidate_id)
+                resolved_id = candidate_id
+                runtime_path = candidate_path
+                break
+            except FileNotFoundError as exc:
+                last_error = exc
+
+        if resolved_id is None or runtime_path is None:
+            tried = [source.get("id") for source in sources]
+            raise RuntimeError(
+                f"Structural expert not found in any source: {tried}"
+            ) from last_error
+
+        async with self.models.lora_resolver_lock[resolved_id]:
+            if resolved_id in self.models.lora_requests and not force_redownload:
+                return self.models.lora_requests[resolved_id]
+            lora_int_id = (
+                self.models.lora_requests[resolved_id].lora_int_id
+                if resolved_id in self.models.lora_requests
+                else self.models.lora_id_counter.inc(1)
+            )
+            request = LoRARequest(
+                lora_name=resolved_id,
+                lora_int_id=lora_int_id,
+                lora_path=runtime_path,
+                load_inplace=force_redownload,
+                is_structural_expert=True,
+            )
+            if self.models.is_base_model(self.model_config.model):
+                request.base_model_name = self.model_config.model
+            await self.engine_client.add_lora(request)
+            self.models.lora_requests[resolved_id] = request
+            return request
+
     async def _maybe_get_engram_adapters(
         self,
         request: AnyRequest,
@@ -225,6 +334,13 @@ class EngramAdapterServingMixin:
 
         adapters = getattr(request, "adapters", None)
         if isinstance(adapters, dict):
+            if adapters.get("lora") and adapters.get("expert"):
+                raise ValueError(
+                    "A request may select one LoRA or one structural expert, not both."
+                )
+            expert_request = await self._process_expert(adapters.get("expert"))
+            if expert_request is not None:
+                return expert_request
             lora_request = await self._process_lora(adapters.get("lora"))
             if lora_request is not None:
                 return lora_request

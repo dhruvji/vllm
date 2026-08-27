@@ -603,6 +603,7 @@ class EngineArgs:
     specialize_active_lora: bool = LoRAConfig.specialize_active_lora
     enable_mixed_moe_lora_format: bool = LoRAConfig.enable_mixed_moe_lora_format
     enable_moe_shared_loras: bool = LoRAConfig.enable_moe_shared_loras
+    enable_structural_experts: bool = LoRAConfig.enable_structural_experts
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
@@ -1355,6 +1356,10 @@ class EngineArgs:
         lora_group.add_argument(
             "--enable-moe-shared-loras",
             **lora_kwargs["enable_moe_shared_loras"],
+        )
+        lora_group.add_argument(
+            "--enable-structural-experts",
+            **lora_kwargs["enable_structural_experts"],
         )
 
         # Observability arguments
@@ -2220,6 +2225,7 @@ class EngineArgs:
                 specialize_active_lora=self.specialize_active_lora,
                 enable_mixed_moe_lora_format=self.enable_mixed_moe_lora_format,
                 enable_moe_shared_loras=self.enable_moe_shared_loras,
+                enable_structural_experts=self.enable_structural_experts,
                 max_cpu_loras=self.max_cpu_loras
                 if self.max_cpu_loras and self.max_cpu_loras > 0
                 else None,

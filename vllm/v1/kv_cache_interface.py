@@ -7,6 +7,7 @@ import copy
 from collections import Counter
 from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
+from fractions import Fraction
 from math import prod
 from typing import TYPE_CHECKING
 
@@ -106,6 +107,23 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def participates_in_prefix_caching(self) -> bool:
+        """Whether this spec's group participates in prefix caching."""
+        return True
+
+    @property
+    def num_heads(self) -> int:
+        raise NotImplementedError
+
+    @property
+    def tokens_per_state(self) -> int | Fraction:
+        raise NotImplementedError
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        raise NotImplementedError
+
+    @property
     def page_size_bytes(self) -> int:
         """
         The size of a page with `block_size` tokens in bytes.
@@ -114,6 +132,15 @@ class KVCacheSpec:
             The page size
         """
         raise NotImplementedError
+
+    @property
+    def num_states(self) -> int:
+        return self.get_num_kernel_states(self.block_size)
+
+    def get_num_kernel_states(self, kernel_block_size: int) -> int:
+        if self.tokens_per_state > 0:
+            return kernel_block_size // self.tokens_per_state
+        return 1
 
     @property
     def storage_block_size(self) -> int:
@@ -177,9 +204,27 @@ class AttentionSpec(KVCacheSpec):
     num_kv_heads: int
     head_size: int
     dtype: torch.dtype
+    head_size_v: int = None  # type: ignore[assignment]
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
     indexes_kv_by_block_stride: bool = False
+    num_head_slots: int | None = None
+    state_content_bytes: int | None = None
+    tokens_per_state: int | Fraction = 1
+
+    def __post_init__(self):
+        if self.head_size_v is None:
+            object.__setattr__(self, "head_size_v", self.head_size)
+
+    @property
+    def num_heads(self) -> int:
+        return self.num_head_slots or self.num_kv_heads
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        if self.state_content_bytes is not None:
+            return self.state_content_bytes
+        return (self.head_size + self.head_size_v) * get_dtype_size(self.dtype)
 
     @property
     def unpadded_page_size_bytes(self) -> int:
@@ -202,19 +247,23 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if (
+            self.num_head_slots is not None
+            or self.state_content_bytes is not None
+            or self.tokens_per_state != 1
+        ):
+            return self.num_heads * self.num_states * self.state_content_size_bytes
         if self.kv_quant_mode.is_nvfp4:
             # Packed layout: fp4 data + fp8 block scales per head.
-            head_dim = nvfp4_kv_cache_full_dim(self.head_size)
+            head_dim = nvfp4_kv_cache_full_dim(
+                self.head_size
+            ) + nvfp4_kv_cache_full_dim(self.head_size_v)
         elif self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
-            head_dim = self.head_size // 2
+            head_dim = self.head_size // 2 + self.head_size_v // 2
         else:
-            head_dim = self.head_size
+            head_dim = self.head_size + self.head_size_v
         return (
-            2
-            * self.block_size
-            * self.num_kv_heads
-            * head_dim
-            * get_dtype_size(self.dtype)
+            self.block_size * self.num_kv_heads * head_dim * get_dtype_size(self.dtype)
         )
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
@@ -239,8 +288,6 @@ class FullAttentionSpec(AttentionSpec):
     In this case, we use FullAttentionSpec and record the sliding window size.
     """
 
-    head_size_v: int = None  # type: ignore[assignment]
-
     sliding_window: int | None = None
     """
     Default to None for not using sliding window attention.
@@ -257,8 +304,7 @@ class FullAttentionSpec(AttentionSpec):
     """
 
     def __post_init__(self):
-        if self.head_size_v is None:
-            object.__setattr__(self, "head_size_v", self.head_size)
+        super().__post_init__()
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
@@ -312,6 +358,9 @@ class FullAttentionSpec(AttentionSpec):
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
+            num_head_slots=specs[0].num_head_slots,
+            state_content_bytes=specs[0].state_content_bytes,
+            tokens_per_state=specs[0].tokens_per_state,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             # If any layer in the group is non-causal, treat the group as
@@ -393,8 +442,17 @@ class MLAAttentionSpec(FullAttentionSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1  # Default to 1 for no compression.
     model_version: str | None = None
+    non_causal_multi_token_decode: bool = False
+    head_size_v: int = 0
 
     def __post_init__(self):
+        if self.compress_ratio == 1 and self.tokens_per_state != 1:
+            assert isinstance(self.tokens_per_state, int)
+            object.__setattr__(self, "compress_ratio", self.tokens_per_state)
+        elif self.compress_ratio != 1 and self.tokens_per_state == 1:
+            object.__setattr__(self, "tokens_per_state", self.compress_ratio)
+        else:
+            object.__setattr__(self, "compress_ratio", self.tokens_per_state)
         super().__post_init__()
         _apply_alignment_padding(self)
 
@@ -450,9 +508,14 @@ class MLAAttentionSpec(FullAttentionSpec):
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=block_stride_set.pop(),
+            num_head_slots=specs[0].num_head_slots,
+            state_content_bytes=specs[0].state_content_bytes,
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
 
 
@@ -546,11 +609,9 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowSpec(AttentionSpec):
     sliding_window: int
-    head_size_v: int = None  # type: ignore[assignment]
 
     def __post_init__(self):
-        if self.head_size_v is None:
-            object.__setattr__(self, "head_size_v", self.head_size)
+        super().__post_init__()
 
     @property
     def real_page_size_bytes(self) -> int:
@@ -624,8 +685,17 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
     model_version: str | None = None
+    head_size_v: int = 0
 
     def __post_init__(self):
+        if self.compress_ratio == 1 and self.tokens_per_state != 1:
+            assert isinstance(self.tokens_per_state, int)
+            object.__setattr__(self, "compress_ratio", self.tokens_per_state)
+        elif self.compress_ratio != 1 and self.tokens_per_state == 1:
+            object.__setattr__(self, "tokens_per_state", self.compress_ratio)
+        else:
+            object.__setattr__(self, "compress_ratio", self.tokens_per_state)
+        super().__post_init__()
         _apply_alignment_padding(self)
 
     @property
@@ -678,6 +748,8 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=block_stride_set.pop(),
+            num_head_slots=specs[0].num_head_slots,
+            state_content_bytes=specs[0].state_content_bytes,
             sliding_window=sliding_window_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
@@ -694,6 +766,28 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class KpoolTailSpec(SlidingWindowSpec):
+    """One-block circular scratch cache for a kpool indexer's raw tail."""
+
+    def max_admission_blocks_per_request(
+        self, max_in_flight_tokens: int, max_model_len: int
+    ) -> int:
+        return 1
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        return 1
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(isinstance(spec, KpoolTailSpec) for spec in kv_cache_specs.values())
+
+    @property
+    def participates_in_prefix_caching(self) -> bool:
+        return False
+
+
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]
@@ -702,6 +796,19 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    num_heads: int = 1
+    tokens_per_state: int = -1
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        return sum(
+            prod(shape) * get_dtype_size(dtype)
+            for (shape, dtype) in zip(self.shapes, self.dtypes)
+        )
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.state_content_size_bytes
 
     @property
     def page_size_bytes(self) -> int:
@@ -831,6 +938,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
 
     kv_cache_specs: dict[str, KVCacheSpec]
+
+    @property
+    def participates_in_prefix_caching(self) -> bool:
+        return all(
+            spec.participates_in_prefix_caching for spec in self.kv_cache_specs.values()
+        )
 
     @property
     def page_size_bytes(self) -> int:

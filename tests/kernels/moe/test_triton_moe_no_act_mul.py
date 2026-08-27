@@ -10,7 +10,7 @@ equals N (not N // 2 like gated activations).
 import pytest
 import torch
 
-from tests.kernels.moe.utils import make_dummy_moe_config
+from tests.kernels.moe.utils import make_dummy_moe_config, triton_moe
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -29,6 +29,41 @@ NO_MUL_ACTIVATIONS = [
     MoEActivation.GELU_NO_MUL,
     MoEActivation.RELU2_NO_MUL,
 ]
+
+
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(80),
+    reason="Requires compute capability >= 8.0",
+)
+@torch.inference_mode()
+def test_zero_weight_route_does_not_propagate_nonfinite_expert_output():
+    dtype = torch.bfloat16
+    hidden_size = 64
+    intermediate_size = 128
+    hidden_states = torch.ones(1, hidden_size, dtype=dtype, device="cuda")
+    w1 = torch.zeros(
+        2,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=dtype,
+        device="cuda",
+    )
+    w2 = torch.zeros(
+        2,
+        hidden_size,
+        intermediate_size,
+        dtype=dtype,
+        device="cuda",
+    )
+    w1[1].fill_(torch.finfo(dtype).max)
+    w2[1].fill_(1)
+    topk_weights = torch.tensor([[1.0, 0.0]], dtype=torch.float32, device="cuda")
+    topk_ids = torch.tensor([[0, 1]], dtype=torch.int64, device="cuda")
+
+    output = triton_moe(hidden_states, w1, w2, topk_weights, topk_ids)
+
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output).item() == 0
 
 
 def make_test_tensors(

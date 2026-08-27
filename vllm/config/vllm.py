@@ -68,6 +68,11 @@ logger = init_logger(__name__)
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "DeepseekV2ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
         "GraniteMoeForCausalLM",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
@@ -75,6 +80,54 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "Qwen2MoeForCausalLM",
     }
 )
+
+DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV32MTPModel",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextMTPModel",
+        "GlmMoeDsaForCausalLM",
+        "InklingForCausalLM",
+        "InklingForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3MTPModel",
+        "KimiLinearForCausalLM",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
+
+
+@lru_cache
+def default_v2_model_runner_architectures() -> frozenset[str]:
+    """Architectures defaulting to the V2 model runner on this platform."""
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        # TODO(rocm): These models are either unsupported by MRV2 or slower with
+        # MRV2 on AMD GPUs.
+        return DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES - {
+            "DeepseekV32ForCausalLM",
+            "DeepseekV4ForCausalLM",
+        }
+    return DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES
+
+
+@lru_cache
+def default_breakable_cudagraph_architectures() -> frozenset[str]:
+    """Architectures defaulting to breakable CUDA graphs on this platform."""
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES - {
+            "DeepseekV32ForCausalLM",
+            "DeepseekV32MTPModel",
+        }
+    return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES
 
 
 class OptimizationLevel(IntEnum):

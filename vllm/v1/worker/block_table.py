@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from enum import Enum
 
 import numpy as np
@@ -14,6 +15,29 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
 
 logger = init_logger(__name__)
+
+
+def get_block_table_width(
+    max_num_blocks: int,
+    block_size: int,
+    kernel_block_size: int | None = None,
+    *,
+    token_alignment: int | None = 128,
+) -> int:
+    """Return the width after optional alignment and virtual block splitting."""
+    if kernel_block_size is None:
+        kernel_block_size = block_size
+    if block_size % kernel_block_size != 0:
+        raise ValueError(
+            f"kernel_block_size {kernel_block_size} must divide "
+            f"block_size {block_size} evenly"
+        )
+    if token_alignment is not None:
+        if token_alignment <= 0:
+            raise ValueError("token_alignment must be positive")
+        block_alignment = token_alignment // math.gcd(token_alignment, block_size)
+        max_num_blocks = cdiv(max_num_blocks, block_alignment) * block_alignment
+    return max_num_blocks * block_size // kernel_block_size
 
 
 class SlotMappingMode(Enum):

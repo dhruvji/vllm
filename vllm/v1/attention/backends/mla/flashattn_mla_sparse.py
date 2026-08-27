@@ -238,10 +238,26 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
         kv_cache = kv_c_and_k_pe_cache.view(
             -1, attn_metadata.block_size, self.head_size
         )
-        k_cache = kv_cache[:, :, self.kv_lora_rank :].view(
-            -1, 1, 1, self.qk_rope_head_dim
-        )
         v_cache = kv_cache[:, :, : self.kv_lora_rank].view(-1, 1, 1, self.kv_lora_rank)
+        only_qv = self.qk_rope_head_dim == 0
+        if only_qv:
+            dummy_headdim = 64
+            q_rope = torch.empty(
+                *q_rope.shape[:-1],
+                dummy_headdim,
+                dtype=q_rope.dtype,
+                device=q_rope.device,
+            )
+            k_cache = torch.empty(
+                *v_cache.shape[:-1],
+                dummy_headdim,
+                dtype=v_cache.dtype,
+                device=v_cache.device,
+            )
+        else:
+            k_cache = kv_cache[:, :, self.kv_lora_rank :].view(
+                -1, 1, 1, self.qk_rope_head_dim
+            )
 
         out = flash_attn_varlen_func(
             q=q_rope,
@@ -256,5 +272,6 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
             softmax_scale=self.scale,
             causal=True,
             fa_version=3,
+            only_qv=only_qv,
         )
         return out, None

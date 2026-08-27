@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+from collections import defaultdict
 from contextlib import suppress
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from vllm.config.multimodal import MultiModalConfig
-from vllm.entrypoints.generate.adapter_serving import _lora_config_source_ids
+from vllm.entrypoints.generate.adapter_serving import (
+    EngramAdapterServingMixin,
+    _lora_config_source_ids,
+)
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
@@ -254,6 +260,43 @@ async def test_serving_completion_with_request_body_lora(mock_serving_setup):
     assert isinstance(generated_lora_request, LoRARequest)
     assert generated_lora_request.lora_name == "/fake/path/request-body-lora"
     assert generated_lora_request.lora_path == "/fake/path/request-body-lora"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
+async def test_request_body_structural_expert_uses_lora_scheduler_slot(monkeypatch):
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+    counter = MagicMock()
+    counter.inc.return_value = 7
+    serving.models = SimpleNamespace(
+        lora_resolver_lock=defaultdict(asyncio.Lock),
+        lora_requests={},
+        lora_id_counter=counter,
+        is_base_model=lambda _model: True,
+    )
+    serving.model_config = SimpleNamespace(model=MODEL_NAME)
+    serving.engine_client = SimpleNamespace(add_lora=AsyncMock())
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving._resolve_glob",
+        lambda expert_id: expert_id,
+    )
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.asyncio.to_thread",
+        run_inline,
+    )
+
+    request = await serving._process_expert([{"id": "/fake/path/structural-expert"}])
+
+    assert request is not None
+    assert request.is_structural_expert
+    assert request.lora_int_id == 7
+    assert request.lora_path == "/fake/path/structural-expert"
+    serving.engine_client.add_lora.assert_awaited_once_with(request)
 
 
 @pytest.mark.asyncio
