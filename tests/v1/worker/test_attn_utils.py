@@ -183,6 +183,10 @@ def test_reshape_packed_compressed_indexer_uses_kernel_state_size(monkeypatch):
 
 @pytest.mark.skip_global_cleanup
 def test_reshape_packed_kpool_tail_uses_storage_backend_shape(monkeypatch):
+    assert KpoolTailBackend.get_kv_cache_stride_order() == (0, 1, 2, 3)
+    assert KpoolTailBackend.get_kv_cache_stride_order(True) == (0, 1, 2, 3, 4)
+    assert KpoolTailBackend.indexes_kv_by_block_stride() is False
+
     spec = KpoolTailSpec(
         block_size=16,
         num_kv_heads=2,

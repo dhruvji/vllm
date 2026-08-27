@@ -174,7 +174,8 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        assert not include_num_layers_dimension
+        if include_num_layers_dimension:
+            return 0, 1, 2, 3, 4
         return 0, 1, 2, 3
 
     @staticmethod
