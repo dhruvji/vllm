@@ -397,7 +397,18 @@ class Glm5NextMoE(nn.Module):
                 dtype=torch.long,
                 device=hidden_states.device,
             )
-        return punica_wrapper.token_lora_indices[: hidden_states.shape[0]]
+        slot_indices = punica_wrapper.token_lora_indices
+        if not self.is_sequence_parallel:
+            return slot_indices[: hidden_states.shape[0]]
+
+        chunk_size = hidden_states.shape[0]
+        start = self.tp_rank * chunk_size
+        slot_indices = slot_indices[start : start + chunk_size]
+        if slot_indices.shape[0] < chunk_size:
+            slot_indices = F.pad(
+                slot_indices, (0, chunk_size - slot_indices.shape[0]), value=-1
+            )
+        return slot_indices
 
     def _structural_expert_routing(
         self,
@@ -441,18 +452,23 @@ class Glm5NextMoE(nn.Module):
         assert self._structural_slot_indices is not None
         output = torch.zeros_like(hidden_states)
         for index in range(self.structural_present.shape[0]):
-            selected_slot = self._structural_slot_indices == index
-            shared_weight = (
-                selected_slot
-                & self.structural_present[index]
-                & ~self.structural_routed[index]
+            slot_weights = self._structural_route_weights + (
+                ~self.structural_routed[index]
             ).to(hidden_states.dtype)
-            routed_weight = self._structural_route_weights * selected_slot
-            weight = shared_weight + routed_weight
-            gate_up = F.linear(hidden_states, self.structural_gate_up[index])
+            selected_slot = (
+                (self._structural_slot_indices == index)
+                & self.structural_present[index]
+                & slot_weights.ne(0)
+            )
+            token_indices = selected_slot.nonzero(as_tuple=True)[0]
+            if token_indices.numel() == 0:
+                continue
+            selected_hidden_states = hidden_states.index_select(0, token_indices)
+            weight = slot_weights.index_select(0, token_indices)
+            gate_up = F.linear(selected_hidden_states, self.structural_gate_up[index])
             intermediate = self.structural_act_fn(gate_up)
             expert_output = F.linear(intermediate, self.structural_down[index])
-            output.add_(expert_output * weight.unsqueeze(-1))
+            output.index_add_(0, token_indices, expert_output * weight.unsqueeze(-1))
         if not self.is_sequence_parallel and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
         return output

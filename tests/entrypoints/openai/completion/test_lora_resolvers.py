@@ -6,6 +6,7 @@ from collections import defaultdict
 from contextlib import suppress
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -269,9 +270,15 @@ async def test_request_body_structural_expert_uses_lora_scheduler_slot(monkeypat
     serving._init_engram_adapter_serving()
     counter = MagicMock()
     counter.inc.return_value = 7
+    adapter_path = "/fake/path/structural-expert"
+    ordinary_lora = LoRARequest(
+        lora_name=adapter_path,
+        lora_int_id=3,
+        lora_path=adapter_path,
+    )
     serving.models = SimpleNamespace(
         lora_resolver_lock=defaultdict(asyncio.Lock),
-        lora_requests={},
+        lora_requests={adapter_path: ordinary_lora},
         lora_id_counter=counter,
         is_base_model=lambda _model: True,
     )
@@ -290,13 +297,39 @@ async def test_request_body_structural_expert_uses_lora_scheduler_slot(monkeypat
         run_inline,
     )
 
-    request = await serving._process_expert([{"id": "/fake/path/structural-expert"}])
+    request = await serving._process_expert([{"id": adapter_path}])
 
     assert request is not None
     assert request.is_structural_expert
     assert request.lora_int_id == 7
-    assert request.lora_path == "/fake/path/structural-expert"
+    assert request.lora_path == adapter_path
+    assert request != ordinary_lora
+    assert len({request, ordinary_lora}) == 2
+    assert serving.models.lora_requests[adapter_path] is ordinary_lora
     serving.engine_client.add_lora.assert_awaited_once_with(request)
+
+
+@pytest.mark.skip_global_cleanup
+def test_staged_adapter_cache_uses_disk_cache_and_deletes_evictions(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("VLLM_LORA_RESOLVER_CACHE_DIR", raising=False)
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+    serving._prepared_lora_dirs_max_size = 1
+
+    staged_dir = serving._staged_adapter_dir("expert", "first")
+    assert staged_dir.parent == tmp_path / "adapters" / "staged"
+    staged_dir.mkdir(parents=True)
+    serving._remember_staged_dir(("expert", "first"), staged_dir)
+
+    replacement_dir = Path(tmp_path, "replacement")
+    replacement_dir.mkdir()
+    serving._remember_staged_dir(("expert", "second"), replacement_dir)
+
+    assert not staged_dir.exists()
+    assert replacement_dir.exists()
 
 
 @pytest.mark.asyncio

@@ -133,43 +133,13 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
             ]
         else:
-            # Prefer FlashInfer FA3 for GLM-5.3-Flash NoPE sparse MLA on SM90;
-            # its feature gate falls through to the other sparse backends when
-            # unsupported. RoPE sparse models retain their existing order.
-            from vllm.config import get_current_vllm_config_or_none
-
-            cfg = get_current_vllm_config_or_none()
-            hf = (
-                cfg.model_config.hf_text_config
-                if cfg is not None and cfg.model_config is not None
-                else None
-            )
-            prefer_fi_sm90 = (
-                hf is not None
-                and getattr(hf, "qk_rope_head_dim", None) == 0
-                and getattr(hf, "index_topk", None) is not None
-            )
-            sparse_tail = [
-                AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
-                AttentionBackendEnum.FLASHMLA_SPARSE,
-                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
-            ]
-            if prefer_fi_sm90:
-                sparse_tail.pop()  # dedupe the head entry
-                return [
-                    AttentionBackendEnum.FLASH_ATTN_MLA,
-                    AttentionBackendEnum.FLASHMLA,
-                    AttentionBackendEnum.FLASHINFER_MLA,
-                    AttentionBackendEnum.TRITON_MLA,
-                    AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
-                    *sparse_tail,
-                ]
             return [
                 AttentionBackendEnum.FLASH_ATTN_MLA,
                 AttentionBackendEnum.FLASHMLA,
                 AttentionBackendEnum.FLASHINFER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
-                *sparse_tail,
+                AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
+                AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
     else:
         # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal

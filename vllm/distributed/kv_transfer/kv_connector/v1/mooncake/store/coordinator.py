@@ -70,7 +70,9 @@ class MooncakeStoreCoordinator:
         retention_interval: int | None = None,
     ) -> None:
         assert all(
-            g.kv_cache_spec.block_size % hash_block_size == 0 for g in kv_cache_groups
+            g.kv_cache_spec.block_size % hash_block_size == 0
+            for g in kv_cache_groups
+            if g.kv_cache_spec.participates_in_prefix_caching
         ), "block_size must be divisible by hash_block_size"
         assert scheduler_block_size % hash_block_size == 0, (
             f"scheduler_block_size ({scheduler_block_size}) must be a multiple of "

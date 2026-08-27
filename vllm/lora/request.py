@@ -59,17 +59,16 @@ class LoRARequest(
 
     def __eq__(self, value: object) -> bool:
         """
-        Overrides the equality method to compare LoRARequest
-        instances based on lora_name. This allows for identification
-        and comparison lora adapter across engines.
+        Compare requests by adapter kind and name.
         """
-        return isinstance(value, self.__class__) and self.lora_name == value.lora_name
+        return (
+            isinstance(value, self.__class__)
+            and self.lora_name == value.lora_name
+            and self.is_structural_expert == value.is_structural_expert
+        )
 
     def __hash__(self) -> int:
         """
-        Overrides the hash method to hash LoRARequest instances
-        based on lora_name. This ensures that LoRARequest instances
-        can be used in hash-based collections such as sets and dictionaries,
-        identified by their names across engines.
+        Hash requests by the same typed identity used for equality.
         """
-        return hash(self.lora_name)
+        return hash((self.lora_name, self.is_structural_expert))

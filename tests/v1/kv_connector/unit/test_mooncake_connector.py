@@ -25,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     SendBlockMeta,
     TransferRegion,
     _align_transfer_regions,
+    _get_kv_block_len,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
@@ -63,6 +64,25 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
                 ),
             )
         ],
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_get_kv_block_len_preserves_virtual_split():
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=64,
+        dtype=torch.float16,
+    )
+
+    assert (
+        _get_kv_block_len(spec, block_len=4096, virtually_split_kv_in_blocks=True)
+        == 2048
+    )
+    assert (
+        _get_kv_block_len(spec, block_len=4096, virtually_split_kv_in_blocks=False)
+        == 4096
     )
 
 

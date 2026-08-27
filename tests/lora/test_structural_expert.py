@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from torch import nn
 
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
@@ -10,6 +11,7 @@ from vllm.lora.structural_expert import (
     extract_structural_experts,
     route_structural_expert,
 )
+from vllm.models.glm5next.nvidia.model import Glm5NextMoE
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -79,3 +81,49 @@ def test_route_structural_expert_replaces_added_slot_for_base_kernel():
     assert base_ids.tolist() == [[0], [0]]
     assert base_weights.tolist() == [[0.0], [2.5]]
     assert added_weights.tolist() == [2.5, 0.0]
+
+
+def test_apply_structural_experts_only_runs_selected_slot_tokens(monkeypatch):
+    moe = Glm5NextMoE.__new__(Glm5NextMoE)
+    nn.Module.__init__(moe)
+    moe.structural_present = torch.tensor([False, True])
+    moe.structural_routed = torch.tensor([False, True])
+    moe.structural_gate_up = torch.randn(2, 8, 6)
+    moe.structural_down = torch.randn(2, 6, 4)
+    moe.structural_act_fn = lambda gate_up: gate_up[:, :4]
+    moe._structural_slot_indices = torch.tensor([1, -1, 1])
+    moe._structural_route_weights = torch.tensor([0.5, 0.0, 0.0])
+    moe.is_sequence_parallel = False
+    moe.tp_size = 1
+    hidden_states = torch.randn(3, 6)
+
+    linear_batches = []
+    linear = torch.nn.functional.linear
+
+    def record_linear(inputs, weights):
+        linear_batches.append(inputs.shape[0])
+        return linear(inputs, weights)
+
+    monkeypatch.setattr(torch.nn.functional, "linear", record_linear)
+
+    output = moe._apply_structural_experts(hidden_states)
+
+    assert linear_batches == [1, 1]
+    assert output[1].eq(0).all()
+    assert output[0].ne(0).any()
+    assert output[2].eq(0).all()
+
+
+def test_structural_slot_indices_follow_sequence_parallel_chunk():
+    moe = Glm5NextMoE.__new__(Glm5NextMoE)
+    nn.Module.__init__(moe)
+    moe.experts = nn.Module()
+    moe.experts.punica_wrapper = type(
+        "Punica", (), {"token_lora_indices": torch.tensor([0, 0, 1])}
+    )()
+    moe.is_sequence_parallel = True
+    moe.tp_rank = 1
+
+    indices = moe._get_structural_slot_indices(torch.empty(2, 6))
+
+    assert indices.tolist() == [1, -1]

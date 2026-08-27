@@ -888,10 +888,12 @@ class Glm5NextProcessor(ProcessorMixin):
     def _get_num_multimodal_tokens(self, image_sizes=None, video_sizes=None, **kwargs):
         vision_data = {}
         if image_sizes is not None:
-            images_kwargs = Glm5NextProcessorKwargs._defaults.get("images_kwargs", {})
+            images_kwargs = dict(
+                Glm5NextProcessorKwargs._defaults.get("images_kwargs", {})
+            )
             images_kwargs.update(kwargs)
-            merge_size = (
-                images_kwargs.get("merge_size", None) or self.image_processor.merge_size
+            image_merge_size = (
+                images_kwargs.get("merge_size") or self.image_processor.merge_size
             )
 
             num_image_patches = [
@@ -900,7 +902,7 @@ class Glm5NextProcessor(ProcessorMixin):
                 )
                 for image_size in image_sizes
             ]
-            num_image_tokens = [(n // merge_size**2) for n in num_image_patches]
+            num_image_tokens = [(n // image_merge_size**2) for n in num_image_patches]
             vision_data.update(
                 {
                     "num_image_tokens": num_image_tokens,
@@ -909,15 +911,20 @@ class Glm5NextProcessor(ProcessorMixin):
             )
 
         if video_sizes is not None:
-            videos_kwargs = Glm5NextProcessorKwargs._defaults.get("videos_kwargs", {})
+            videos_kwargs = dict(
+                Glm5NextProcessorKwargs._defaults.get("videos_kwargs", {})
+            )
             videos_kwargs.update(kwargs)
+            video_merge_size = (
+                videos_kwargs.get("merge_size") or self.video_processor.merge_size
+            )
             num_video_patches = [
                 self.video_processor.get_number_of_video_patches(
                     *video_size, videos_kwargs
                 )
                 for video_size in video_sizes
             ]
-            num_video_tokens = [(n // merge_size**2) for n in num_video_patches]
+            num_video_tokens = [(n // video_merge_size**2) for n in num_video_patches]
             vision_data["num_video_tokens"] = num_video_tokens
 
         return MultiModalData(**vision_data)

@@ -9,6 +9,7 @@ only get the `eos_token_id` from the tokenizer as defined by
 import pytest
 
 from vllm.tokenizers import get_tokenizer
+from vllm.transformers_utils import configs
 from vllm.transformers_utils.config import (
     try_get_generation_config,
 )
@@ -17,6 +18,20 @@ from vllm.transformers_utils.configs.glm5_next import (
     Glm5NextTextConfig,
     Glm5NextVisionConfig,
 )
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "HunYuanVLConfig",
+        "HunYuanVLTextConfig",
+        "HunYuanVLVisionConfig",
+        "HCXVisionConfig",
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_glm5_config_registration_preserves_existing_lazy_exports(config_name):
+    assert getattr(configs, config_name).__name__ == config_name
 
 
 @pytest.mark.skip_global_cleanup

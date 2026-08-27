@@ -77,6 +77,21 @@ except ImportError:
     )
     TransferEngine = None
 
+
+def _get_kv_block_len(
+    layer_spec: KVCacheSpec,
+    block_len: int,
+    virtually_split_kv_in_blocks: bool,
+) -> int:
+    if isinstance(layer_spec, KpoolTailSpec):
+        return layer_spec.unpadded_page_size_bytes // 2
+    if isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
+        return layer_spec.page_size_bytes
+    if virtually_split_kv_in_blocks and not isinstance(layer_spec, MambaSpec):
+        return block_len // 2
+    return block_len
+
+
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -1695,12 +1710,11 @@ class MooncakeConnectorWorker:
                 block_len = cache.stride(0) * cache.element_size()
                 region_base_addresses.append(base_addr)
 
-                if isinstance(layer_spec, KpoolTailSpec):
-                    kv_block_len = layer_spec.unpadded_page_size_bytes // 2
-                elif isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
-                    kv_block_len = layer_spec.page_size_bytes
-                else:
-                    kv_block_len = block_len
+                kv_block_len = _get_kv_block_len(
+                    layer_spec,
+                    block_len,
+                    self.transfer_topo.virtually_split_kv_in_blocks,
+                )
                 self.block_len_per_layer.append(block_len)
                 self.kv_block_len_per_layer.append(kv_block_len)
                 self.registered_layer_names.append(layer_name)

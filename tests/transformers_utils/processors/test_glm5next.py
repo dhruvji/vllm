@@ -3,6 +3,7 @@
 """Unit tests for the vLLM-native GLM-5.3-Flash multimodal processor."""
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,6 +13,8 @@ from transformers.video_utils import VideoMetadata
 
 from vllm.transformers_utils.processors.glm5next import (
     Glm5NextImageProcessor,
+    Glm5NextProcessor,
+    Glm5NextProcessorKwargs,
     Glm5NextVideoProcessor,
     _get_pad_content_size,
     _resize_or_pad,
@@ -30,6 +33,20 @@ MIN_TOKENS = 16
 MAX_TOKENS = 800  # serving-cap equivalent budget, keeps test canvases small
 MIN_PIXELS = MIN_TOKENS * PIXELS_PER_TOKEN
 MAX_PIXELS = MAX_TOKENS * PIXELS_PER_TOKEN
+
+
+def test_video_only_multimodal_token_count_uses_video_merge_size():
+    processor = object.__new__(Glm5NextProcessor)
+    processor.video_processor = SimpleNamespace(
+        merge_size=2,
+        get_number_of_video_patches=lambda *_args: 16,
+    )
+    defaults_before = dict(Glm5NextProcessorKwargs._defaults["videos_kwargs"])
+
+    result = processor._get_num_multimodal_tokens(video_sizes=[(2, 28, 28)])
+
+    assert result["num_video_tokens"] == [4]
+    assert Glm5NextProcessorKwargs._defaults["videos_kwargs"] == defaults_before
 
 
 def resize(height: int, width: int, t: int = 2) -> tuple[int, int]:
