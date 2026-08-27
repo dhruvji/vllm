@@ -1046,13 +1046,20 @@ def get_kv_cache_spec_sliding_window(kv_cache_spec: KVCacheSpec) -> int | None:
 @dataclass
 class KVCacheTensor:
     """
-    A class for specifying how the workers should initialize the KV cache.
+    Describes layer views into a KV cache backing allocation.
+
+    A page for block ``b`` starts at ``offset + b * block_stride`` bytes.
+    Names in ``shared_by`` alias that same view. A zero block stride denotes
+    the legacy layout where each descriptor owns a separate allocation.
     """
 
     size: int  # size of the KV cache tensor in bytes
     shared_by: list[str]  # layer names that share the same KV cache tensor
-    offset: int = 0  # byte offset of this layer within a contiguous block
-    block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
+    # Byte offset of this layer's first page in a shared backing allocation.
+    offset: int = 0
+    # Bytes between this layer's pages in a shared backing allocation.
+    # Zero means the tensor has its own unpacked allocation.
+    block_stride: int = 0
 
 
 @dataclass

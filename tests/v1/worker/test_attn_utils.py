@@ -7,8 +7,22 @@ import pytest
 import torch
 
 from vllm.v1.attention.backend import AttentionMetadataBuilder
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
-from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    KVQuantMode,
+    MambaSpec,
+    MLAAttentionSpec,
+)
+from vllm.v1.worker.gpu.attn_utils import (
+    _get_kv_cache_num_blocks,
+    _reshape_attention_kv_cache,
+    _reshape_kv_cache,
+    _reshape_mamba_kv_cache,
+)
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -29,6 +43,140 @@ class FakeFlashAttentionBackend:
     ) -> tuple[int, ...]:
         assert not include_num_layers_dimension
         return (0, 1, 2, 3, 4)
+
+
+@pytest.mark.skip_global_cleanup
+def test_reshape_packed_attention_cache_from_absolute_storage_offset():
+    spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.uint8,
+    )
+    raw_tensor = torch.zeros(13, dtype=torch.uint8)
+
+    kv_cache = _reshape_attention_kv_cache(
+        raw_tensor,
+        spec,
+        kv_cache_shape=(4, 2),
+        kv_cache_stride_order=(0, 1),
+        num_blocks=4,
+        packing=(5, 4),
+        blocks_per_page=2,
+    )
+
+    assert kv_cache.shape == (4, 2)
+    assert kv_cache.stride() == (2, 1)
+    assert kv_cache.storage_offset() == 5
+    kv_cache[0].fill_(1)
+    kv_cache[3].fill_(2)
+    assert raw_tensor.tolist() == [0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 2, 2]
+
+
+@pytest.mark.skip_global_cleanup
+def test_reshape_packed_mamba_cache_from_absolute_storage_offset():
+    spec = MambaSpec(
+        block_size=1,
+        shapes=((2,),),
+        dtypes=(torch.uint8,),
+    )
+    raw_tensor = torch.zeros(9, dtype=torch.uint8)
+    packing = (5, 2)
+    num_blocks = _get_kv_cache_num_blocks(raw_tensor, spec, packing, 2)
+
+    state = _reshape_mamba_kv_cache(raw_tensor, spec, num_blocks, packing)[0]
+
+    assert state.shape == (2, 2)
+    assert state.stride() == (2, 1)
+    assert state.storage_offset() == 5
+    state[0].fill_(1)
+    state[1].fill_(2)
+    assert raw_tensor.tolist() == [0, 0, 0, 0, 0, 1, 1, 2, 2]
+
+
+class FakeIndexerBackend:
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        return num_blocks, block_size, head_size
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        assert not include_num_layers_dimension
+        return 0, 1, 2
+
+    @staticmethod
+    def get_kv_cache_block_dim(*args, **kwargs) -> int:
+        return 0
+
+
+@pytest.mark.skip_global_cleanup
+def test_reshape_packed_compressed_indexer_uses_kernel_state_size(monkeypatch):
+    spec = MLAAttentionSpec(
+        block_size=2176,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=4,
+    )
+    num_blocks = 2
+    offset = 5
+    raw_tensor = torch.zeros(
+        offset + num_blocks * spec.page_size_bytes,
+        dtype=torch.uint8,
+    )
+    group = AttentionGroup(FakeIndexerBackend, ["indexer"], spec, 0)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=raw_tensor.numel(),
+                shared_by=["indexer"],
+                offset=offset,
+                block_stride=spec.page_size_bytes,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["indexer"], spec)],
+    )
+
+    kv_cache = _reshape_kv_cache(
+        [group],
+        {"indexer": raw_tensor},
+        "auto",
+        [64],
+        {},
+        kv_cache_config,
+    )["indexer"]
+
+    assert kv_cache.shape == (34, 32, 132)
+    assert kv_cache.stride() == (32 * 132, 132, 1)
+    assert kv_cache.storage_offset() == offset
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.kv_cache_config = kv_cache_config
+    runner.attn_groups = [[group]]
+    runner.runner_only_attn_layers = set()
+    runner.cache_config = SimpleNamespace(cache_dtype="auto")  # type: ignore[assignment]
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "_has_mixed_attention_kv_layout",
+        lambda *args: False,
+    )
+
+    runner_kv_cache = runner._reshape_kv_cache_tensors({"indexer": raw_tensor}, [64])[
+        "indexer"
+    ]
+
+    assert runner_kv_cache.shape == kv_cache.shape
+    assert runner_kv_cache.stride() == kv_cache.stride()
+    assert runner_kv_cache.storage_offset() == offset
 
 
 class WidthAwareMetadataBuilder:

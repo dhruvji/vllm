@@ -127,7 +127,6 @@ from vllm.utils.torch_utils import (
     PIN_MEMORY,
     async_tensor_h2d,
     current_stream,
-    get_dtype_size,
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
@@ -221,7 +220,11 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
-from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
+from vllm.v1.worker.gpu.attn_utils import (
+    _get_kv_cache_num_blocks,
+    _reshape_attention_kv_cache,
+    _reshape_mamba_kv_cache,
+)
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -233,7 +236,10 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.utils import (
+    compressed_kernel_block_size,
+    is_residual_scattered_for_sp,
+)
 from vllm.v1.worker.workspace import lock_workspace
 
 from .utils import (
@@ -7832,6 +7838,14 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        packed_sizes = {
+            tensor.size
+            for tensor in kv_cache_config.kv_cache_tensors
+            if tensor.block_stride > 0
+        }
+        assert len(packed_sizes) <= 1, (
+            "Packed KV cache tensors must share one backing allocation size"
+        )
         packed_backing: torch.Tensor | None = None
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             if kv_cache_tensor.block_stride > 0:
@@ -7902,30 +7916,33 @@ class GPUModelRunner(
             if group.kv_cache_group_id == len(kernel_block_sizes):
                 # There may be a last group for layers without kv cache.
                 continue
-            kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+            if (
+                isinstance(kv_cache_spec, AttentionSpec)
+                and kv_cache_spec.tokens_per_state > 1
+            ):
+                kernel_block_size = compressed_kernel_block_size(kv_cache_spec)
+            else:
+                kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
                 packing = layer_packing.get(layer_name)
-                if packing is not None:
-                    _, blk_stride = packing
-                    num_blocks = raw_tensor.numel() // blk_stride
-                else:
-                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                num_blocks = _get_kv_cache_num_blocks(
+                    raw_tensor,
+                    kv_cache_spec,
+                    packing,
+                    self.kv_cache_config.num_blocks,
+                )
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-
-                    # For MLA with compression, storage_block_size != block_size
-                    if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = kv_cache_spec.storage_block_size
-                    else:
-                        shape_block_size = kernel_block_size
+                    shape_block_size = kv_cache_spec.get_num_kernel_states(
+                        kernel_block_size
+                    )
 
                     # Skipped layers (--kv-cache-dtype-skip-layers) need
                     # the unquantized shape.
@@ -7959,32 +7976,14 @@ class GPUModelRunner(
                         kv_cache_stride_order,
                         kernel_num_blocks,
                         packing,
+                        num_blocks_per_kv_block,
                     )
 
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
-                    raw_tensor = kv_cache_raw_tensors[layer_name]
-                    state_tensors = []
-                    storage_offset_bytes = 0
-                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                        dtype_size = get_dtype_size(dtype)
-                        num_element_per_page = (
-                            kv_cache_spec.page_size_bytes // dtype_size
-                        )
-                        target_shape = (num_blocks, *shape)
-                        stride = torch.empty(target_shape).stride()
-                        target_stride = (num_element_per_page, *stride[1:])
-                        assert storage_offset_bytes % dtype_size == 0
-                        tensor = torch.as_strided(
-                            raw_tensor.view(dtype),
-                            size=target_shape,
-                            stride=target_stride,
-                            storage_offset=storage_offset_bytes // dtype_size,
-                        )
-                        state_tensors.append(tensor)
-                        storage_offset_bytes += stride[0] * dtype_size
-
-                    kv_caches[layer_name] = state_tensors
+                    kv_caches[layer_name] = _reshape_mamba_kv_cache(
+                        raw_tensor, kv_cache_spec, num_blocks, packing
+                    )
                 else:
                     raise NotImplementedError
 
