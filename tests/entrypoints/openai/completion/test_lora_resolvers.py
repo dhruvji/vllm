@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -320,6 +323,7 @@ def test_staged_adapter_cache_reuses_durable_disk_path(monkeypatch, tmp_path):
     staged_dir.mkdir(parents=True)
     model_path = staged_dir / "adapter_model.safetensors"
     model_path.touch()
+    (staged_dir / ".ready").touch()
     manager = MagicMock()
     monkeypatch.setattr(
         "vllm.entrypoints.generate.adapter_serving.get_adapter_manager", manager
@@ -330,6 +334,125 @@ def test_staged_adapter_cache_reuses_durable_disk_path(monkeypatch, tmp_path):
     assert resolved == str(staged_dir)
     assert model_path.exists()
     manager.get_adapter.assert_not_called()
+
+
+@pytest.mark.skip_global_cleanup
+def test_staged_lora_publishes_complete_directory_before_reuse(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+    manager = MagicMock()
+    manager.get_adapter.return_value = {}
+
+    def download_json(*, json_id, target_path):
+        Path(target_path).write_text(json_id)
+
+    manager.download_json = MagicMock(side_effect=download_json)
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.get_adapter_manager",
+        lambda: manager,
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.safetensors_save_file",
+        lambda _data, path: Path(path).write_bytes(b"model"),
+    )
+
+    staged = Path(serving._prepare_staged_lora_dir("s3://bucket/adapter.bin", False))
+
+    assert (staged / "adapter_model.safetensors").read_bytes() == b"model"
+    assert (staged / "adapter_config.json").is_file()
+    assert (staged / ".ready").is_file()
+
+    manager.reset_mock()
+    assert serving._prepare_staged_lora_dir("s3://bucket/adapter.bin", False) == str(
+        staged
+    )
+    manager.get_adapter.assert_not_called()
+    manager.download_json.assert_not_called()
+
+
+@pytest.mark.skip_global_cleanup
+def test_staged_adapter_lock_serializes_shared_disk_writes(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    first_save_started = threading.Event()
+    release_first_save = threading.Event()
+    second_save_started = threading.Event()
+    save_call_lock = threading.Lock()
+    save_calls = 0
+
+    def save_adapter(_data, path):
+        nonlocal save_calls
+        with save_call_lock:
+            save_calls += 1
+            call = save_calls
+        if call == 1:
+            first_save_started.set()
+            assert release_first_save.wait(timeout=5)
+        else:
+            second_save_started.set()
+        Path(path).touch()
+
+    manager = MagicMock()
+    manager.get_adapter.return_value = {}
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.get_adapter_manager",
+        lambda: manager,
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.safetensors_save_file",
+        save_adapter,
+    )
+
+    first = EngramAdapterServingMixin()
+    first._init_engram_adapter_serving()
+    second = EngramAdapterServingMixin()
+    second._init_engram_adapter_serving()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_result = executor.submit(first._prepare_staged_expert_dir, "shared", True)
+        assert first_save_started.wait(timeout=5)
+        second_result = executor.submit(
+            second._prepare_staged_expert_dir, "shared", True
+        )
+        writes_overlapped = second_save_started.wait(timeout=0.5)
+        release_first_save.set()
+        first_result.result(timeout=5)
+        second_result.result(timeout=5)
+
+    assert not writes_overlapped
+
+
+@pytest.mark.skip_global_cleanup
+def test_failed_force_redownload_preserves_published_adapter(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+    staged_dir = serving._staged_adapter_dir("expert", "shared")
+    staged_dir.mkdir(parents=True)
+    model_path = staged_dir / "adapter_model.safetensors"
+    model_path.write_bytes(b"published")
+    (staged_dir / ".ready").touch()
+
+    manager = MagicMock()
+    manager.get_adapter.return_value = {}
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.get_adapter_manager",
+        lambda: manager,
+    )
+
+    def fail_save(_data, _path):
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.safetensors_save_file",
+        fail_save,
+    )
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        serving._prepare_staged_expert_dir("shared", force_redownload=True)
+
+    assert model_path.read_bytes() == b"published"
+    assert not (staged_dir / ".ready").exists()
 
 
 @pytest.mark.asyncio
