@@ -66,6 +66,7 @@ DEVICE_TYPE = current_platform.device_type
         ("fp8_ds_mla", KVQuantMode.FP8_PER_TENSOR),
     ],
 )
+@pytest.mark.skip_global_cleanup
 def test_mla_kv_cache_spec_uses_layer_cache_dtype(
     cache_dtype: str, expected_quant_mode: KVQuantMode
 ):

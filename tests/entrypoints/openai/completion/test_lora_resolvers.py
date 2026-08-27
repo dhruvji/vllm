@@ -6,7 +6,6 @@ from collections import defaultdict
 from contextlib import suppress
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -310,26 +309,27 @@ async def test_request_body_structural_expert_uses_lora_scheduler_slot(monkeypat
 
 
 @pytest.mark.skip_global_cleanup
-def test_staged_adapter_cache_uses_disk_cache_and_deletes_evictions(
-    monkeypatch, tmp_path
-):
+def test_staged_adapter_cache_reuses_durable_disk_path(monkeypatch, tmp_path):
     monkeypatch.delenv("VLLM_LORA_RESOLVER_CACHE_DIR", raising=False)
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
     serving = EngramAdapterServingMixin()
     serving._init_engram_adapter_serving()
-    serving._prepared_lora_dirs_max_size = 1
 
     staged_dir = serving._staged_adapter_dir("expert", "first")
     assert staged_dir.parent == tmp_path / "adapters" / "staged"
     staged_dir.mkdir(parents=True)
-    serving._remember_staged_dir(("expert", "first"), staged_dir)
+    model_path = staged_dir / "adapter_model.safetensors"
+    model_path.touch()
+    manager = MagicMock()
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.get_adapter_manager", manager
+    )
 
-    replacement_dir = Path(tmp_path, "replacement")
-    replacement_dir.mkdir()
-    serving._remember_staged_dir(("expert", "second"), replacement_dir)
+    resolved = serving._prepare_staged_expert_dir("first", force_redownload=False)
 
-    assert not staged_dir.exists()
-    assert replacement_dir.exists()
+    assert resolved == str(staged_dir)
+    assert model_path.exists()
+    manager.get_adapter.assert_not_called()
 
 
 @pytest.mark.asyncio
