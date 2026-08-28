@@ -442,6 +442,8 @@ class MLAAttentionSpec(FullAttentionSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1  # Default to 1 for no compression.
     model_version: str | None = None
+    metadata_block_size: int | None = None
+    """Token width used by metadata and kernel cache views when overridden."""
     non_causal_multi_token_decode: bool = False
     head_size_v: int = 0
 
@@ -489,16 +491,18 @@ class MLAAttentionSpec(FullAttentionSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        metadata_block_size_set = set(spec.metadata_block_size for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
+            and len(metadata_block_size_set) == 1
             and len(block_stride_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version, and KV block "
-            "stride indexing."
+            "quantization method, compress ratio, model version, metadata "
+            "block size, and KV block stride indexing."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -513,6 +517,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            metadata_block_size=metadata_block_size_set.pop(),
             non_causal_multi_token_decode=any(
                 spec.non_causal_multi_token_decode for spec in specs
             ),

@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVQuantMode,
     MambaSpec,
+    MLAAttentionSpec,
     TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -35,7 +36,6 @@ from vllm.v1.worker.utils import (
     AttentionGroup,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
-    compressed_kernel_block_size,
     prepare_kernel_block_sizes,
 )
 
@@ -360,10 +360,10 @@ def _reshape_kv_cache(
 
         kv_cache_spec = group.kv_cache_spec
         if (
-            isinstance(kv_cache_spec, AttentionSpec)
-            and kv_cache_spec.tokens_per_state > 1
+            isinstance(kv_cache_spec, MLAAttentionSpec)
+            and kv_cache_spec.metadata_block_size is not None
         ):
-            kernel_block_size = compressed_kernel_block_size(kv_cache_spec)
+            kernel_block_size = kv_cache_spec.metadata_block_size
         else:
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
 

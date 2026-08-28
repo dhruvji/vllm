@@ -163,6 +163,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpecKind,
     KVQuantMode,
     MambaSpec,
+    MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
@@ -236,10 +237,7 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
-from vllm.v1.worker.utils import (
-    compressed_kernel_block_size,
-    is_residual_scattered_for_sp,
-)
+from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.workspace import lock_workspace
 
 from .utils import (
@@ -7917,10 +7915,10 @@ class GPUModelRunner(
                 # There may be a last group for layers without kv cache.
                 continue
             if (
-                isinstance(kv_cache_spec, AttentionSpec)
-                and kv_cache_spec.tokens_per_state > 1
+                isinstance(kv_cache_spec, MLAAttentionSpec)
+                and kv_cache_spec.metadata_block_size is not None
             ):
-                kernel_block_size = compressed_kernel_block_size(kv_cache_spec)
+                kernel_block_size = kv_cache_spec.metadata_block_size
             else:
                 kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
             for layer_name in group.layer_names:

@@ -120,13 +120,25 @@ class FakeIndexerBackend:
 
 
 @pytest.mark.skip_global_cleanup
-def test_reshape_packed_compressed_indexer_uses_kernel_state_size(monkeypatch):
+@pytest.mark.parametrize(
+    ("metadata_block_size", "expected_shape"),
+    [
+        (128, (34, 32, 132)),
+        (None, (68, 16, 132)),
+    ],
+)
+def test_reshape_packed_compressed_indexer_uses_kernel_state_size(
+    monkeypatch,
+    metadata_block_size: int | None,
+    expected_shape: tuple[int, ...],
+):
     spec = MLAAttentionSpec(
         block_size=2176,
         num_kv_heads=1,
         head_size=132,
         dtype=torch.uint8,
         tokens_per_state=4,
+        metadata_block_size=metadata_block_size,
     )
     num_blocks = 2
     offset = 5
@@ -157,8 +169,8 @@ def test_reshape_packed_compressed_indexer_uses_kernel_state_size(monkeypatch):
         kv_cache_config,
     )["indexer"]
 
-    assert kv_cache.shape == (34, 32, 132)
-    assert kv_cache.stride() == (32 * 132, 132, 1)
+    assert kv_cache.shape == expected_shape
+    assert kv_cache.stride() == (expected_shape[1] * 132, 132, 1)
     assert kv_cache.storage_offset() == offset
 
     runner = GPUModelRunner.__new__(GPUModelRunner)
@@ -252,6 +264,7 @@ class WidthAwareMetadataBuilder:
     requires_block_table_width = True
 
     def __init__(self, *args, block_table_width: int, **kwargs):
+        self.kv_cache_spec = args[0]
         self.block_table_width = block_table_width
 
 
@@ -286,6 +299,37 @@ def test_metadata_builder_block_table_width_contract():
     )
 
     assert group.metadata_builders[0].block_table_width == 32
+
+
+@pytest.mark.skip_global_cleanup
+def test_compressed_mla_metadata_uses_explicit_block_size():
+    spec = MLAAttentionSpec(
+        block_size=2176,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=4,
+        metadata_block_size=128,
+    )
+    group = AttentionGroup(WidthAwareBackend, ["indexer"], spec, 0)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=4096),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+    )
+
+    group.create_metadata_builders(
+        vllm_config,
+        torch.device("cpu"),
+        kernel_block_size=64,
+    )
+
+    builder = group.metadata_builders[0]
+    assert builder.kv_cache_spec.block_size == 128
+    assert builder.kv_cache_spec.storage_block_size == 32
+    assert builder.kernel_block_size == 64
 
 
 class FakeHNDFlashAttentionBackend(FakeFlashAttentionBackend):
