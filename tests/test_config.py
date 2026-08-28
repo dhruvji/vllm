@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pydantic
 import pytest
+import torch
 from pydantic import ValidationError
 
 import vllm.config.vllm as vllm_config_module
@@ -37,6 +38,55 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_hybrid_mla_mamba_block_size_preserves_kernel_alignment(monkeypatch):
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.platforms.interface import Platform
+
+    class Backend:
+        @staticmethod
+        def get_supported_kernel_block_sizes():
+            return [64]
+
+    class Model:
+        @staticmethod
+        def get_mamba_state_shape_from_config(vllm_config):
+            return (1, 1), (1, 1, 1)
+
+        @staticmethod
+        def get_mamba_state_dtype_from_config(vllm_config):
+            return torch.bfloat16, torch.bfloat16
+
+    monkeypatch.setattr(
+        ModelRegistry,
+        "resolve_model_cls",
+        lambda *args, **kwargs: (Model, None),
+    )
+    cache_config = SimpleNamespace(
+        block_size=64,
+        cache_dtype="auto",
+        mamba_block_size=None,
+        mamba_cache_mode="align",
+        mamba_page_size_padded=None,
+        user_specified_mamba_block_size=False,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(
+            architecture="HybridMLAForCausalLM",
+            dtype=torch.bfloat16,
+            get_head_size=lambda: 128,
+            get_num_kv_heads=lambda parallel_config: 1,
+            use_mla=True,
+        ),
+        parallel_config=SimpleNamespace(),
+    )
+
+    Platform._align_hybrid_block_size(vllm_config, Backend)
+
+    assert cache_config.block_size == 128
+    assert cache_config.mamba_block_size == 128
 
 
 @pytest.mark.parametrize(

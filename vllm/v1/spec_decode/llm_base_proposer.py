@@ -1744,7 +1744,10 @@ class SpecDecodeBaseProposer:
 
         attention_groups: dict[tuple[str, str], AttentionGroup] = {}
         if kv_cache_spec is not None:
-            for layer_name in self._draft_attn_layer_names:
+            # _draft_attn_layer_names is a set; iterate in sorted order so
+            # that attention_groups (and anything derived from its first
+            # element) is deterministic across processes.
+            for layer_name in sorted(self._draft_attn_layer_names):
                 attn_backend = all_attn_layers[layer_name].get_attn_backend()
                 backend_key = attn_backend.full_cls_name()
                 if backend_key not in attention_groups:

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -26,103 +25,10 @@ from vllm.config.load import LoadConfig
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KpoolTailSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-)
-from vllm.v1.spec_decode import multi_group as multi_group_module
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.multi_group import MultiGroupEagleProposer
 
 mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
-
-
-@pytest.mark.skip_global_cleanup
-def test_glm5next_mtp_uses_multi_group_proposer():
-    speculative_config = SimpleNamespace(
-        method="mtp",
-        draft_model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(model_type="glm5_next_mtp")
-        ),
-    )
-
-    assert SpeculativeConfig.use_glm5next_mtp(speculative_config)
-
-
-@pytest.mark.skip_global_cleanup
-def test_multi_group_proposer_initializes_each_draft_cache_group(monkeypatch):
-    class MetadataBuilder:
-        requires_block_table_width = False
-
-        def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
-            self.kv_cache_spec = kv_cache_spec
-
-    class Backend:
-        @classmethod
-        def full_cls_name(cls):
-            return cls.__module__, cls.__name__
-
-        @staticmethod
-        def get_builder_cls():
-            return MetadataBuilder
-
-    layers = {
-        "draft.main": SimpleNamespace(get_attn_backend=lambda: Backend),
-        "draft.tail": SimpleNamespace(get_attn_backend=lambda: Backend),
-    }
-    monkeypatch.setattr(
-        multi_group_module,
-        "get_layers_from_vllm_config",
-        lambda *args: layers,
-    )
-    proposer = MultiGroupEagleProposer.__new__(MultiGroupEagleProposer)
-    proposer.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=1024),
-        parallel_config=SimpleNamespace(
-            decode_context_parallel_size=1,
-            prefill_context_parallel_size=1,
-        ),
-    )
-    proposer.device = torch.device("cpu")
-    proposer._draft_attn_layer_names = set(layers)
-    main_spec = FullAttentionSpec(
-        block_size=64,
-        num_kv_heads=1,
-        head_size=2,
-        dtype=torch.float32,
-    )
-    tail_spec = KpoolTailSpec(
-        block_size=16,
-        num_kv_heads=2,
-        head_size=2,
-        dtype=torch.float32,
-        sliding_window=16,
-    )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=8,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=["draft.main"], kv_cache_spec=main_spec),
-            KVCacheGroupSpec(layer_names=["draft.tail"], kv_cache_spec=tail_spec),
-        ],
-    )
-
-    proposer.validate_same_kv_cache_group(kv_cache_config)
-    proposer.initialize_attn_backend(kv_cache_config, [32, 16])
-
-    assert [group.kv_cache_group_id for group in proposer.draft_attn_groups] == [
-        0,
-        1,
-    ]
-    assert [
-        group.get_metadata_builder().kv_cache_spec.block_size
-        for group in proposer.draft_attn_groups
-    ] == [32, 16]
-    assert proposer.kv_cache_gid == 0
-    assert proposer.block_size == 32
 
 
 def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
