@@ -17,9 +17,15 @@ from vllm.models.glm5next.nvidia.model import Glm5NextMoE
 
 pytestmark = pytest.mark.skip_global_cleanup
 
+STRUCTURAL_PREFIXES = (
+    "model.layers.0.mlp",
+    "language_model.model.layers.0.mlp",
+)
 
-def structural_tensors() -> dict[str, torch.Tensor]:
-    prefix = "model.layers.0.mlp"
+
+def structural_tensors(
+    prefix: str = "model.layers.0.mlp",
+) -> dict[str, torch.Tensor]:
     return {
         f"{prefix}.shared_expert.trainable_expert.gate_up_proj.weight": (
             torch.arange(48, dtype=torch.float32).reshape(8, 6)
@@ -32,11 +38,12 @@ def structural_tensors() -> dict[str, torch.Tensor]:
     }
 
 
-def test_extract_structural_expert_preserves_portable_schema():
-    ordinary, experts = extract_structural_experts(structural_tensors())
+@pytest.mark.parametrize("prefix", STRUCTURAL_PREFIXES)
+def test_extract_structural_expert_preserves_runtime_prefix(prefix: str):
+    ordinary, experts = extract_structural_experts(structural_tensors(prefix))
 
     assert ordinary == {}
-    weights = experts["model.layers.0.mlp"]
+    weights = experts[prefix]
     assert weights.is_routed
     assert weights.gate_up_proj.shape == (8, 6)
     assert weights.down_proj.shape == (6, 4)
@@ -44,17 +51,18 @@ def test_extract_structural_expert_preserves_portable_schema():
     assert weights.expert_bias.shape == (3,)
 
 
-def test_lora_model_accepts_structural_only_artifact():
+@pytest.mark.parametrize("prefix", STRUCTURAL_PREFIXES)
+def test_lora_model_accepts_structural_only_artifact(prefix: str):
     model = LoRAModel.from_lora_tensors(
         lora_model_id=1,
-        tensors=structural_tensors(),
+        tensors=structural_tensors(prefix),
         peft_helper=PEFTHelper(r=1, lora_alpha=1, target_modules=[]),
         device="cpu",
         dtype=torch.bfloat16,
     )
 
     assert model.loras == {}
-    weights = model.structural_experts["model.layers.0.mlp"]
+    weights = model.structural_experts[prefix]
     assert weights.gate_up_proj.dtype == torch.bfloat16
     assert weights.down_proj.dtype == torch.bfloat16
     assert weights.expert_bias.dtype == torch.float32

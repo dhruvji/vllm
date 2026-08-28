@@ -8,18 +8,17 @@ import torch
 
 EXPERT_ADAPTER_SCHEMA = "qwen3_moe_expert_adapter_v1"
 
+_MLP_MODULE_PATTERN = r"((?:language_model\.)?model\.layers\.\d+\.mlp)"
 _GATE_UP = re.compile(
-    r"^(model\.layers\.\d+\.mlp)\.shared_expert\.trainable_expert"
+    rf"^{_MLP_MODULE_PATTERN}\.shared_expert\.trainable_expert"
     r"\.gate_up_proj\.weight$"
 )
 _DOWN = re.compile(
-    r"^(model\.layers\.\d+\.mlp)\.shared_expert\.trainable_expert"
+    rf"^{_MLP_MODULE_PATTERN}\.shared_expert\.trainable_expert"
     r"\.down_proj\.weight$"
 )
-_ROUTER = re.compile(
-    r"^(model\.layers\.\d+\.mlp)\.gate\.trainable_expert_router\.weight$"
-)
-_BIAS = re.compile(r"^(model\.layers\.\d+\.mlp)\.shared_expert\.expert_bias$")
+_ROUTER = re.compile(rf"^{_MLP_MODULE_PATTERN}\.gate\.trainable_expert_router\.weight$")
+_BIAS = re.compile(rf"^{_MLP_MODULE_PATTERN}\.shared_expert\.expert_bias$")
 _PATTERNS = (_GATE_UP, _DOWN, _ROUTER, _BIAS)
 
 
