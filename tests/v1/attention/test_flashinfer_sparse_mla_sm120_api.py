@@ -70,10 +70,19 @@ def test_sm120_compacts_kpool_tail_to_kernel_topk() -> None:
         [
             [10, 11, 12, 13, 20, 21, -1, -1],
             [30, 31, 32, 33, -1, -1, -1, -1],
+            [40, 41, -1, -1, 50, 51, -1, -1],
+            [60, -1, -1, -1, 70, -1, -1, -1],
+            [-1, -1, -1, -1, 80, 81, -1, -1],
         ],
         dtype=torch.int32,
     )
 
     compacted = _compact_topk_indices(topk_indices, logical_topk=4)
 
-    assert compacted.tolist() == [[10, 11, 20, 21], [30, 31, 32, 33]]
+    assert compacted.tolist() == [
+        [10, 11, 20, 21],
+        [30, 31, 32, 33],
+        [40, 41, 50, 51],
+        [60, 70, -1, -1],
+        [80, 81, -1, -1],
+    ]

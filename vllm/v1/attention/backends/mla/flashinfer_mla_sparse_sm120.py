@@ -47,12 +47,15 @@ def _compact_topk_indices(
     tail = topk_indices[:, logical_topk:]
     tail_count = (tail >= 0).sum(dim=-1).clamp(max=logical_topk)
     columns = torch.arange(logical_topk, device=topk_indices.device)
-    history_count = logical_topk - tail_count
+    history_count = (history >= 0).sum(dim=-1).clamp(max=logical_topk)
+    history_count = torch.minimum(history_count, logical_topk - tail_count)
     tail_offsets = (columns - history_count[:, None]).clamp(
         min=0, max=tail.shape[-1] - 1
     )
     tail_values = torch.gather(tail, 1, tail_offsets)
-    return torch.where(columns < history_count[:, None], history, tail_values)
+    compacted = torch.where(columns < history_count[:, None], history, tail_values)
+    valid_count = history_count + tail_count
+    return torch.where(columns < valid_count[:, None], compacted, -1)
 
 
 class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]):
