@@ -27,13 +27,14 @@ from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.multi_group import MultiGroupEagleProposer
 
 mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
 
 
 @pytest.mark.skip_global_cleanup
-def test_glm5next_mtp_uses_multi_group_proposer():
+def test_glm5next_mtp_is_identified():
     speculative_config = SimpleNamespace(
         method="mtp",
         draft_model_config=SimpleNamespace(
@@ -42,6 +43,22 @@ def test_glm5next_mtp_uses_multi_group_proposer():
     )
 
     assert SpeculativeConfig.use_glm5next_mtp(speculative_config)
+
+
+@pytest.mark.parametrize(
+    ("kernel_block_sizes", "expected"),
+    [({1: 64}, 64), ({}, 1024)],
+)
+@pytest.mark.skip_global_cleanup
+def test_multi_group_proposer_uses_kernel_block_size(
+    kernel_block_sizes: dict[int, int], expected: int
+):
+    proposer = object.__new__(MultiGroupEagleProposer)
+    proposer._kernel_block_sizes = kernel_block_sizes
+    attn_group = mock.MagicMock()
+    attn_group.get_metadata_builder.return_value.kv_cache_spec.block_size = 1024
+
+    assert proposer._block_size_for_group(1, attn_group) == expected
 
 
 def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:

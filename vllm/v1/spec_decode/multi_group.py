@@ -31,6 +31,13 @@ class MultiGroupEagleProposer(EagleProposer):
         self._per_group_block_tables: dict[int, torch.Tensor] = {}
         self._per_group_slot_mappings: dict[int, torch.Tensor] = {}
         self._per_group_slot_mapping_buffers: dict[int, torch.Tensor] = {}
+        self._kernel_block_sizes: dict[int, int] = {}
+
+    def _block_size_for_group(self, gid: int, attn_group: AttentionGroup) -> int:
+        kernel_block_size = self._kernel_block_sizes.get(gid)
+        if kernel_block_size is not None:
+            return kernel_block_size
+        return attn_group.get_metadata_builder().kv_cache_spec.block_size
 
     def set_per_group_attn_metadata(
         self,
@@ -101,9 +108,7 @@ class MultiGroupEagleProposer(EagleProposer):
             block_table = self._per_group_block_tables.get(gid)
             if block_table is None:
                 continue
-            group_block_size = (
-                attn_group.get_metadata_builder().kv_cache_spec.block_size
-            )
+            group_block_size = self._block_size_for_group(gid, attn_group)
             block_numbers = new_positions_1d // group_block_size
             block_numbers.clamp_(max=block_table.shape[1] - 1)
             block_ids = block_table[:batch_size].gather(
@@ -158,6 +163,9 @@ class MultiGroupEagleProposer(EagleProposer):
         kv_cache_config: KVCacheConfig,
         kernel_block_sizes: list[int] | None = None,
     ) -> None:
+        self._kernel_block_sizes = {
+            gid: block_size for gid, block_size in enumerate(kernel_block_sizes or ())
+        }
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
             AttentionLayerBase,  # type: ignore[type-abstract]
@@ -241,4 +249,4 @@ class MultiGroupEagleProposer(EagleProposer):
             for group in self.draft_attn_groups
             if group.kv_cache_group_id == self.kv_cache_gid
         )
-        self.block_size = primary_group.get_metadata_builder().kv_cache_spec.block_size
+        self.block_size = self._block_size_for_group(self.kv_cache_gid, primary_group)
