@@ -311,6 +311,99 @@ def test_placeholder_draft_token_rejected():
     assert (recovered >= 0).all() and (recovered < VOCAB_SIZE).all()
 
 
+@pytest.mark.parametrize("has_draft_logits", [True, False])
+@pytest.mark.parametrize("num_placeholders", [1, 2])
+def test_block_verification_placeholder_truncates_block(
+    has_draft_logits: bool, num_placeholders: int
+):
+    torch.manual_seed(42)
+    device = "cuda"
+    num_trials = 20 * VOCAB_SIZE
+    K = 3
+    temperature = 1.0
+
+    target_logits_1d = torch.randn(VOCAB_SIZE, device=device) / temperature
+    draft_logits_1d = torch.randn(VOCAB_SIZE, device=device) / temperature
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        K,
+        temperature=temperature,
+        num_trials=num_trials,
+    )
+    if not has_draft_logits:
+        inputs["draft_logits"] = None
+    inputs["draft_sampled"].view(num_trials, K + 1)[:, K + 1 - num_placeholders :] = -1
+
+    sampled, num_sampled = rejection_sample(
+        **inputs, num_speculative_steps=K, use_block_verification=True
+    )
+
+    num_real = K - num_placeholders
+    assert (num_sampled <= num_real + 1).all()
+    target_probs = torch.softmax(target_logits_1d, dim=0)
+    for pos in range(num_real + 1):
+        accepted_mask = num_sampled >= pos + 1
+        _assert_distribution_match(
+            sampled[accepted_mask, pos], target_probs, device, label=f"position {pos}"
+        )
+
+
+def test_greedy_placeholder_emits_target_argmax():
+    torch.manual_seed(0)
+    device = "cuda"
+    num_trials = 512
+    K = 3
+
+    target_logits_1d = torch.randn(VOCAB_SIZE, device=device)
+    draft_logits_1d = torch.randn(VOCAB_SIZE, device=device)
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        K,
+        temperature=0.0,
+        num_trials=num_trials,
+    )
+    target_argmax = int(target_logits_1d.argmax())
+    draft_sampled = inputs["draft_sampled"].view(num_trials, K + 1)
+    draft_sampled[:, 1] = target_argmax
+    draft_sampled[:, 2:] = -1
+
+    sampled, num_sampled = rejection_sample(**inputs, num_speculative_steps=K)
+
+    assert torch.equal(num_sampled, torch.full_like(num_sampled, 2))
+    steps = torch.arange(K + 1, device=device).unsqueeze(0)
+    emitted = sampled[steps < num_sampled.unsqueeze(1)]
+    assert (emitted == target_argmax).all()
+
+
+@pytest.mark.parametrize("use_block_verification", [False, True])
+def test_placeholder_blocks_later_draft_tokens(use_block_verification: bool):
+    torch.manual_seed(0)
+    device = "cuda"
+    num_trials = 4 * VOCAB_SIZE
+    K = 3
+
+    logits_1d = torch.randn(VOCAB_SIZE, device=device)
+    inputs = _build_rejection_sample_inputs(
+        logits_1d,
+        logits_1d,
+        K,
+        temperature=1.0,
+        num_trials=num_trials,
+    )
+    inputs["draft_sampled"].view(num_trials, K + 1)[:, 2] = -1
+
+    _, num_sampled = rejection_sample(
+        **inputs,
+        num_speculative_steps=K,
+        use_block_verification=use_block_verification,
+    )
+
+    assert (num_sampled <= 2).all()
+    assert (num_sampled == 2).float().mean().item() > 0.9
+
+
 @pytest.mark.parametrize(
     "num_speculative_steps,temperature",
     [
