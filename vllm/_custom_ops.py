@@ -2837,7 +2837,7 @@ def cp_gather_and_upconvert_fp8_kv_cache(
 
     Args:
         src_cache: FP8 KV cache [num_blocks, block_size, 656]
-        dst: BF16 output workspace [total_tokens, 576]
+        dst: BF16 output workspace [total_tokens, 512 or 576]
         block_table: Block indices [num_reqs, max_blocks]
         workspace_starts: Workspace start offsets [num_reqs]
         batch_size: Number of requests
