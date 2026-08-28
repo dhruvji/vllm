@@ -73,7 +73,7 @@ def route_structural_expert(
     added_weights = torch.where(
         added, topk_weights, torch.zeros_like(topk_weights)
     ).sum(dim=-1)
-    base_ids = torch.where(added, torch.zeros_like(topk_ids), topk_ids)
+    base_ids = torch.where(added, torch.full_like(topk_ids, -1), topk_ids)
     base_weights = torch.where(added, torch.zeros_like(topk_weights), topk_weights)
     return base_weights, base_ids, added_weights
 

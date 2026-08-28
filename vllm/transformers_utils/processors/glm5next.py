@@ -88,6 +88,8 @@ def glm_sample_frame_indices(
 
     extract_t = int(duration * target_fps)
     extract_t = min(extract_t, int(max_frame_count))
+    if total_frames > 0 and max_frame_count > 0:
+        extract_t = max(extract_t, 1)
 
     duration_per_frame = 1 / fps
     timestamps = [i * duration_per_frame for i in range(total_frames)]

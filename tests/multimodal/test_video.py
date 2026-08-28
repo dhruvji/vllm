@@ -1149,6 +1149,14 @@ def test_glm5next_backend_selected_for_processor():
         assert VIDEO_LOADER_REGISTRY.get_backend_for_video_processor(name) == "glm5next"
 
 
+def test_glm5next_sampler_keeps_sub_interval_clip():
+    from vllm.transformers_utils.processors.glm5next import (
+        glm_sample_frame_indices,
+    )
+
+    assert glm_sample_frame_indices(3, 30.0, 0.1) == [0, 0]
+
+
 @pytest.mark.parametrize(
     ("total_frames", "original_fps", "duration", "fps", "max_frames"),
     [

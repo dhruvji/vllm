@@ -99,9 +99,27 @@ def test_route_structural_expert_replaces_added_slot_for_base_kernel():
         routed_scaling_factor=2.5,
     )
 
-    assert base_ids.tolist() == [[0], [0]]
+    assert base_ids.tolist() == [[-1], [0]]
     assert base_weights.tolist() == [[0.0], [2.5]]
     assert added_weights.tolist() == [2.5, 0.0]
+
+
+def test_route_structural_expert_invalidates_added_topk_slot():
+    base_weights, base_ids, added_weights = route_structural_expert(
+        gating_output=torch.tensor([[2.0, 0.0]]),
+        extra_logits=torch.tensor([3.0]),
+        active=torch.tensor([True]),
+        base_bias=torch.zeros(1, 2),
+        topk=2,
+        renormalize=False,
+        scoring_func="sigmoid",
+        routed_scaling_factor=1.0,
+    )
+
+    assert base_ids.eq(-1).sum().item() == 1
+    assert base_ids[base_ids >= 0].unique().numel() == 1
+    assert base_weights[base_ids == -1].eq(0).all()
+    assert added_weights.gt(0).all()
 
 
 def test_apply_structural_experts_only_runs_selected_slot_tokens(monkeypatch):
