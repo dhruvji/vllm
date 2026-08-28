@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -29,6 +30,18 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 
 mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.skip_global_cleanup
+def test_glm5next_mtp_uses_multi_group_proposer():
+    speculative_config = SimpleNamespace(
+        method="mtp",
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="glm5_next_mtp")
+        ),
+    )
+
+    assert SpeculativeConfig.use_glm5next_mtp(speculative_config)
 
 
 def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
