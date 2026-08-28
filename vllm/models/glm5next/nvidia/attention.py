@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import cast
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -73,6 +75,19 @@ def _pad_indexer_heads(x: torch.Tensor, pad: int) -> torch.Tensor:
     # Fuse new_zeros + cat (was 2 kernels) into one. Pad values are zero (exact
     # in fp8 e4m3 and zero-weight in the logits sum), so numerically a no-op.
     return torch.cat([x, x.new_zeros(x.shape[0], pad, *x.shape[2:])], dim=1)
+
+
+def _compute_indexer_gate(
+    hidden_states: torch.Tensor,
+    base_weight_fp32: torch.Tensor,
+    base_gate_output: torch.Tensor | None = None,
+    fused_gate_output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    weights = torch.mm(hidden_states.float(), base_weight_fp32)
+    if base_gate_output is None:
+        return weights
+    assert fused_gate_output is not None
+    return weights + (fused_gate_output - base_gate_output).float()
 
 
 class Glm5NextIndexerCache(DeepseekV32IndexerCache):
@@ -323,14 +338,27 @@ class Indexer(nn.Module):
         # rankings on long-context tasks. Cache it after weights are loaded.
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
+        base_projection = cast(
+            MergedColumnParallelLinear,
+            getattr(self.wk_weights_proj, "base_layer", self.wk_weights_proj),
+        )
         if self._wp_fp32 is None:
             self._wp_fp32 = (
-                self.wk_weights_proj.weight.data[self.head_dim :, :]
+                base_projection.weight.detach()[self.head_dim :, :]
                 .t()
                 .contiguous()
                 .float()
             )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        if base_projection is self.wk_weights_proj:
+            weights = _compute_indexer_gate(hidden_states, self._wp_fp32)
+        else:
+            base_kw, _ = base_projection(hidden_states)
+            weights = _compute_indexer_gate(
+                hidden_states,
+                self._wp_fp32,
+                base_kw[:, self.head_dim :],
+                kw[:, self.head_dim :],
+            )
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
