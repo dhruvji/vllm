@@ -663,17 +663,17 @@ class VllmConfig:
         if model_config.runner_type != "generate":
             return False
 
-        if getattr(model_config, "is_hybrid", False):
-            return False
-
         if getattr(model_config, "is_attention_free", False):
             return False
         architectures = getattr(model_config, "architectures", [])
         default_architectures = default_v2_model_runner_architectures()
-        return (
-            any(arch in default_architectures for arch in architectures)
-            or not model_config.is_moe
-        )
+        if any(arch in default_architectures for arch in architectures):
+            return True
+
+        if getattr(model_config, "is_hybrid", False):
+            return False
+
+        return not model_config.is_moe
 
     def _uses_breakable_cudagraph_by_default(self) -> bool:
         model_config = self.model_config

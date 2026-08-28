@@ -638,10 +638,6 @@ class GPUModelRunner(
                 )
             elif self.speculative_config.use_gemma4_mtp():
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
-            elif self.speculative_config.use_glm5next_mtp():
-                self.drafter = MultiGroupEagleProposer(
-                    self.vllm_config, self.device, self
-                )
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():

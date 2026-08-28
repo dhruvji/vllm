@@ -191,6 +191,7 @@ def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
     assert compilation_config.cudagraph_capture_sizes == expected_capture_sizes
 
 
+@pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
     ("model_config", "expected"),
     [
@@ -354,6 +355,17 @@ def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
                 is_hybrid=True,
             ),
             False,
+        ),
+        (
+            SimpleNamespace(
+                model="zai-org/GLM-5.3",
+                architectures=["Glm5NextForConditionalGeneration"],
+                runner_type="generate",
+                is_moe=True,
+                is_quantized=False,
+                is_hybrid=True,
+            ),
+            True,
         ),
         (
             SimpleNamespace(
