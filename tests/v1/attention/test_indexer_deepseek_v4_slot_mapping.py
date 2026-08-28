@@ -6,9 +6,39 @@ import torch
 
 from tests.v1.attention.utils import create_vllm_config
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadataBuilder,
+    _prepare_uniform_decode_kernel,
+)
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.block_table import get_block_table_width
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_uniform_decode_clamps_padded_sequence_lengths():
+    device = torch.device("cuda")
+    seq_lens = torch.tensor([10, 0], dtype=torch.int32, device=device)
+    decode_seq_lens = torch.empty(4, dtype=torch.int32, device=device)
+    block_table = torch.tensor([[3, 4], [0, 0]], dtype=torch.int32, device=device)
+    expanded_block_table = torch.empty((4, 2), dtype=torch.int32, device=device)
+    decode_lens = torch.empty(4, dtype=torch.int32, device=device)
+
+    _prepare_uniform_decode_kernel[(4,)](
+        seq_lens,
+        decode_seq_lens,
+        block_table,
+        block_table.stride(0),
+        expanded_block_table,
+        expanded_block_table.stride(0),
+        decode_lens,
+        2,
+        BLOCK_SIZE=2,
+    )
+
+    torch.testing.assert_close(
+        decode_seq_lens,
+        torch.tensor([9, 10, 0, 0], dtype=torch.int32, device=device),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
