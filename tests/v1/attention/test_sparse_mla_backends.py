@@ -36,9 +36,11 @@ if not current_platform.is_cuda():
 
 import vllm.v1.attention.backends.mla.flashinfer_mla_sparse as flashinfer_sparse_mod
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseImpl,
     FlashInferMLASparseTRTLLMBackend,
+    FlashInferMLASparseTRTLLMMetadataBuilder,
 )
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
@@ -73,6 +75,13 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 )
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_flashinfer_trtllm_uses_full_graph_metadata_builder():
+    builder_cls = FlashInferMLASparseTRTLLMBackend.get_builder_cls()
+
+    assert builder_cls is FlashInferMLASparseTRTLLMMetadataBuilder
+    assert builder_cls._cudagraph_support == AttentionCGSupport.ALWAYS
 
 
 def test_nope_flashinfer_sparse_mla_uses_model_scale(monkeypatch):
