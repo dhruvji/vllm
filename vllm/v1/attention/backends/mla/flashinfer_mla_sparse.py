@@ -229,14 +229,10 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
                     "FLASHINFER_MLA_SPARSE_SM120 requires a model with "
                     "index_topk config"
                 )
-            kpool = getattr(hf_text_config, "index_kpool", 1) or 1
-            effective_width = int(index_topk) + (kpool - 1 if kpool > 1 else 0)
-            effective_width = ((effective_width + 127) // 128) * 128
-            if effective_width != 2048:
+            if int(index_topk) != 2048:
                 return (
-                    "FLASHINFER_MLA_SPARSE_SM120 requires an effective topk "
-                    f"buffer width of 2048; got {effective_width} "
-                    f"(index_topk={index_topk}, index_kpool={kpool})"
+                    "FLASHINFER_MLA_SPARSE_SM120 requires index_topk=2048; "
+                    f"got {index_topk}"
                 )
         return None
 

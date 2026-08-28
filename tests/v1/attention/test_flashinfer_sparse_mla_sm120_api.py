@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.config import set_current_vllm_config
@@ -14,11 +15,17 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+pytestmark = pytest.mark.skip_global_cleanup
 
-def _fake_vllm_config(model_type: str) -> SimpleNamespace:
+
+def _fake_vllm_config(model_type: str, index_kpool: int = 4) -> SimpleNamespace:
     return SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(model_type=model_type, index_topk=2048),
+            hf_text_config=SimpleNamespace(
+                model_type=model_type,
+                index_topk=2048,
+                index_kpool=index_kpool,
+            ),
         ),
     )
 
@@ -52,3 +59,21 @@ def test_v32_glm_sm120_backend_accepts_glm_block_size(
         )
 
     assert invalid_reasons == []
+
+
+def test_sm120_compacts_kpool_tail_to_kernel_topk() -> None:
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
+        _compact_topk_indices,
+    )
+
+    topk_indices = torch.tensor(
+        [
+            [10, 11, 12, 13, 20, 21, -1, -1],
+            [30, 31, 32, 33, -1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+
+    compacted = _compact_topk_indices(topk_indices, logical_topk=4)
+
+    assert compacted.tolist() == [[10, 11, 20, 21], [30, 31, 32, 33]]

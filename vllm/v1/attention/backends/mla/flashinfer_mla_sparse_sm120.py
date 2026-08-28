@@ -36,6 +36,25 @@ def _kv_scale_format_for_model(model_type: str | None) -> str:
     return "pow2_fp32"
 
 
+def _compact_topk_indices(
+    topk_indices: torch.Tensor, logical_topk: int
+) -> torch.Tensor:
+    """Fit the kpool history and incomplete tail into the kernel top-k."""
+    if topk_indices.shape[-1] == logical_topk:
+        return topk_indices
+
+    history = topk_indices[:, :logical_topk]
+    tail = topk_indices[:, logical_topk:]
+    tail_count = (tail >= 0).sum(dim=-1).clamp(max=logical_topk)
+    columns = torch.arange(logical_topk, device=topk_indices.device)
+    history_count = logical_topk - tail_count
+    tail_offsets = (columns - history_count[:, None]).clamp(
+        min=0, max=tail.shape[-1] - 1
+    )
+    tail_values = torch.gather(tail, 1, tail_offsets)
+    return torch.where(columns < history_count[:, None], history, tail_values)
+
+
 class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]):
     """SM120 FlashInfer sparse-MLA implementation."""
 
@@ -152,7 +171,9 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             rope_dim = _DS_ROPE_DIM
 
         assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
+        topk_indices = _compact_topk_indices(
+            self.topk_indices_buffer[:num_actual_toks], attn_metadata.topk_tokens
+        )
 
         topk_indices_physical = cast(
             torch.Tensor,
@@ -177,8 +198,6 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             flashinfer_trtllm_batch_decode_with_kv_cache_mla,
         )
 
-        effective_topk = topk_indices_physical.shape[-1]
-
         out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
             query=q.unsqueeze(1),
             kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
@@ -188,11 +207,11 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             qk_rope_head_dim=rope_dim,
             block_tables=topk_indices_physical.unsqueeze(1),
             seq_lens=None,
-            max_seq_len=effective_topk,
+            max_seq_len=attn_metadata.topk_tokens,
             out=output.unsqueeze(1),
             bmm1_scale=self.scale,
             bmm2_scale=1.0,
-            sparse_mla_top_k=effective_topk,
+            sparse_mla_top_k=attn_metadata.topk_tokens,
             kv_scale_format=self.kv_scale_format,
         )
         return out.squeeze(1), None
