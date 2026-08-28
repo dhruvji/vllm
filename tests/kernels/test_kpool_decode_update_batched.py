@@ -31,6 +31,8 @@ import torch
 from vllm.models.glm5next.nvidia.ops.kpool_compress import (
     kpool_compress_and_write_cache,
     kpool_decode_update_and_maybe_write_cache_batched,
+    kpool_prefill_compress_and_write_cache,
+    kpool_seed_tail_cache,
 )
 
 HEAD_DIM = 128
@@ -256,6 +258,31 @@ def test_decode_writer_matches_prefill_writer(pool_size):
         round_scale=ROUND_SCALE,
     )
 
+    kv_logical_prefill = torch.zeros_like(kv_prefill)
+    tail_prefill = torch.zeros(
+        nblk, 2, pool_size, HEAD_DIM, dtype=torch.bfloat16, device=dev
+    )
+    positions = torch.arange(n_tok, dtype=torch.int32, device=dev)
+    tail_slots = positions % pool_size
+    pool_slots = torch.full((n_tok,), -1, dtype=torch.int64, device=dev)
+    pool_slots[pool_size - 1 :: pool_size] = torch.arange(
+        n_pools, dtype=torch.int64, device=dev
+    )
+    kpool_prefill_compress_and_write_cache(
+        kv_logical_prefill,
+        tail_prefill,
+        k,
+        score,
+        ape,
+        pool_slots,
+        positions,
+        tail_slots,
+        pool_size,
+        HEAD_DIM,
+        round_scale=ROUND_SCALE,
+    )
+    assert torch.equal(kv_prefill, kv_logical_prefill)
+
     # One request owning tail block 0, fed one token per decode step.
     kv_decode = torch.zeros_like(kv_prefill)
     tail = torch.zeros(nblk, 2, pool_size, HEAD_DIM, dtype=torch.bfloat16, device=dev)
@@ -290,6 +317,133 @@ def test_decode_writer_matches_prefill_writer(pool_size):
         f"decode-written pools differ from prefill-written pools: "
         f"{len(differing)}/{n_pools} (pool_size={pool_size}, first={differing[:5]})"
     )
+
+
+def test_prefill_writer_reads_prior_chunk_from_request_tail():
+    """A resumed request completes a pool using its own persisted tail."""
+    torch.manual_seed(0)
+    block = 5
+    prior_n = 10
+    current_positions = torch.arange(10, 21, dtype=torch.int32, device="cuda")
+    prior_k = torch.randn(prior_n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    prior_score = torch.randn_like(prior_k)
+    current_k = torch.randn(
+        current_positions.shape[0], HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    current_score = torch.randn_like(current_k)
+    ape = torch.randn(POOL_SIZE, HEAD_DIM, dtype=torch.float32, device="cuda")
+    kv, tail = _make_caches()
+    prior_positions = torch.arange(prior_n, dtype=torch.int32, device="cuda")
+    prior_tail_slots = block * POOL_SIZE + prior_positions % POOL_SIZE
+    kpool_seed_tail_cache(
+        tail,
+        prior_k,
+        prior_score,
+        prior_tail_slots,
+        POOL_SIZE,
+        HEAD_DIM,
+    )
+
+    loc = torch.full(
+        (current_positions.shape[0],), -1, dtype=torch.int64, device="cuda"
+    )
+    loc[5] = 7
+    tail_slots = block * POOL_SIZE + current_positions % POOL_SIZE
+    kpool_prefill_compress_and_write_cache(
+        kv,
+        tail,
+        current_k,
+        current_score,
+        ape,
+        loc,
+        current_positions,
+        tail_slots,
+        POOL_SIZE,
+        HEAD_DIM,
+        round_scale=ROUND_SCALE,
+    )
+
+    expected = torch.zeros_like(kv)
+    kpool_compress_and_write_cache(
+        expected,
+        torch.cat((prior_k, current_k[:6])).view(1, POOL_SIZE, HEAD_DIM),
+        torch.cat((prior_score, current_score[:6])).view(1, POOL_SIZE, HEAD_DIM),
+        ape,
+        torch.tensor([7], dtype=torch.int64, device="cuda"),
+        POOL_SIZE,
+        HEAD_DIM,
+        round_scale=ROUND_SCALE,
+    )
+    assert torch.equal(kv, expected)
+
+
+def test_prefill_writer_does_not_cross_request_boundaries():
+    """Matching logical positions from another request must not enter a pool."""
+    torch.manual_seed(1)
+    prior_n = 10
+    request_0_block = 3
+    request_1_block = 5
+    request_0_positions = torch.arange(prior_n, dtype=torch.int32, device="cuda")
+    request_1_positions = torch.arange(10, 21, dtype=torch.int32, device="cuda")
+    positions = torch.cat((request_0_positions, request_1_positions))
+    request_0_k = torch.randn(prior_n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    request_0_score = torch.randn_like(request_0_k)
+    request_1_prior_k = torch.randn_like(request_0_k)
+    request_1_prior_score = torch.randn_like(request_1_prior_k)
+    request_1_k = torch.randn(
+        request_1_positions.shape[0], HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    request_1_score = torch.randn_like(request_1_k)
+    key = torch.cat((request_0_k, request_1_k))
+    score = torch.cat((request_0_score, request_1_score))
+    ape = torch.randn(POOL_SIZE, HEAD_DIM, dtype=torch.float32, device="cuda")
+    kv, tail = _make_caches()
+    prior_tail_slots = request_1_block * POOL_SIZE + request_0_positions % POOL_SIZE
+    kpool_seed_tail_cache(
+        tail,
+        request_1_prior_k,
+        request_1_prior_score,
+        prior_tail_slots,
+        POOL_SIZE,
+        HEAD_DIM,
+    )
+
+    tail_slots = torch.cat(
+        (
+            request_0_block * POOL_SIZE + request_0_positions % POOL_SIZE,
+            request_1_block * POOL_SIZE + request_1_positions % POOL_SIZE,
+        )
+    )
+    loc = torch.full((positions.shape[0],), -1, dtype=torch.int64, device="cuda")
+    loc[prior_n + 5] = 9
+    kpool_prefill_compress_and_write_cache(
+        kv,
+        tail,
+        key,
+        score,
+        ape,
+        loc,
+        positions,
+        tail_slots,
+        POOL_SIZE,
+        HEAD_DIM,
+        round_scale=ROUND_SCALE,
+    )
+
+    expected = torch.zeros_like(kv)
+    kpool_compress_and_write_cache(
+        expected,
+        torch.cat((request_1_prior_k, request_1_k[:6])).view(1, POOL_SIZE, HEAD_DIM),
+        torch.cat((request_1_prior_score, request_1_score[:6])).view(
+            1, POOL_SIZE, HEAD_DIM
+        ),
+        ape,
+        torch.tensor([9], dtype=torch.int64, device="cuda"),
+        POOL_SIZE,
+        HEAD_DIM,
+        round_scale=ROUND_SCALE,
+    )
+    assert torch.equal(kv, expected)
 
 
 def test_leading_invalid_tail_slot():

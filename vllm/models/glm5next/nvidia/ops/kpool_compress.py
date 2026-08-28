@@ -365,6 +365,249 @@ def kpool_compress_and_write_cache(
     return None
 
 
+@triton.jit
+def _kpool_prefill_source(
+    row,
+    pool_slot,
+    pos,
+    positions_ptr,
+    tail_slot_mapping_ptr,
+    n_tokens,
+    safe_block,
+    do_write,
+    POOL_SIZE: tl.constexpr,
+):
+    desired_pos = pos - (POOL_SIZE - 1) + pool_slot
+    source_idx = row - (POOL_SIZE - 1) + pool_slot
+    source_in_bounds = (source_idx >= 0) & (source_idx < n_tokens)
+    safe_source_idx = tl.maximum(source_idx, 0)
+    source_pos = tl.load(
+        positions_ptr + safe_source_idx,
+        mask=do_write & source_in_bounds,
+        other=-1,
+    )
+    source_tail_slot = tl.load(
+        tail_slot_mapping_ptr + safe_source_idx,
+        mask=do_write & source_in_bounds,
+        other=-1,
+    )
+    source_block = tl.maximum(source_tail_slot, 0).to(tl.int64) // POOL_SIZE
+    use_current = (
+        source_in_bounds
+        & (source_pos == desired_pos)
+        & (source_tail_slot >= 0)
+        & (source_block == safe_block)
+    )
+    return safe_source_idx, desired_pos % POOL_SIZE, use_current
+
+
+@triton.jit
+def _kpool_prefill_compress_write_cache_kernel(
+    buf_fp8_ptr,
+    buf_fp32_ptr,
+    tail_kv_ptr,
+    key_ptr,
+    score_ptr,
+    ape_ptr,
+    loc_ptr,
+    positions_ptr,
+    tail_slot_mapping_ptr,
+    n_tokens,
+    key_stride_0,
+    score_stride_0,
+    ape_stride_0,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    TAIL_BLOCK_ELEMS: tl.constexpr,
+    KPOOL_HEAD: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    ROUND_SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Compress prefill pools from logical positions and the paged tail."""
+    row = tl.program_id(0)
+    loc = tl.load(loc_ptr + row)
+    pos = tl.load(positions_ptr + row)
+    tail_slot = tl.load(tail_slot_mapping_ptr + row)
+    do_write = (
+        (loc >= 0)
+        & (pos >= POOL_SIZE - 1)
+        & ((pos + 1) % POOL_SIZE == 0)
+        & (tail_slot >= 0)
+    )
+
+    safe_block = tl.maximum(tail_slot, 0).to(tl.int64) // POOL_SIZE
+    block_base = safe_block * TAIL_BLOCK_ELEMS
+    offs = tl.arange(0, BLOCK_D)
+    dim_mask = (offs < HEAD_DIM) & do_write
+
+    max_score = tl.full((BLOCK_D,), -float("inf"), tl.float32)
+    for pool_slot in tl.static_range(0, POOL_SIZE):
+        safe_source_idx, tail_offset, use_current = _kpool_prefill_source(
+            row,
+            pool_slot,
+            pos,
+            positions_ptr,
+            tail_slot_mapping_ptr,
+            n_tokens,
+            safe_block,
+            do_write,
+            POOL_SIZE,
+        )
+        current_score = tl.load(
+            score_ptr + safe_source_idx * score_stride_0 + offs,
+            mask=dim_mask & use_current,
+            other=0.0,
+        ).to(tl.float32)
+        tail_score = tl.load(
+            tail_kv_ptr + block_base + KPOOL_HEAD + tail_offset * HEAD_DIM + offs,
+            mask=dim_mask & ~use_current,
+            other=0.0,
+        ).to(tl.float32)
+        score = tl.where(use_current, current_score, tail_score)
+        score += tl.load(
+            ape_ptr + pool_slot * ape_stride_0 + offs,
+            mask=dim_mask,
+            other=0.0,
+        ).to(tl.float32)
+        max_score = tl.maximum(max_score, score)
+
+    acc = tl.full((BLOCK_D,), 0.0, tl.float32)
+    denom = tl.full((BLOCK_D,), 0.0, tl.float32)
+    for pool_slot in tl.static_range(0, POOL_SIZE):
+        safe_source_idx, tail_offset, use_current = _kpool_prefill_source(
+            row,
+            pool_slot,
+            pos,
+            positions_ptr,
+            tail_slot_mapping_ptr,
+            n_tokens,
+            safe_block,
+            do_write,
+            POOL_SIZE,
+        )
+        current_score = tl.load(
+            score_ptr + safe_source_idx * score_stride_0 + offs,
+            mask=dim_mask & use_current,
+            other=0.0,
+        ).to(tl.float32)
+        tail_score = tl.load(
+            tail_kv_ptr + block_base + KPOOL_HEAD + tail_offset * HEAD_DIM + offs,
+            mask=dim_mask & ~use_current,
+            other=0.0,
+        ).to(tl.float32)
+        score = tl.where(use_current, current_score, tail_score)
+        score += tl.load(
+            ape_ptr + pool_slot * ape_stride_0 + offs,
+            mask=dim_mask,
+            other=0.0,
+        ).to(tl.float32)
+        prob = tl.exp(score - max_score)
+        denom += prob
+
+        current_key = tl.load(
+            key_ptr + safe_source_idx * key_stride_0 + offs,
+            mask=dim_mask & use_current,
+            other=0.0,
+        ).to(tl.float32)
+        tail_key = tl.load(
+            tail_kv_ptr + block_base + tail_offset * HEAD_DIM + offs,
+            mask=dim_mask & ~use_current,
+            other=0.0,
+        ).to(tl.float32)
+        key = tl.where(use_current, current_key, tail_key)
+        acc += key * prob
+
+    x = (acc / denom).to(tl.bfloat16).to(tl.float32)
+    x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
+    fp8_max = 448.0
+    absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
+    if ROUND_SCALE:
+        scale = tl.exp2(tl.ceil(tl.log2(absmax / fp8_max)))
+    else:
+        scale = absmax / fp8_max
+    quantized = tl.minimum(tl.maximum(x / scale, -fp8_max), fp8_max)
+
+    loc_page_index = loc // PAGE_SIZE
+    loc_token_offset_in_page = loc % PAGE_SIZE
+    out_k_offsets = (
+        loc_page_index * BUF_NUMEL_PER_PAGE + loc_token_offset_in_page * HEAD_DIM + offs
+    )
+    out_s_offset = (
+        loc_page_index * BUF_NUMEL_PER_PAGE // 4
+        + S_OFFSET_NBYTES_IN_PAGE // 4
+        + loc_token_offset_in_page
+    )
+    tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+    tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
+
+
+def kpool_prefill_compress_and_write_cache(
+    kv_cache: torch.Tensor,
+    tail_kv_cache: torch.Tensor,
+    key: torch.Tensor,
+    score: torch.Tensor,
+    ape: torch.Tensor,
+    loc: torch.Tensor,
+    positions: torch.Tensor,
+    tail_slot_mapping: torch.Tensor,
+    pool_size: int,
+    head_dim: int = INDEX_HEAD_DIM,
+    round_scale: bool = True,
+) -> None:
+    """Write prefill pools without assuming that a chunk begins at a pool edge."""
+    n = loc.shape[0]
+    if n == 0:
+        return
+    assert key.shape == (n, head_dim)
+    assert score.shape == key.shape
+    assert ape.shape == (pool_size, head_dim)
+    assert positions.shape == (n,)
+    assert tail_slot_mapping.shape == (n,)
+    assert kv_cache.dtype == torch.uint8
+    assert tail_kv_cache.dtype == torch.bfloat16
+    assert key.dtype == torch.bfloat16
+    assert score.dtype == torch.bfloat16
+    assert ape.dtype == torch.float32
+    assert loc.dtype == torch.int64
+
+    key = key.contiguous()
+    score = score.contiguous()
+    ape = ape.contiguous()
+    loc = loc.contiguous()
+    positions = positions.contiguous()
+    tail_slot_mapping = tail_slot_mapping.contiguous()
+    page_size = kv_cache.shape[1]
+    buf_fp8 = kv_cache.view(torch.float8_e4m3fn)
+    buf_fp32 = kv_cache.view(torch.float32)
+    _kpool_prefill_compress_write_cache_kernel[(n,)](
+        buf_fp8,
+        buf_fp32,
+        tail_kv_cache,
+        key,
+        score,
+        ape,
+        loc,
+        positions,
+        tail_slot_mapping,
+        n,
+        key.stride(0),
+        score.stride(0),
+        ape.stride(0),
+        PAGE_SIZE=page_size,
+        BUF_NUMEL_PER_PAGE=kv_cache.stride(0),
+        POOL_SIZE=pool_size,
+        TAIL_BLOCK_ELEMS=tail_kv_cache.stride(0),
+        KPOOL_HEAD=tail_kv_cache.stride(1),
+        HEAD_DIM=head_dim,
+        S_OFFSET_NBYTES_IN_PAGE=page_size * head_dim,
+        ROUND_SCALE=round_scale,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+    )
+
+
 # Seed each request's incomplete pool into its paged tail during prefill.
 
 
