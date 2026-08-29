@@ -22,8 +22,60 @@ from vllm.config.lora import LoRAConfig
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.platforms import current_platform
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+from vllm.v1.worker.gpu.cudagraph_utils import prepare_inputs_to_capture
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize("full_cudagraph", [False, True])
+@pytest.mark.skip_global_cleanup
+def test_prepare_capture_attention_metadata_mode(full_cudagraph):
+    input_batch = MagicMock()
+    input_buffers = MagicMock()
+    block_tables = MagicMock(cp_size=1)
+    input_block_tables = MagicMock()
+    slot_mappings = MagicMock()
+    slot_mappings_by_layer = MagicMock()
+    block_tables.get_dummy_block_tables.return_value = input_block_tables
+    block_tables.get_dummy_slot_mappings.return_value = slot_mappings
+    model_state = MagicMock()
+    attn_metadata = MagicMock()
+    model_state.prepare_attn.return_value = attn_metadata
+    attn_groups = MagicMock()
+    kv_cache_config = MagicMock()
+
+    with (
+        patch(
+            "vllm.v1.worker.gpu.cudagraph_utils.InputBatch.make_dummy",
+            return_value=input_batch,
+        ),
+        patch(
+            "vllm.v1.worker.gpu.cudagraph_utils.build_slot_mappings_by_layer",
+            return_value=slot_mappings_by_layer,
+        ),
+    ):
+        result = prepare_inputs_to_capture(
+            64,
+            512,
+            model_state,
+            input_buffers,
+            block_tables,
+            attn_groups,
+            kv_cache_config,
+            full_cudagraph=full_cudagraph,
+        )
+
+    assert result.attn_metadata is attn_metadata
+    assert result.slot_mappings is slot_mappings_by_layer
+    model_state.prepare_attn.assert_called_once_with(
+        input_batch,
+        CUDAGraphMode.NONE,
+        input_block_tables,
+        slot_mappings,
+        attn_groups,
+        kv_cache_config,
+        for_capture=full_cudagraph,
+    )
 
 
 # Helper MLP for testing

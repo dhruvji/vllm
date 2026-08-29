@@ -493,10 +493,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 block_tables,
                 attn_groups,
                 kv_cache_config,
-                skip_attn=(
-                    desc.cg_mode == CUDAGraphMode.PIECEWISE
-                    and not self.use_breakable_cg
-                ),
+                full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
             )
 
             # Capture with dummy rows marked as padding.
@@ -588,7 +585,7 @@ def prepare_inputs_to_capture(
     block_tables: BlockTables,
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
-    skip_attn: bool = False,
+    full_cudagraph: bool,
 ) -> AttentionState:
     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
@@ -609,15 +606,13 @@ def prepare_inputs_to_capture(
         )
         input_batch.dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_reqs]
 
-    attn_metadata = None
-    if not skip_attn:
-        attn_metadata = model_state.prepare_attn(
-            input_batch,
-            CUDAGraphMode.NONE,
-            input_block_tables,
-            slot_mappings,
-            attn_groups,
-            kv_cache_config,
-            for_capture=True,
-        )
+    attn_metadata = model_state.prepare_attn(
+        input_batch,
+        CUDAGraphMode.NONE,
+        input_block_tables,
+        slot_mappings,
+        attn_groups,
+        kv_cache_config,
+        for_capture=full_cudagraph,
+    )
     return AttentionState(attn_metadata, slot_mappings_by_layer)
