@@ -621,6 +621,18 @@ def copy_kv_cache_blocks_inplace(
         blocks[dst_indices] = blocks[src_indices]
 
 
+def get_uniform_decode_token_count(
+    num_reqs: int,
+    num_tokens: int,
+    max_query_len: int,
+    has_prefill: bool,
+) -> int | None:
+    """Return the shared query length only for an all-decode batch."""
+    if not has_prefill and num_reqs > 0 and num_tokens == max_query_len * num_reqs:
+        return max_query_len
+    return None
+
+
 def is_residual_scattered_for_sp(
     vllm_config: VllmConfig, num_input_tokens: int
 ) -> bool:
