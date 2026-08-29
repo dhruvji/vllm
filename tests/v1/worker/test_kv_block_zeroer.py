@@ -43,6 +43,7 @@ def test_non_uniform_page_sizes_have_per_segment_zeroing_metadata():
             layer_name: SimpleNamespace(kv_cache=cache)
             for layer_name, cache in layers.items()
         },
+        num_blocks=4,
     )
 
     assert zeroer._meta is not None
@@ -50,6 +51,47 @@ def test_non_uniform_page_sizes_have_per_segment_zeroing_metadata():
     assert block_strides.tolist() == [4, 6]
     assert page_sizes.tolist() == [4, 6]
     assert (max_chunks, block_size, num_segments) == (1, 8, 2)
+
+
+@pytest.mark.skip_global_cleanup
+def test_layers_in_one_group_may_use_different_kernel_pages_per_block():
+    device = torch.device("cpu")
+    num_blocks = 4
+    layers = {
+        "wide": torch.ones((num_blocks * 2, 3), dtype=torch.int32),
+        "narrow": torch.ones((num_blocks, 5), dtype=torch.int32),
+    }
+    spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.int32,
+    )
+
+    zeroer = KVBlockZeroer(
+        device,
+        pin_memory=False,
+        attn_groups_iter=[
+            AttentionGroup(
+                BlocksFirstBackend,
+                list(layers),
+                spec,
+                0,
+            )
+        ],
+        kernel_block_sizes=[1],
+        cache_dtype="auto",
+        static_forward_context={
+            layer_name: SimpleNamespace(kv_cache=cache)
+            for layer_name, cache in layers.items()
+        },
+        num_blocks=num_blocks,
+    )
+
+    assert zeroer._meta is not None
+    _, block_strides, page_sizes, _, _, _ = zeroer._meta
+    assert block_strides.tolist() == [6, 5]
+    assert page_sizes.tolist() == [6, 5]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

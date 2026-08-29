@@ -98,6 +98,7 @@ class KVBlockZeroer:
         kernel_block_sizes: list[int],
         cache_dtype: str,
         static_forward_context: dict[str, Any],
+        num_blocks: int,
         runner_only_attn_layers: set[str] | None = None,
         max_concurrency: int = 1,
     ) -> None:
@@ -140,7 +141,6 @@ class KVBlockZeroer:
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
-            ratio = spec.block_size // kernel_bs
             block_dim = group.backend.get_kv_cache_block_dim(
                 kernel_bs,
                 spec.num_kv_heads,
@@ -155,6 +155,15 @@ class KVBlockZeroer:
                 if not isinstance(kv, torch.Tensor):
                     continue
                 dp = kv.data_ptr()
+
+                # Layers in one group may store different numbers of kernel
+                # pages per logical block, so derive this from each allocation.
+                num_kernel_blocks = kv.shape[block_dim]
+                assert num_kernel_blocks % num_blocks == 0, (
+                    f"{layer_name}: {num_kernel_blocks} kernel blocks is not a "
+                    f"multiple of {num_blocks} logical blocks"
+                )
+                ratio = num_kernel_blocks // num_blocks
 
                 el = kv.element_size()
                 cur_bytes = kv.stride(block_dim) * el
