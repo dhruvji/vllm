@@ -907,7 +907,6 @@ class SpeculativeConfig:
                         not in (
                             "step3p5_mtp",
                             "inkling_mtp",
-                            "glm5_next_mtp",
                         )
                     ):
                         logger.warning(
