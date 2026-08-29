@@ -208,6 +208,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    supports_spec_step_idx = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -215,6 +217,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.model = Glm5NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.num_mtp_layers = self.model.num_mtp_layers
         self.set_moe_parameters()
 
     def set_moe_parameters(self):

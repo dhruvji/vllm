@@ -284,10 +284,32 @@ class DraftModelSpeculator(BaseSpeculator):
             "(communication: O(2*tp_size) vs O(vocab_size))."
         )
 
-    def _greedy_sample_draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.use_local_argmax_reduction:
+    def _compute_draft_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int | None = None,
+    ) -> torch.Tensor:
+        if spec_step_idx is None:
+            return self.model.compute_logits(hidden_states)
+        return self.model.compute_logits(hidden_states, spec_step_idx=spec_step_idx)
+
+    def _get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int | None = None,
+    ) -> torch.Tensor:
+        if spec_step_idx is None:
             return self.model.get_top_tokens(hidden_states)
-        logits = self.model.compute_logits(hidden_states)
+        return self.model.get_top_tokens(hidden_states, spec_step_idx=spec_step_idx)
+
+    def _greedy_sample_draft(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int | None = None,
+    ) -> torch.Tensor:
+        if self.use_local_argmax_reduction:
+            return self._get_top_tokens(hidden_states, spec_step_idx)
+        logits = self._compute_draft_logits(hidden_states, spec_step_idx)
         return logits.argmax(dim=-1)
 
     def sample_draft(
@@ -299,9 +321,10 @@ class DraftModelSpeculator(BaseSpeculator):
         seeds: torch.Tensor,
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
+        spec_step_idx: int | None = None,
     ) -> torch.Tensor:
         if draft_logits is not None:
-            logits = self.model.compute_logits(hidden_states)
+            logits = self._compute_draft_logits(hidden_states, spec_step_idx)
             # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
             # used for draft and target sampling.
             return gumbel_sample(
@@ -315,7 +338,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 output_processed_logits_col=draft_step,
                 use_fp64=self.use_fp64_gumbel,
             )
-        return self._greedy_sample_draft(hidden_states)
+        return self._greedy_sample_draft(hidden_states, spec_step_idx)
 
     def _copy_request_inputs(
         self,

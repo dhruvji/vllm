@@ -904,7 +904,11 @@ class SpeculativeConfig:
                     if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
-                        not in ("step3p5_mtp", "inkling_mtp")
+                        not in (
+                            "step3p5_mtp",
+                            "inkling_mtp",
+                            "glm5_next_mtp",
+                        )
                     ):
                         logger.warning(
                             "Enabling num_speculative_tokens > 1 will run "

@@ -12,6 +12,11 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 class MTPSpeculator(AutoRegressiveSpeculator):
     share_mtp_topk_indices: bool = False
 
+    def _get_spec_step_idx(self, draft_step: int) -> int | None:
+        if not getattr(self.model, "supports_spec_step_idx", False):
+            return None
+        return draft_step % self.model.num_mtp_layers
+
     def load_draft_model(
         self,
         target_model: nn.Module,
