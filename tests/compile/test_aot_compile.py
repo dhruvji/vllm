@@ -19,10 +19,14 @@ from vllm.compilation.caching import (
     VllmSerializableFunction,
 )
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.decorators import support_torch_compile
+from vllm.compilation.decorators import (
+    _configure_aot_compile_cache,
+    support_torch_compile,
+)
 from vllm.config import (
     CompilationConfig,
     CompilationMode,
+    DeviceConfig,
     VllmConfig,
     set_current_vllm_config,
 )
@@ -90,6 +94,31 @@ def make_vllm_config() -> VllmConfig:
 def use_vllm_config(vllm_config: VllmConfig):
     with set_forward_context({}, vllm_config), set_current_vllm_config(vllm_config):
         yield
+
+
+@pytest.mark.skipif(not is_torch_equal_or_newer("2.10.0"), reason="requires torch 2.10")
+@pytest.mark.parametrize("dp_rank", [0, 3])
+def test_aot_compiler_caches_are_data_parallel_rank_local(
+    monkeypatch: pytest.MonkeyPatch, dp_rank: int
+):
+    with tempfile.TemporaryDirectory() as tmpdirname, monkeypatch.context() as m:
+        m.setenv("VLLM_CACHE_ROOT", tmpdirname)
+        m.setenv("VLLM_USE_AOT_COMPILE", "1")
+        m.setenv("VLLM_USE_MEGA_AOT_ARTIFACT", "1")
+        m.setenv("VLLM_USE_STANDALONE_COMPILE", "1")
+        m.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+        m.delenv("TRITON_CACHE_DIR", raising=False)
+        vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+        vllm_config.parallel_config.data_parallel_index = dp_rank
+        model_path = _configure_aot_compile_cache(vllm_config, tmpdirname)
+
+        rank_cache_dir = Path(vllm_config.compilation_config.local_cache_dir).resolve()
+        assert rank_cache_dir.name == f"rank_0_{dp_rank}"
+        assert Path(model_path).resolve().parent == rank_cache_dir
+        assert Path(os.environ["TORCHINDUCTOR_CACHE_DIR"]).resolve().parent == (
+            rank_cache_dir
+        )
+        assert Path(os.environ["TRITON_CACHE_DIR"]).resolve().parent == rank_cache_dir
 
 
 @pytest.mark.skipif(not is_torch_equal_or_newer("2.10.0"), reason="requires torch 2.10")
