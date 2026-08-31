@@ -16,7 +16,7 @@ CONCURRENCY = 64
 ROOT = Path(__file__).parent
 
 
-def read_series(input_path: Path, model: str) -> list[dict[str, object]]:
+def read_series(input_path: Path, model: str, mode: str) -> list[dict[str, object]]:
     rows = [json.loads(line) for line in input_path.read_text().splitlines() if line]
     rows = [
         row
@@ -44,6 +44,7 @@ def read_series(input_path: Path, model: str) -> list[dict[str, object]]:
     return [
         {
             "request_model": model,
+            "mode": mode,
             "sequence_length": length,
             "median_output_tokens_per_second": round(
                 statistics.median(grouped[length]), 2
@@ -57,10 +58,25 @@ def read_series(input_path: Path, model: str) -> list[dict[str, object]]:
 
 def main() -> None:
     summary = [
-        *read_series(ROOT / "glm-3f712-ep8-mtp5-base.jsonl", "glm-5.3-flash"),
+        *read_series(
+            ROOT / "glm-3f712-ep8-mtp5-base.jsonl",
+            "glm-5.3-flash",
+            "MTP5",
+        ),
         *read_series(
             ROOT / "glm-3f712-ep8-mtp5-step0-lora.jsonl",
             "step0-lora-r32",
+            "MTP5",
+        ),
+        *read_series(
+            ROOT / "glm-3f712-ep8-no-mtp-base.jsonl",
+            "glm-5.3-flash",
+            "no MTP",
+        ),
+        *read_series(
+            ROOT / "glm-3f712-ep8-no-mtp-step0-lora.jsonl",
+            "step0-lora-r32",
+            "no MTP",
         ),
     ]
 
@@ -72,23 +88,45 @@ def main() -> None:
         writer.writerows(summary)
 
     plt.figure(figsize=(9, 5.5))
-    for model, label, color, linestyle, marker in (
+    for model, mode, label, color, linestyle, marker in (
         (
             "glm-5.3-flash",
-            "Normal model (LoRA disabled)",
+            "MTP5",
+            "Normal model, MTP5",
             "tab:blue",
             "-",
             "o",
         ),
         (
+            "glm-5.3-flash",
+            "no MTP",
+            "Normal model, no MTP",
+            "tab:blue",
+            "--",
+            "o",
+        ),
+        (
             "step0-lora-r32",
-            "Step-0 rank-32 attention LoRA",
+            "MTP5",
+            "Step-0 attention LoRA, MTP5",
+            "tab:red",
+            "-",
+            "s",
+        ),
+        (
+            "step0-lora-r32",
+            "no MTP",
+            "Step-0 attention LoRA, no MTP",
             "tab:red",
             "--",
             "s",
         ),
     ):
-        model_rows = [row for row in summary if row["request_model"] == model]
+        model_rows = [
+            row
+            for row in summary
+            if row["request_model"] == model and row["mode"] == mode
+        ]
         plt.plot(
             [row["sequence_length"] for row in model_rows],
             [row["median_output_tokens_per_second"] for row in model_rows],

@@ -6,6 +6,7 @@ artifact_file=${2:?artifact file is required}
 lengths=${BENCH_LENGTHS:-128 256 512 1024 2048 4096 8192}
 repeats=${BENCH_REPEATS:-2}
 warmup_length=${BENCH_WARMUP_LENGTH:-1024}
+lora_only=${BENCH_LORA_ONLY:-0}
 readonly concurrency=64
 base_model=glm-5.3-flash
 lora_model=step0-lora-r32
@@ -14,6 +15,7 @@ smoke_file=${artifact_file%.jsonl}-smoke.json
 install -d -m 0755 "$(dirname "$artifact_file")"
 test ! -e "$artifact_file"
 test ! -e "$smoke_file"
+test "$lora_only" = 0 || test "$lora_only" = 1
 curl -fsS "$endpoint/health" >/dev/null
 models=$(curl -fsS "$endpoint/v1/models")
 jq -e --arg model "$base_model" '.data | any(.id == $model)' <<<"$models" >/dev/null
@@ -113,19 +115,30 @@ run_once() {
     test "$total_tokens" -eq $((concurrency * sequence_length))
 }
 
-run_once "$base_model" "$warmup_length" 0 warmup-base
-run_once "$lora_model" "$warmup_length" 0 warmup-step0-lora
-for sequence_length in $lengths; do
-    for repeat in $(seq 1 "$repeats"); do
-        if test "$((repeat % 2))" -eq 1; then
-            run_once "$base_model" "$sequence_length" "$repeat" measured-base
+if test "$lora_only" = 1; then
+    run_once "$lora_model" "$warmup_length" 0 warmup-step0-lora
+    for sequence_length in $lengths; do
+        for repeat in $(seq 1 "$repeats"); do
             run_once "$lora_model" "$sequence_length" "$repeat" measured-step0-lora
-        else
-            run_once "$lora_model" "$sequence_length" "$repeat" measured-step0-lora
-            run_once "$base_model" "$sequence_length" "$repeat" measured-base
-        fi
+        done
     done
-done
+else
+    run_once "$base_model" "$warmup_length" 0 warmup-base
+    run_once "$lora_model" "$warmup_length" 0 warmup-step0-lora
+    for sequence_length in $lengths; do
+        for repeat in $(seq 1 "$repeats"); do
+            if test "$((repeat % 2))" -eq 1; then
+                run_once "$base_model" "$sequence_length" "$repeat" measured-base
+                run_once "$lora_model" "$sequence_length" "$repeat" \
+                    measured-step0-lora
+            else
+                run_once "$lora_model" "$sequence_length" "$repeat" \
+                    measured-step0-lora
+                run_once "$base_model" "$sequence_length" "$repeat" measured-base
+            fi
+        done
+    done
+fi
 
 curl -fsS "$endpoint/health" >/dev/null
 sha256sum "$artifact_file" "$smoke_file"
