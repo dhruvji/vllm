@@ -381,8 +381,11 @@ class CudaPlatformBase(Platform):
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
                 )
-            except ImportError:
-                invalid_reasons_i = ["ImportError"]
+            except (ImportError, OSError) as e:
+                logger.debug(
+                    "Attention backend %s is unavailable", backend.name, exc_info=True
+                )
+                invalid_reasons_i = [f"{type(e).__name__}: {e}"]
             if invalid_reasons_i:
                 invalid_reasons[backend] = (priority, invalid_reasons_i)
             else:
@@ -403,8 +406,13 @@ class CudaPlatformBase(Platform):
 
         # kpool paged-MQA indexer: the storage block (block_size /
         # index_kpool) is virtually split into pool pages, so block_size
-        # must be a multiple of index_kpool * min(PAGED_MQA_PAGE_SIZES).
-        return index_kpool * min(PAGED_MQA_PAGE_SIZES)
+        # must be a multiple of index_kpool times a legal pool page.
+        page = min(PAGED_MQA_PAGE_SIZES)
+        if cls.is_device_capability_family(120):
+            # The SM120 DeepGEMM paged-MQA kernel only accepts a 64-token
+            # fp8 indexer page.
+            page = max(PAGED_MQA_PAGE_SIZES)
+        return index_kpool * page
 
     @classmethod
     def get_attn_backend_cls(
@@ -424,8 +432,11 @@ class CudaPlatformBase(Platform):
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
                 )
-            except ImportError:
-                invalid_reasons = ["ImportError"]
+            except (ImportError, OSError) as e:
+                raise ValueError(
+                    f"Selected backend {selected_backend} is not valid for "
+                    f"this configuration. Reason: [{type(e).__name__}: {e}]"
+                ) from e
             if invalid_reasons:
                 raise ValueError(
                     f"Selected backend {selected_backend} is not valid for "

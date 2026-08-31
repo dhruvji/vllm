@@ -41,8 +41,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   4: Add KV block lease renewal through heartbeats
 #   5: Add remote_blocks_expiry_time to kv_transfer_params + handshake
 #      clock-sync timestamp
+#   6: Register compressed MLA rows as dense virtual transfer pages
 #
-NIXL_CONNECTOR_VERSION: int = 5
+NIXL_CONNECTOR_VERSION: int = 6
 
 
 @dataclass

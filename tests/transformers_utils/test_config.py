@@ -60,6 +60,31 @@ def test_glm5_next_accepts_prebuilt_subconfigs():
     assert config.vision_config is vision_config
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "option"),
+    [
+        (
+            {"index_topk": 2048, "index_dsa_use_layernorm": False},
+            "index_dsa_use_layernorm",
+        ),
+        (
+            {"index_topk": 2048, "index_kpool_compress": False},
+            "index_kpool_compress",
+        ),
+        (
+            {"index_topk": 2048, "index_kpool_always_select_tail": False},
+            "index_kpool_always_select_tail",
+        ),
+        ({"hres_vwnstyle": False}, "hres_vwnstyle"),
+        ({"mhc_no_norm_weight": True}, "mhc_no_norm_weight"),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_glm5_next_rejects_unimplemented_config_options(kwargs, option):
+    with pytest.raises(NotImplementedError, match=option):
+        Glm5NextTextConfig(**kwargs)
+
+
 def test_get_llama3_eos_token():
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
 

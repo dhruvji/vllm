@@ -260,12 +260,23 @@ def test_reshape_packed_kpool_tail_uses_storage_backend_shape(monkeypatch):
     assert runner_kv_cache.storage_offset() == offset // 2
 
 
-class WidthAwareMetadataBuilder:
+class WidthAwareMetadataBuilder(AttentionMetadataBuilder):
     requires_block_table_width = True
 
-    def __init__(self, *args, block_table_width: int, **kwargs):
-        self.kv_cache_spec = args[0]
+    def __init__(
+        self,
+        kv_cache_spec,
+        layer_names,
+        vllm_config,
+        device,
+        *,
+        block_table_width: int,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_table_width = block_table_width
+
+    def build(self, *args, **kwargs):
+        raise NotImplementedError
 
 
 class WidthAwareBackend:

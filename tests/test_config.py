@@ -89,6 +89,24 @@ def test_hybrid_mla_mamba_block_size_preserves_kernel_alignment(monkeypatch):
     assert cache_config.mamba_block_size == 128
 
 
+@pytest.mark.skip_global_cleanup
+def test_sm120_kpool_alignment_uses_64_token_pool_pages(monkeypatch):
+    from vllm.platforms.cuda import CudaPlatform
+
+    monkeypatch.setattr(
+        CudaPlatform,
+        "is_device_capability_family",
+        classmethod(lambda _cls, capability: capability == 120),
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_kpool=4),
+        )
+    )
+
+    assert CudaPlatform._get_indexer_block_alignment(config) == 256
+
+
 @pytest.mark.parametrize(
     "architecture",
     [

@@ -70,6 +70,8 @@ from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KpoolTailSpec,
+    KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -83,6 +85,46 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
+
+
+def _tensor_byte_span_end(cache: torch.Tensor) -> int:
+    """Return the exclusive end address touched by a nonnegative-stride view."""
+    if cache.numel() == 0:
+        return cache.data_ptr()
+    if any(stride < 0 for stride in cache.stride()):
+        raise ValueError("NIXL cache views must have nonnegative strides")
+    max_element_offset = sum(
+        (size - 1) * stride for size, stride in zip(cache.shape, cache.stride())
+    )
+    return cache.data_ptr() + (max_element_offset + 1) * cache.element_size()
+
+
+def _uses_dense_virtual_transfer_pages(
+    layer_spec: KVCacheSpec,
+    cache: torch.Tensor,
+    physical_page_size: int,
+    num_blocks: int,
+) -> bool:
+    """Return whether a compressed kernel view can split into NIXL pages."""
+    if not (
+        isinstance(layer_spec, MLAAttentionSpec)
+        and layer_spec.tokens_per_state > 1
+        and cache.ndim == 4
+        and cache.shape[1] == 1
+        and cache.is_contiguous()
+        and physical_page_size > 0
+        and layer_spec.state_content_size_bytes > 0
+    ):
+        return False
+
+    block_stride = cache.stride(0) * cache.element_size()
+    return (
+        block_stride > physical_page_size
+        and block_stride % physical_page_size == 0
+        and physical_page_size % layer_spec.state_content_size_bytes == 0
+        and cache.shape[0] * (block_stride // physical_page_size) == num_blocks
+        and cache.nbytes == num_blocks * physical_page_size
+    )
 
 
 class NixlBaseConnectorWorker:
@@ -1089,12 +1131,41 @@ class NixlBaseConnectorWorker:
         self._mamba_region_indices = []
         tensor_size_bytes = None
 
+        layer_specs: dict[str, KVCacheSpec] = {}
+        compressed_region_owners: dict[int, torch.Tensor] = {}
+        for layer_name, cache_or_caches in xfer_buffers.items():
+            layer_spec = self._layer_specs.get(layer_name)
+            if isinstance(layer_spec, UniformTypeKVCacheSpecs):
+                layer_spec = layer_spec.kv_cache_specs[layer_name]
+            if layer_spec is None:
+                continue
+            layer_specs[layer_name] = layer_spec
+            if not isinstance(cache_or_caches, torch.Tensor):
+                continue
+            physical_page_size = (
+                layer_spec.page_size_bytes
+                if isinstance(layer_spec, MambaSpec)
+                else layer_spec.page_size_bytes
+                // self._physical_blocks_per_logical_kv_block
+            )
+            num_blocks = (
+                self._logical_num_blocks
+                if isinstance(layer_spec, MambaSpec)
+                else self.num_blocks
+            )
+            if _uses_dense_virtual_transfer_pages(
+                layer_spec, cache_or_caches, physical_page_size, num_blocks
+            ):
+                compressed_region_owners.setdefault(
+                    cache_or_caches.data_ptr(), cache_or_caches
+                )
+
         for layer_name, cache_or_caches in xfer_buffers.items():
             # NOTE (NickLucche) Hybrid SSM mamba/FA physical page_size may differ when
             # kernel requires a specific block size. This leads to SSM and FA layers
             # having different num_blocks.
             # `_physical_blocks_per_logical_kv_block` ratio is used to adjust for this.
-            layer_spec = self._layer_specs.get(layer_name)
+            layer_spec = layer_specs.get(layer_name)
             if layer_spec is None:
                 logger.debug(
                     "Skipping layer %s as no KVCache spec is present. "
@@ -1102,9 +1173,35 @@ class NixlBaseConnectorWorker:
                     layer_name,
                 )
                 continue
-            if isinstance(layer_spec, UniformTypeKVCacheSpecs):
-                # MLA DSv32 Indexer case: UniformTypeKVCacheSpecs merges kv_cache_specs
-                layer_spec = layer_spec.kv_cache_specs[layer_name]
+            if isinstance(layer_spec, KpoolTailSpec):
+                assert isinstance(cache_or_caches, torch.Tensor)
+                compressed_owner = compressed_region_owners.get(
+                    cache_or_caches.data_ptr()
+                )
+                if compressed_owner is not None:
+                    owner_storage = compressed_owner.untyped_storage()
+                    tail_storage = cache_or_caches.untyped_storage()
+                    owner_end = compressed_owner.data_ptr() + compressed_owner.nbytes
+                    tail_is_covered = (
+                        compressed_owner.is_contiguous()
+                        and owner_storage.data_ptr() == tail_storage.data_ptr()
+                        and _tensor_byte_span_end(cache_or_caches) <= owner_end
+                    )
+                    if not tail_is_covered:
+                        raise AssertionError(
+                            "Kpool tail cache is not fully covered by its compressed "
+                            f"indexer region: layer={layer_name}, "
+                            f"tail_shape={tuple(cache_or_caches.shape)}, "
+                            f"tail_stride={tuple(cache_or_caches.stride())}, "
+                            f"owner_shape={tuple(compressed_owner.shape)}, "
+                            f"owner_stride={tuple(compressed_owner.stride())}"
+                        )
+                    logger.debug(
+                        "Skipping layer %s because its compressed indexer region "
+                        "covers the same storage",
+                        layer_name,
+                    )
+                    continue
             cache_list = self.transfer_topo.get_transfer_cache_regions(
                 cache_or_caches, layer_spec
             )
@@ -1133,6 +1230,9 @@ class NixlBaseConnectorWorker:
             curr_tensor_size_bytes = num_blocks * physical_page_size
 
             for cache in cache_list:
+                virtual_transfer_pages = _uses_dense_virtual_transfer_pages(
+                    layer_spec, cache, physical_page_size, num_blocks
+                )
                 base_addr = cache.data_ptr()
                 if base_addr in seen_base_addresses:
                     idx = seen_base_addresses.index(base_addr)
@@ -1176,6 +1276,7 @@ class NixlBaseConnectorWorker:
                 if (
                     self._physical_blocks_per_logical_kv_block == 1
                     and cache.shape[0] != num_blocks
+                    and not virtual_transfer_pages
                 ):
                     raise AssertionError(
                         "All kv cache tensors must have the same number of "

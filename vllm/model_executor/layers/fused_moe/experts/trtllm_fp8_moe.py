@@ -238,6 +238,9 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             hidden_states_scale=hidden_states_scale,
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale,
+            gemm1_alpha=self.gemm1_alpha,
+            gemm1_beta=self.gemm1_beta,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale,
             num_experts=global_num_experts,
@@ -255,10 +258,6 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             output=output,
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
         )
-        if is_mxfp8:
-            kwargs["gemm1_alpha"] = self.gemm1_alpha
-            kwargs["gemm1_beta"] = self.gemm1_beta
-            kwargs["gemm1_clamp_limit"] = self.gemm1_clamp_limit
         flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(**kwargs)
 
 
@@ -412,6 +411,9 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             hidden_states_scale=hidden_states_scale,
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale,
+            gemm1_alpha=self.gemm1_alpha,
+            gemm1_beta=self.gemm1_beta,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale,
             num_experts=global_num_experts,
@@ -428,10 +430,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             fp8_quantization_type=fp8_quant_type,
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
         )
-        if is_mxfp8:
-            kwargs["gemm1_alpha"] = self.gemm1_alpha
-            kwargs["gemm1_beta"] = self.gemm1_beta
-            kwargs["gemm1_clamp_limit"] = self.gemm1_clamp_limit
         if is_mxfp8 or activation == MoEActivation.RELU2_NO_MUL:
             kwargs["activation_type"] = activation_type
         return flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
