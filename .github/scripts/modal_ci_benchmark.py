@@ -75,8 +75,8 @@ except ModuleNotFoundError:
     }
     TORCH_PACKAGES = ("torch==2.11.0+cu130", "torchvision==0.26.0+cu130")
     FLASHINFER_PACKAGES = (
-        "flashinfer-python==0.6.14",
-        "flashinfer-cubin==0.6.14",
+        "flashinfer-python==0.6.18",
+        "flashinfer-cubin==0.6.18",
     )
 
     def get_commit_hash() -> str | None:
