@@ -1,0 +1,15 @@
+request_model,sequence_length,median_output_tokens_per_second,min_output_tokens_per_second,max_output_tokens_per_second
+glm-5.3-flash,128,6063.93,5335.57,6792.28
+glm-5.3-flash,256,6480.97,6328.11,6633.82
+glm-5.3-flash,512,6602.37,6378.91,6825.84
+glm-5.3-flash,1024,6993.94,6985.47,7002.41
+glm-5.3-flash,2048,6690.6,6651.56,6729.65
+glm-5.3-flash,4096,7056.03,7024.95,7087.1
+glm-5.3-flash,8192,7280.48,7146.83,7414.13
+step0-lora-r32,128,562.67,559.82,565.52
+step0-lora-r32,256,762.63,587.94,937.32
+step0-lora-r32,512,1528.98,1480.11,1577.86
+step0-lora-r32,1024,2228.82,2167.5,2290.14
+step0-lora-r32,2048,2735.8,2687.89,2783.72
+step0-lora-r32,4096,3218.09,3076.97,3359.21
+step0-lora-r32,8192,3719.02,3634.15,3803.88

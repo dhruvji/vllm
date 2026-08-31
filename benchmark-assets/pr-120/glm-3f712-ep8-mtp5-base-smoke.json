@@ -1,0 +1,6 @@
+{
+  "model": "glm-5.3-flash",
+  "dp_rank": 0,
+  "completion_tokens_per_response": 64,
+  "status": "passed"
+}
