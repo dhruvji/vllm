@@ -389,16 +389,20 @@ def test_select_lora_explicit_non_triton_backend():
 
 
 @skipif_not_cuda_rocm
-@pytest.mark.parametrize("is_lora_enabled", [False, True])
-def test_select_explicit_triton_backend(is_lora_enabled):
+def test_select_explicit_triton_backend():
     """Explicit triton backend selection should return Triton."""
     moe_config = make_dummy_moe_config()
-    moe_config.is_lora_enabled = is_lora_enabled
+    moe_config.is_lora_enabled = True
     moe_config.moe_backend = "triton"
 
-    selected_backend, experts_cls = select_unquantized_moe_backend(
-        moe_config=moe_config
-    )
+    with patch(
+        "vllm.model_executor.layers.fused_moe.oracle.unquantized."
+        "_trtllm_bf16_lora_supported",
+        return_value=True,
+    ):
+        selected_backend, experts_cls = select_unquantized_moe_backend(
+            moe_config=moe_config
+        )
 
     assert selected_backend == UnquantizedMoeBackend.TRITON
     assert experts_cls is not None

@@ -208,7 +208,7 @@ def select_unquantized_moe_backend(
     if current_platform.is_out_of_tree():
         return UnquantizedMoeBackend.OOT, None
 
-    if moe_config.is_lora_enabled:
+    if moe_config.is_lora_enabled and moe_config.moe_backend in ["auto", "humming"]:
         if _trtllm_bf16_lora_supported(moe_config):
             from vllm.model_executor.layers.fused_moe.experts.trtllm_lora_moe import (
                 TrtLlmBf16LoRAExperts,
