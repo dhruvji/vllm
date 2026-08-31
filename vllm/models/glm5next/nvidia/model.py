@@ -201,6 +201,11 @@ class Glm5NextMoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             out_dtype=self.router_dtype,
+            # The checkpoint and Hugging Face reference retain GLM's router
+            # weights in FP32.  Preserve that contract so small BF16 residual
+            # differences do not unnecessarily change expert selection.
+            params_dtype=torch.float32,
+            force_fp32_compute=True,
             prefix=f"{prefix}.gate",
         )
         if config.topk_method == "noaux_tc":
