@@ -363,9 +363,14 @@ def test_select_lora_backend_prefers_triton():
     """LoRA-enabled unquantized MoE should select Triton backend."""
     moe_config = make_dummy_moe_config()
     moe_config.is_lora_enabled = True
-    selected_backend, experts_cls = select_unquantized_moe_backend(
-        moe_config=moe_config
-    )
+    with patch(
+        "vllm.model_executor.layers.fused_moe.oracle.unquantized."
+        "_trtllm_bf16_lora_supported",
+        return_value=False,
+    ):
+        selected_backend, experts_cls = select_unquantized_moe_backend(
+            moe_config=moe_config
+        )
 
     assert selected_backend == UnquantizedMoeBackend.TRITON
     assert experts_cls is not None
@@ -380,19 +385,25 @@ def test_select_lora_explicit_non_triton_backend():
     # Use string from mapping in function map_unquantized_backend()
     moe_config.moe_backend = "flashinfer_cutlass"
 
-    selected_backend, experts_cls = select_unquantized_moe_backend(
-        moe_config=moe_config
-    )
+    with patch(
+        "vllm.model_executor.layers.fused_moe.oracle.unquantized."
+        "_trtllm_bf16_lora_supported",
+        return_value=False,
+    ):
+        selected_backend, experts_cls = select_unquantized_moe_backend(
+            moe_config=moe_config
+        )
 
     assert selected_backend == UnquantizedMoeBackend.TRITON
     assert experts_cls is not None
 
 
 @skipif_not_cuda_rocm
-def test_select_explicit_triton_backend():
+@pytest.mark.parametrize("is_lora_enabled", [False, True])
+def test_select_explicit_triton_backend(is_lora_enabled):
     """Explicit triton backend selection should return Triton."""
     moe_config = make_dummy_moe_config()
-    moe_config.is_lora_enabled = True
+    moe_config.is_lora_enabled = is_lora_enabled
     moe_config.moe_backend = "triton"
 
     with patch(
