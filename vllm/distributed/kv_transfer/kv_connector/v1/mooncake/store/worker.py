@@ -1167,7 +1167,11 @@ class MooncakeStoreWorker:
             ChunkedTokenDatabase(
                 dataclasses.replace(self.metadata, group_id=g_idx),
                 g.kv_cache_spec.block_size,
-                hash_block_size=self.hash_block_size,
+                hash_block_size=(
+                    self.hash_block_size
+                    if g.kv_cache_spec.participates_in_prefix_caching
+                    else g.kv_cache_spec.block_size
+                ),
             )
             for g_idx, g in enumerate(self._kv_cache_groups)
         ]

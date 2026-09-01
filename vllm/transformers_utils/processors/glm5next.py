@@ -78,13 +78,21 @@ def glm_sample_frame_indices(
     Request overrides: ``target_fps`` -> fps interval, ``max_frame_count``
     -> frame cap.
     """
+    if total_frames <= 0:
+        return []
+
     max_frame_idx = total_frames - 1
-    if not duration:
-        duration = (round(max_frame_idx / fps) + 1) if fps else 0
     if max_frame_count is None:
         max_frame_count = GLM_VIDEO_DEFAULT_MAX_FRAMES
     if target_fps is None:
         target_fps = GLM_VIDEO_DEFAULT_FPS
+    if target_fps <= 0:
+        raise ValueError("target_fps must be positive")
+
+    if fps <= 0:
+        fps = total_frames / duration if duration > 0 else target_fps
+    if duration <= 0:
+        duration = round(max_frame_idx / fps) + 1
 
     extract_t = int(duration * target_fps)
     extract_t = min(extract_t, int(max_frame_count))

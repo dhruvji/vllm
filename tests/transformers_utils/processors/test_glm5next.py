@@ -340,6 +340,21 @@ def test_glm_sample_frame_indices_short_clip_floor_spread():
     assert glm_sample_frame_indices(7, 30.0, 10.0) == [0, 1, 2, 3, 4, 5, 6, 6]
 
 
+def test_glm_sample_frame_indices_derives_zero_fps_from_duration():
+    expected = glm_sample_frame_indices(30, 30.0, 1.0)
+
+    assert glm_sample_frame_indices(30, 0.0, 1.0) == expected
+
+
+def test_glm_sample_frame_indices_handles_missing_source_timing():
+    indices = glm_sample_frame_indices(30, 0.0, 0.0, max_frame_count=16)
+
+    assert indices == sorted(indices)
+    assert len(indices) % 2 == 0
+    assert len(indices) <= 16
+    assert all(0 <= index < 30 for index in indices)
+
+
 @pytest.mark.parametrize(
     ("kwargs", "expected_len"),
     [

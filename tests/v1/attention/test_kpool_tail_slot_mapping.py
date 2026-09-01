@@ -25,7 +25,7 @@ import pytest
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.attention.backends.mla.indexer import (
+from vllm.v1.attention.backends.mla.kpool_tail import (
     KpoolTailMetadataBuilder,
     compute_kpool_tail_slot_mapping,
 )

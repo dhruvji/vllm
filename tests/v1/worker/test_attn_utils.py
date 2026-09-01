@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from vllm.v1.attention.backend import AttentionMetadataBuilder
-from vllm.v1.attention.backends.mla.indexer import KpoolTailBackend
+from vllm.v1.attention.backends.mla.kpool_tail import KpoolTailBackend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KpoolTailSpec,

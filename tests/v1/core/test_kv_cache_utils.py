@@ -28,6 +28,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.core.glm5_kv_cache import get_glm5_next_tensor_layout
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -2155,10 +2156,34 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
 
     # The layout detector surfaces the sibling names in layer order for the
     # accounting and connector paths.
-    layout = kv_cache_utils._glm5_next_tensor_layout(kv_cache_config.kv_cache_groups)
+    layout = get_glm5_next_tensor_layout(kv_cache_config.kv_cache_groups)
     assert layout is not None
-    assert layout[3] == [f"layers.{4 * i + 3}.indexer" for i in range(11)]
-    assert layout[6] == [f"layers.{4 * i + 3}.tail" for i in range(11)]
+    assert layout.indexer_names == tuple(
+        f"layers.{4 * i + 3}.indexer" for i in range(11)
+    )
+    assert layout.indexer_tail_pairs == tuple(
+        (
+            f"layers.{4 * i + 3}.indexer",
+            f"layers.{4 * i + 3}.tail",
+        )
+        for i in range(11)
+    )
+
+    reordered_groups = [
+        replace(group, layer_names=list(reversed(group.layer_names)))
+        if group is layout.tail_group
+        else group
+        for group in kv_cache_config.kv_cache_groups
+    ]
+    reordered_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, reordered_groups, bytes_per_block * 100 + 1
+    )
+    reordered_tensors = _tensor_by_layer(reordered_config)
+    for indexer_name, tail_name in layout.indexer_tail_pairs:
+        assert (
+            reordered_tensors[indexer_name].offset
+            == reordered_tensors[tail_name].offset
+        )
 
     # Accounting charges exactly one extra shared block per request for the
     # tail, not a per-sequence allocation.
@@ -2378,7 +2403,7 @@ def test_get_kv_cache_config_mamba_hybrid_sharing_pp_group_count_bump(monkeypatc
         projected = kv_cache_utils._project_kv_cache_groups_to_worker(
             groups, worker_spec
         )
-        assert kv_cache_utils._glm5_next_tensor_layout(projected) is not None
+        assert get_glm5_next_tensor_layout(projected) is not None
 
 
 @pytest.mark.skip_global_cleanup

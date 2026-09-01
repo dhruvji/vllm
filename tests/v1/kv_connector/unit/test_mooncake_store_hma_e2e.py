@@ -8,6 +8,7 @@ import threading
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
@@ -29,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
@@ -139,6 +141,33 @@ def _build_worker_with_dict_store(vllm_config, kv_cache_config, store):
                 vllm_config, kv_cache_config=kv_cache_config
             )
     return worker
+
+
+@pytest.mark.skip_global_cleanup
+def test_worker_uses_group_block_size_for_non_prefix_cache():
+    full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
+    tail = KpoolTailSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=None,
+        sliding_window=4,
+    )
+    cfg = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attention"], full),
+            KVCacheGroupSpec(["kpool_tail"], tail),
+        ],
+    )
+    vllm_config = _minimal_vllm_config(cache_block_size=16)
+    vllm_config.cache_config.prefix_match_unit = 8
+
+    worker = _build_worker_with_dict_store(vllm_config, cfg, _DictStore())
+
+    assert worker.token_dbs[0].hash_block_size == 8
+    assert worker.token_dbs[1].hash_block_size == 4
 
 
 def test_e2e_swa_plus_full_save_then_lookup_hits():

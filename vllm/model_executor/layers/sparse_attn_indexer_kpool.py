@@ -28,11 +28,11 @@ from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
     _resolve_layer_name,
-    direct_register_custom_op,
 )
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
+from vllm.v1.attention.backends.mla.kpool_tail import KpoolTailMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -177,6 +177,29 @@ def _decode_topk_seq_lens(
     return padded.reshape(n) + 1  # pad rows: -1 + 1 = 0 -> empty tail
 
 
+def _fill_causal_indices(rows: torch.Tensor, positions: torch.Tensor) -> None:
+    causal_range = torch.arange(rows.shape[1], device=rows.device, dtype=torch.int32)
+    positions = positions.to(torch.int32)
+    rows[:] = causal_range[None, :]
+    rows[causal_range[None, :] > positions[:, None]] = -1
+
+
+def _fill_short_decode_causal_indices(
+    topk_indices_buffer: torch.Tensor,
+    positions: torch.Tensor | None,
+    num_decode_tokens: int,
+    max_seq_len: int,
+    topk_tokens: int,
+) -> bool:
+    """Fill exact causal rows when sparse decode would select every token."""
+    if positions is None or positions.numel() == 0 or max_seq_len > topk_tokens:
+        return False
+    _fill_causal_indices(
+        topk_indices_buffer[:num_decode_tokens], positions[:num_decode_tokens]
+    )
+    return True
+
+
 def _gather_workspace_shapes(
     total_seq_lens: int,
     head_dim: int,
@@ -290,24 +313,7 @@ def sparse_attn_indexer_kpool(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
         )
 
-        return sparse_attn_indexer_kpool_fake(
-            hidden_states,
-            k_cache_prefix,
-            kv_cache,
-            q_quant,
-            q_scale,
-            k,
-            weights,
-            quant_block_size,
-            scale_fmt,
-            topk_tokens,
-            head_dim,
-            max_model_len,
-            total_seq_lens,
-            topk_indices_buffer,
-            skip_k_cache_insert,
-            use_fp4_cache,
-        )
+        return topk_indices_buffer
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
     slot_mapping = attn_metadata_narrowed.slot_mapping
@@ -345,7 +351,7 @@ def sparse_attn_indexer_kpool(
                 assert positions is not None
                 assert tail_kv_cache is not None and tail_prefix is not None
                 tail_meta = attn_metadata.get(_resolve_layer_name(tail_prefix))
-                assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
+                assert isinstance(tail_meta, KpoolTailMetadata)
                 _kpool_compress_insert(
                     k[prefill_slice],
                     gate_score[prefill_slice],
@@ -623,7 +629,7 @@ def sparse_attn_indexer_kpool(
             # dec_slot / dec_pos, so the kernel gets each request's current-token
             # tail slot (block * kpool + pos % kpool).
             if tail_meta is not None:
-                assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
+                assert isinstance(tail_meta, KpoolTailMetadata)
             if tail_meta is None or tail_kv_cache is None:
                 dec_tail_slot = None
             elif not use_uniform:
@@ -659,6 +665,14 @@ def sparse_attn_indexer_kpool(
                     head_dim,
                     round_scale=(scale_fmt is not None),
                 )
+        if current_platform.is_cuda_alike() and _fill_short_decode_causal_indices(
+            topk_indices_buffer,
+            positions,
+            num_decode_tokens,
+            attn_metadata_narrowed.max_seq_len,
+            topk_tokens,
+        ):
+            return topk_indices_buffer
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
             # Padding also covers short chunked prefills classified as decode.
@@ -795,47 +809,6 @@ def sparse_attn_indexer_kpool(
     return topk_indices_buffer
 
 
-def sparse_attn_indexer_kpool_fake(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: LayerNameType,
-    kv_cache: torch.Tensor,
-    q_quant: torch.Tensor,
-    q_scale: torch.Tensor | None,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    quant_block_size: int,
-    scale_fmt: str | None,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor | None,
-    skip_k_cache_insert: bool,
-    use_fp4_cache: bool = False,
-    gate_score: torch.Tensor | None = None,
-    compress_ape: torch.Tensor | None = None,
-    index_kpool: int = 1,
-    positions: torch.Tensor | None = None,
-    tail_kv_cache: torch.Tensor | None = None,
-    tail_prefix: str | None = None,
-) -> torch.Tensor:
-    return topk_indices_buffer
-
-
-direct_register_custom_op(
-    op_name="sparse_attn_indexer_kpool",
-    op_func=sparse_attn_indexer_kpool,
-    # The indexer writes the index-K cache in place (prefill k-cache insert +
-    # kpool decode write), so kv_cache must be declared as mutated — otherwise
-    # under full-graph compile dynamo assumes it is unchanged across the
-    # indexer→MLA boundary and the MLA reads stale/misaligned KV. The paged tail
-    # cache is likewise written in place (prefill tail scatter + decode stash).
-    mutates_args=["topk_indices_buffer", "kv_cache", "tail_kv_cache"],
-    fake_impl=sparse_attn_indexer_kpool_fake,
-    dispatch_key=current_platform.dispatch_key,
-)
-
-
 @CustomOp.register("sparse_attn_indexer_kpool")
 class SparseAttnIndexerKpool(CustomOp):
     """Sparse Attention Indexer Custom Op Layer. This layer is extracted as a
@@ -929,9 +902,9 @@ class SparseAttnIndexerKpool(CustomOp):
             q_values, q_scale = q_quant
         else:
             q_values, q_scale = q_quant, None
-        return torch.ops.vllm.sparse_attn_indexer_kpool(
+        return sparse_attn_indexer_kpool(
             hidden_states,
-            _encode_layer_name(self.k_cache.prefix),
+            self.k_cache.prefix,
             self.k_cache.kv_cache,
             q_values,
             q_scale,
