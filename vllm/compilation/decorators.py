@@ -50,6 +50,25 @@ IGNORE_COMPILE_KEY = "_ignore_compile_vllm"
 _T = TypeVar("_T", bound=nn.Module)
 
 
+def _configure_aot_compile_cache(vllm_config: VllmConfig, cache_dir: str) -> str:
+    rank = vllm_config.parallel_config.rank
+    dp_rank = vllm_config.parallel_config.data_parallel_index
+    rank_cache_dir = os.path.join(cache_dir, f"rank_{rank}_{dp_rank}")
+    vllm_config.compilation_config.local_cache_dir = rank_cache_dir
+
+    # Each DP engine is a separate process. Keep its writable compiler state
+    # isolated while preserving stable cache reuse for the same rank.
+    inductor_cache = os.path.join(rank_cache_dir, "inductor_cache")
+    os.makedirs(inductor_cache, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
+
+    triton_cache = os.path.join(rank_cache_dir, "triton_cache")
+    os.makedirs(triton_cache, exist_ok=True)
+    os.environ["TRITON_CACHE_DIR"] = triton_cache
+
+    return os.path.join(rank_cache_dir, "model")
+
+
 def should_torch_compile_mm_encoder(vllm_config: VllmConfig) -> bool:
     """Callable to be passed to `@support_torch_compile`'s `enable_if` argument."""
     return vllm_config.compilation_config.compile_mm_encoder
@@ -547,20 +566,9 @@ def _support_torch_compile(
                 hash_key,
             )
 
-            # Hash-level dir; shared across ranks on the same node.
-            self.compilation_config.local_cache_dir = cache_dir
-            inductor_cache = os.path.join(cache_dir, "inductor_cache")
-            os.makedirs(inductor_cache, exist_ok=True)
-            # Process-wide: post-load execution, CUDA-graph capture, and later
-            # autotune/recompile all need to write under {hash}/inductor_cache/.
-            # Unconditional because torch's cache_dir() may have pre-filled the
-            # /tmp default during import, making setdefault a no-op.
-            os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
-
-            rank = self.vllm_config.parallel_config.rank
-            dp_rank = self.vllm_config.parallel_config.data_parallel_index
-            cache_dir = os.path.join(cache_dir, f"rank_{rank}_{dp_rank}")
-            aot_compilation_path = os.path.join(cache_dir, "model")
+            aot_compilation_path = _configure_aot_compile_cache(
+                self.vllm_config, cache_dir
+            )
             if not envs.VLLM_DISABLE_COMPILE_CACHE:
                 loaded_fn = _try_load_aot_compiled_fn(self, aot_compilation_path)
                 if loaded_fn is not None:
