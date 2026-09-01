@@ -454,6 +454,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         enable_kv_event: bool = False,
         replicate_config: Any = None,
         record_operation: Callable[..., None] | None = None,
+        group_participates: Sequence[bool] | None = None,
     ):
         super().__init__(
             store,
@@ -467,6 +468,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.put_step = put_step
         self.coord = coord
         self.kv_role = kv_role
+        self.group_participates = (
+            list(group_participates)
+            if group_participates is not None
+            else [True] * len(token_databases)
+        )
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
         self.enable_kv_event = enable_kv_event
         # Caller always passes a non-None ReplicateConfig — see
@@ -567,6 +573,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             kv_event_block_hashes: list[BlockHash] = []
             group_indices: list[int] = []
             for g_idx, db in enumerate(self.token_databases):
+                if (
+                    not self.group_participates[g_idx]
+                    or db.block_size < self.block_size
+                ):
+                    continue
                 # Rotate the stride phase per group to balance load across ranks.
                 put_step_rank = (self.tp_rank + g_idx) % self.put_step
                 for start, end, block_hash in db.process_tokens(
@@ -752,6 +763,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         disk_offload_buffer_budget_bytes: int | None = None,
         record_operation: Callable[..., None] | None = None,
         request_queue: queue.Queue[Any] | None = None,
+        group_participates: Sequence[bool] | None = None,
     ):
         super().__init__(
             store,
@@ -762,6 +774,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             name="KVCacheStoreRecvingThread",
             record_operation=record_operation,
             request_queue=request_queue,
+        )
+        self.group_participates = (
+            list(group_participates)
+            if group_participates is not None
+            else [True] * len(token_databases)
         )
         # _invalid_block_ids can be access by both the Worker and RecvingThread
         self._invalid_block_ids_lock = threading.Lock()
@@ -804,6 +821,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         key_list: list[str] = []
         block_id_list: list[int] = []
         for g_idx, db in enumerate(self.token_databases):
+            if not self.group_participates[g_idx]:
+                continue
             mask = load_mask_per_group[g_idx]
             for start, end, block_hash in db.process_tokens(
                 token_len, req_meta.block_hashes, mask_num
@@ -1148,7 +1167,11 @@ class MooncakeStoreWorker:
             ChunkedTokenDatabase(
                 dataclasses.replace(self.metadata, group_id=g_idx),
                 g.kv_cache_spec.block_size,
-                hash_block_size=self.hash_block_size,
+                hash_block_size=(
+                    self.hash_block_size
+                    if g.kv_cache_spec.participates_in_prefix_caching
+                    else g.kv_cache_spec.block_size
+                ),
             )
             for g_idx, g in enumerate(self._kv_cache_groups)
         ]
@@ -1290,6 +1313,10 @@ class MooncakeStoreWorker:
                 self.enable_kv_events,
                 self.store_replicate_config,
                 record_operation=self._record_kv_connector_operation,
+                group_participates=[
+                    group.kv_cache_spec.participates_in_prefix_caching
+                    for group in self._kv_cache_groups
+                ],
             )
             self.kv_send_thread.start()
 
@@ -1307,6 +1334,10 @@ class MooncakeStoreWorker:
                 disk_offload_buffer_budget_bytes=self.disk_offload_buffer_budget_bytes,
                 record_operation=self._record_kv_connector_operation,
                 request_queue=self.recv_request_queue,
+                group_participates=[
+                    group.kv_cache_spec.participates_in_prefix_caching
+                    for group in self._kv_cache_groups
+                ],
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
@@ -1468,6 +1499,13 @@ class MooncakeStoreWorker:
         candidate_meta: list[tuple[int, bytes]] = []
         lookup_masks = self.coord.lookup_mask(token_len)
         for g_idx, db in enumerate(self.token_dbs):
+            if (
+                not self._kv_cache_groups[
+                    g_idx
+                ].kv_cache_spec.participates_in_prefix_caching
+                or db.block_size < self.block_size
+            ):
+                continue
             spec_block_size = db.block_size
             lookup_mask = lookup_masks[g_idx]
             key_prefixes = self._lookup_key_prefixes[g_idx]

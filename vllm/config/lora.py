@@ -84,6 +84,10 @@ class LoRAConfig:
     experts (stored once with expert-dim 1) instead of per-expert. The shared
     factors are broadcast to the expert count at kernel time. Only meaningful for
     MoE models whose adapters use this layout; ignored otherwise."""
+    enable_structural_experts: bool = False
+    """Enable request-scoped full structural experts carried in LoRA slots.
+    This currently targets GLM-5.3-Flash and uses the portable
+    ``qwen3_moe_expert_adapter_v1`` artifact layout."""
 
     def compute_hash(self) -> str:
         """
@@ -105,6 +109,7 @@ class LoRAConfig:
         factors.append(self.enable_tower_connector_lora)
         factors.append(self.enable_mixed_moe_lora_format)
         factors.append(self.enable_moe_shared_loras)
+        factors.append(self.enable_structural_experts)
         # target_modules affects which modules get LoRA applied
         factors.append(
             tuple(sorted(self.target_modules)) if self.target_modules else None

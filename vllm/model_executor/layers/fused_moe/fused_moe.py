@@ -157,7 +157,8 @@ def fused_moe_kernel_gptq_awq(
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     # Cast to int64 to prevent overflow in stride*offset products
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
-    token_mask = offs_token < num_valid_tokens
+    valid_token_mask = offs_token < num_valid_tokens
+    token_mask = valid_token_mask
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
@@ -171,12 +172,20 @@ def fused_moe_kernel_gptq_awq(
             pid_n,
             N,
             offs_token,
-            token_mask,
+            valid_token_mask,
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
             compute_type,
         )
         return
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(
+            topk_weights_ptr + offs_token,
+            mask=valid_token_mask,
+            other=0,
+        )
+        token_mask = valid_token_mask & (moe_weight != 0)
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -279,7 +288,6 @@ def fused_moe_kernel_gptq_awq(
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
     accumulator = accumulator.to(compute_type)
@@ -287,7 +295,7 @@ def fused_moe_kernel_gptq_awq(
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    c_mask = valid_token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
@@ -337,6 +345,7 @@ def fused_moe_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    SKIP_ZERO_WEIGHT: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
@@ -412,7 +421,8 @@ def fused_moe_kernel(
     # (e.g. stride_cm * offs_token can exceed int32 for large token counts)
     offs_token = offs_token.to(tl.int64)
 
-    token_mask = offs_token < num_valid_tokens
+    valid_token_mask = offs_token < num_valid_tokens
+    token_mask = valid_token_mask
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
@@ -426,12 +436,20 @@ def fused_moe_kernel(
             pid_n,
             N,
             offs_token,
-            token_mask,
+            valid_token_mask,
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
             compute_type,
         )
         return
+
+    if SKIP_ZERO_WEIGHT:
+        moe_weight = tl.load(
+            topk_weights_ptr + offs_token,
+            mask=valid_token_mask,
+            other=0,
+        )
+        token_mask = valid_token_mask & (moe_weight != 0)
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -564,11 +582,6 @@ def fused_moe_kernel(
     # conversion to ensure numerical stability, which is especially critical
     # on ROCm platforms.
     if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(
-            topk_weights_ptr + offs_token,
-            mask=token_mask,
-            other=0,
-        )
         accumulator *= moe_weight[:, None]
 
     # Final precision conversion:
@@ -579,7 +592,7 @@ def fused_moe_kernel(
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    c_mask = valid_token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
@@ -754,8 +767,9 @@ def invoke_fused_moe_triton_kernel(
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
+    skip_zero_weight: bool = False,
 ):
-    assert topk_weights is not None or not mul_routed_weight
+    assert topk_weights is not None or not (mul_routed_weight or skip_zero_weight)
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
 
@@ -835,6 +849,7 @@ def invoke_fused_moe_triton_kernel(
         B_bias.stride(1) if B_bias is not None else 0,
         0 if block_shape is None else block_shape[0],
         0 if block_shape is None else block_shape[1],
+        SKIP_ZERO_WEIGHT=skip_zero_weight,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=compute_type,
@@ -950,6 +965,7 @@ def dispatch_fused_moe_kernel(
             per_channel_quant,
             block_shape,
             B_bias,
+            skip_zero_weight=topk_weights is not None,
         )
 
 

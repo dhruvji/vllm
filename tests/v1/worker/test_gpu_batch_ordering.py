@@ -8,11 +8,18 @@ tail sorted in front of the uniform decodes misclassifies every decode as a
 prefill.
 """
 
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.worker.gpu.model_runner import sort_batch_req_ids
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner, sort_batch_req_ids
+from vllm.v1.worker.utils import get_uniform_decode_token_count
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 def _make_common_attn_metadata(query_lens: list[int]) -> CommonAttentionMetadata:
@@ -68,3 +75,24 @@ def test_spec_decodes_lead_short_prefill_tail():
     )
     assert (num_decodes, num_prefills) == (8, 1)
     assert (num_decode_tokens, num_prefill_tokens) == (16, 1)
+
+
+def test_uniform_decode_requires_every_request_to_finish_prefill():
+    assert get_uniform_decode_token_count(2, 16, 8, has_prefill=False) == 8
+    assert get_uniform_decode_token_count(2, 16, 8, has_prefill=True) is None
+    assert get_uniform_decode_token_count(2, 12, 8, has_prefill=False) is None
+
+
+def test_prefill_detection_uses_request_state_indices():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.req_states = SimpleNamespace(
+        req_id_to_index={"prefilling": 0, "decode_a": 1, "decode_b": 2},
+        num_computed_prefill_tokens=np.array([8, 16, 16], dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.array([40, 16, 16], dtype=np.int32)),
+    )
+
+    decodes = {"decode_a": 8, "decode_b": 8}
+    assert not runner._any_req_still_prefilling(decodes, len(decodes))
+
+    mixed = {"decode_a": 8, "prefilling": 8, "decode_b": 8}
+    assert runner._any_req_still_prefilling(mixed, len(mixed))

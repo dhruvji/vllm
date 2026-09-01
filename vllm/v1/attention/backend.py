@@ -615,6 +615,8 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     # Does this backend/builder support updating the block table in existing
     # metadata
     supports_update_block_table: bool = False
+    # Whether the builder constructor requires the block-table width.
+    requires_block_table_width: ClassVar[bool] = False
 
     @abstractmethod
     def __init__(
@@ -628,6 +630,10 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         self.layer_names = layer_names
         self.vllm_config = vllm_config
         self.device = device
+        self.kernel_block_size: int | None = None
+
+    def set_kernel_block_size(self, kernel_block_size: int) -> None:
+        self.kernel_block_size = kernel_block_size
 
     @classmethod
     def get_cudagraph_support(

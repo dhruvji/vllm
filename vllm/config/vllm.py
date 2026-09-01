@@ -68,6 +68,11 @@ logger = init_logger(__name__)
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "DeepseekV2ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
         "GraniteMoeForCausalLM",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
@@ -75,6 +80,54 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "Qwen2MoeForCausalLM",
     }
 )
+
+DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV32MTPModel",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextMTPModel",
+        "GlmMoeDsaForCausalLM",
+        "InklingForCausalLM",
+        "InklingForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3MTPModel",
+        "KimiLinearForCausalLM",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
+
+
+@lru_cache
+def default_v2_model_runner_architectures() -> frozenset[str]:
+    """Architectures defaulting to the V2 model runner on this platform."""
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        # TODO(rocm): These models are either unsupported by MRV2 or slower with
+        # MRV2 on AMD GPUs.
+        return DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES - {
+            "DeepseekV32ForCausalLM",
+            "DeepseekV4ForCausalLM",
+        }
+    return DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES
+
+
+@lru_cache
+def default_breakable_cudagraph_architectures() -> frozenset[str]:
+    """Architectures defaulting to breakable CUDA graphs on this platform."""
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES - {
+            "DeepseekV32ForCausalLM",
+            "DeepseekV32MTPModel",
+        }
+    return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES
 
 
 class OptimizationLevel(IntEnum):
@@ -610,16 +663,45 @@ class VllmConfig:
         if model_config.runner_type != "generate":
             return False
 
-        if getattr(model_config, "is_hybrid", False):
-            return False
-
         if getattr(model_config, "is_attention_free", False):
             return False
         architectures = getattr(model_config, "architectures", [])
-        return (
-            any(arch in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES for arch in architectures)
-            or not model_config.is_moe
+        default_architectures = default_v2_model_runner_architectures()
+        if any(arch in default_architectures for arch in architectures):
+            return True
+
+        if getattr(model_config, "is_hybrid", False):
+            return False
+
+        return not model_config.is_moe
+
+    def _uses_breakable_cudagraph_by_default(self) -> bool:
+        model_config = self.model_config
+        if model_config is None:
+            return False
+
+        architectures = set(model_config.architectures)
+        return bool(architectures & default_breakable_cudagraph_architectures())
+
+    def _maybe_enable_breakable_cudagraph(self) -> bool:
+        if (
+            "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
+            and self._uses_breakable_cudagraph_by_default()
+        ):
+            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+            logger.info_once(
+                "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
+                "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
+            )
+
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
         )
+
+        enabled = is_breakable_cudagraph_enabled()
+        if enabled:
+            self.compilation_config.mode = CompilationMode.NONE
+        return enabled
 
     @property
     def needs_dp_coordinator(self) -> bool:
@@ -1174,41 +1256,14 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        # For model classes don't carry @support_torch_compile —
-        # the breakable cudagraph is the supported PIECEWISE path. Auto-enable
-        # it unless the user has explicitly opted out via the env var.
-        if (
-            self.model_config is not None
-            and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
-            and any(
-                a
-                in (
-                    "DeepseekV4ForCausalLM",
-                    "DeepSeekV4MTPModel",
-                    "InklingForCausalLM",
-                    "InklingForConditionalGeneration",
-                    "MiniMaxM3SparseForCausalLM",
-                    "MiniMaxM3SparseForConditionalGeneration",
-                )
-                for a in self.model_config.architectures
-            )
-        ):
-            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
-            logger.info_once(
-                "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
-                "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
-            )
+        breakable_cudagraph_enabled = self._maybe_enable_breakable_cudagraph()
 
-        if envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
-            logger.warning_once(
-                "VLLM_USE_BREAKABLE_CUDAGRAPH is set, disabling vLLM's "
-                "torch.compile pipeline. Equivalent to -cc.mode=none."
+        if not breakable_cudagraph_enabled and (
+            self.compilation_config.backend == "eager"
+            or (
+                self.compilation_config.mode is not None
+                and self.compilation_config.mode != CompilationMode.VLLM_COMPILE
             )
-            self.compilation_config.mode = CompilationMode.NONE
-
-        if self.compilation_config.backend == "eager" or (
-            self.compilation_config.mode is not None
-            and self.compilation_config.mode != CompilationMode.VLLM_COMPILE
         ):
             logger.warning(
                 "Inductor compilation was disabled by user settings, "

@@ -1006,11 +1006,16 @@ class SpecDecodeBaseProposer:
 
     def model_returns_tuple(self) -> bool:
         if self.method == "mtp":
-            # DeepSeek-family MTP (deepseek_mtp.py) recycles the post-final-
-            # norm hidden, so its forward returns (logit_hidden,
-            # recycle_hidden). Other MTP families return a single tensor.
-            return "DeepSeekMTPModel" in (
-                self.draft_model_config.hf_config.architectures or []
+            # These models return separate hidden states for logits and for
+            # feedback into the next draft step.
+            architectures = self.draft_model_config.hf_config.architectures or []
+            return bool(
+                {
+                    "DeepSeekMTPModel",
+                    "DeepseekV32MTPModel",
+                    "Glm5NextMTPModel",
+                    "KimiK3MTPModel",
+                }.intersection(architectures)
             )
         return self.method not in ("mtp", "draft_model", "dflash")
 
@@ -1336,6 +1341,8 @@ class SpecDecodeBaseProposer:
         )
 
         self.model = self._get_model()
+        # Draft cache specs are read before the executor's normal resolution.
+        current_platform.update_block_size_for_backend(self.vllm_config)
 
         # Find draft layers (attention layers added by draft model)
         all_attn_layers = get_layers_from_vllm_config(
@@ -1379,6 +1386,7 @@ class SpecDecodeBaseProposer:
                 "Qwen3VLMoeForConditionalGeneration",
                 "Gemma4ForConditionalGeneration",
                 "Gemma4UnifiedForConditionalGeneration",
+                "Glm5NextForConditionalGeneration",
                 "Step3p7ForConditionalGeneration",
             ]:
                 self.model.config.image_token_index = target_model.config.image_token_id
@@ -1736,7 +1744,10 @@ class SpecDecodeBaseProposer:
 
         attention_groups: dict[tuple[str, str], AttentionGroup] = {}
         if kv_cache_spec is not None:
-            for layer_name in self._draft_attn_layer_names:
+            # _draft_attn_layer_names is a set; iterate in sorted order so
+            # that attention_groups (and anything derived from its first
+            # element) is deterministic across processes.
+            for layer_name in sorted(self._draft_attn_layer_names):
                 attn_backend = all_attn_layers[layer_name].get_attn_backend()
                 backend_key = attn_backend.full_cls_name()
                 if backend_key not in attention_groups:

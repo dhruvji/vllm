@@ -9,12 +9,39 @@ from __future__ import annotations
 import os
 import threading
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
 os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+
+
+@pytest.mark.skip_global_cleanup
+def test_piecewise_breakable_does_not_pad_requests():
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+
+    manager = CudaGraphManager.__new__(CudaGraphManager)
+    manager.compilation_config = SimpleNamespace(
+        cudagraph_capture_sizes=[24],
+        max_cudagraph_capture_size=24,
+    )
+    manager.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    manager.max_num_reqs = 64
+    manager.decode_query_len = 4
+    manager.lora_capture_cases = [0]
+    manager.vllm_config = SimpleNamespace(speculative_config=None)
+    manager.use_breakable_cg = True
+    manager._candidates = {}
+    manager._capture_descs = {}
+
+    manager._init_candidates()
+
+    descs = manager._capture_descs[CUDAGraphMode.PIECEWISE]
+    assert len(descs) == 1
+    assert descs[0].num_reqs is None
 
 
 def test_piecewise_capture_builds_fresh_metadata_for_both_passes():

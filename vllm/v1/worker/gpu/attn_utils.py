@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVQuantMode,
     MambaSpec,
+    MLAAttentionSpec,
     TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -173,6 +174,14 @@ def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
 ):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+    packed_sizes = {
+        tensor.size
+        for tensor in kv_cache_config.kv_cache_tensors
+        if tensor.block_stride > 0
+    }
+    assert len(packed_sizes) <= 1, (
+        "Packed KV cache tensors must share one backing allocation size"
+    )
     packed_backing: torch.Tensor | None = None
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         if kv_cache_tensor.block_stride > 0:
@@ -204,6 +213,7 @@ def _reshape_attention_kv_cache(
     kv_cache_stride_order: tuple[int, ...],
     num_blocks: int,
     packing: tuple[int, int] | None,
+    blocks_per_page: int = 1,
 ) -> torch.Tensor:
     permuted_kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
     inv_order = [
@@ -214,11 +224,32 @@ def _reshape_attention_kv_cache(
     if packing is not None:
         offset, block_stride = packing
         assert inv_order[0] == 0
+        assert kv_cache_shape[0] == num_blocks
+        dtype_size = get_dtype_size(dtype)
         page_bytes = prod(kv_cache_shape[1:]) * get_dtype_size(dtype)
-        kv_cache = (
-            kv_raw_tensor.view(-1, block_stride)[:, offset : offset + page_bytes]
-            .view(dtype)
-            .view(permuted_kv_cache_shape)
+        if blocks_per_page > 1:
+            dense_page_bytes = page_bytes * blocks_per_page
+            if block_stride != dense_page_bytes:
+                raise ValueError(
+                    "A strided KV cache page with "
+                    f"block_stride={block_stride} cannot split into "
+                    f"{blocks_per_page} kernel blocks totaling "
+                    f"{dense_page_bytes} bytes"
+                )
+            block_stride //= blocks_per_page
+        assert offset % dtype_size == 0
+        assert block_stride % dtype_size == 0
+        assert (
+            offset + (num_blocks - 1) * block_stride + page_bytes
+            <= kv_raw_tensor.numel()
+        )
+        strides = list(torch.empty(permuted_kv_cache_shape, device="meta").stride())
+        strides[0] = block_stride // dtype_size
+        kv_cache = torch.as_strided(
+            kv_raw_tensor.view(dtype),
+            size=permuted_kv_cache_shape,
+            stride=tuple(strides),
+            storage_offset=offset // dtype_size,
         )
     elif kv_cache_spec.page_size_padded is not None:
         # Use a strided view to skip the padding between physical pages.
@@ -253,6 +284,58 @@ def _reshape_attention_kv_cache(
     return kv_cache.permute(*inv_order)
 
 
+def _get_kv_cache_num_blocks(
+    kv_raw_tensor: torch.Tensor,
+    kv_cache_spec: KVCacheSpec,
+    packing: tuple[int, int] | None,
+    configured_num_blocks: int | None,
+) -> int:
+    if packing is not None:
+        assert configured_num_blocks is not None
+        return configured_num_blocks
+    assert kv_raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+    return kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+
+
+def _reshape_mamba_kv_cache(
+    kv_raw_tensor: torch.Tensor,
+    kv_cache_spec: MambaSpec,
+    num_blocks: int,
+    packing: tuple[int, int] | None,
+) -> list[torch.Tensor]:
+    base_offset_bytes, block_stride_bytes = packing or (
+        0,
+        kv_cache_spec.page_size_bytes,
+    )
+    state_tensors = []
+    state_offset_bytes = 0
+    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+        dtype_size = get_dtype_size(dtype)
+        target_shape = (num_blocks, *shape)
+        contiguous_stride = torch.empty(target_shape).stride()
+        state_size_bytes = contiguous_stride[0] * dtype_size
+        assert base_offset_bytes % dtype_size == 0
+        assert block_stride_bytes % dtype_size == 0
+        assert state_offset_bytes % dtype_size == 0
+        assert (
+            base_offset_bytes
+            + (num_blocks - 1) * block_stride_bytes
+            + state_offset_bytes
+            + state_size_bytes
+            <= kv_raw_tensor.numel()
+        )
+        tensor = torch.as_strided(
+            kv_raw_tensor.view(dtype),
+            size=target_shape,
+            stride=(block_stride_bytes // dtype_size, *contiguous_stride[1:]),
+            storage_offset=(base_offset_bytes + state_offset_bytes) // dtype_size,
+        )
+        state_tensors.append(tensor)
+        state_offset_bytes += state_size_bytes
+    assert state_offset_bytes <= block_stride_bytes
+    return state_tensors
+
+
 def _reshape_kv_cache(
     attn_groups: Sequence[AttentionGroup],
     kv_cache_raw_tensors: dict[str, torch.Tensor],
@@ -276,10 +359,11 @@ def _reshape_kv_cache(
             continue
 
         kv_cache_spec = group.kv_cache_spec
-        if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-            # use storage_block_size as the kernel block size for groups
-            # that apply a compression on block size (eg. DeepSeek V4).
-            kernel_block_size = kv_cache_spec.storage_block_size
+        if (
+            isinstance(kv_cache_spec, MLAAttentionSpec)
+            and kv_cache_spec.metadata_block_size is not None
+        ):
+            kernel_block_size = kv_cache_spec.metadata_block_size
         else:
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
 
@@ -290,22 +374,20 @@ def _reshape_kv_cache(
 
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
             packing = layer_packing.get(layer_name)
-            if packing is not None:
-                _, blk_stride = packing
-                num_blocks = kv_raw_tensor.numel() // blk_stride
-            else:
-                assert kv_raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+            num_blocks = _get_kv_cache_num_blocks(
+                kv_raw_tensor,
+                kv_cache_spec,
+                packing,
+                kv_cache_config.num_blocks if kv_cache_config is not None else None,
+            )
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
-                # Use storage_block_size: it equals block_size for uncompressed
-                # specs but is smaller for compressed ones (DeepSeek V4), which
-                # store block_size tokens in block_size // compress_ratio slots.
-                num_blocks_per_kv_block = (
-                    kv_cache_spec.storage_block_size // kernel_block_size
-                )
+                num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
                 kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+                shape_block_size = kv_cache_spec.get_num_kernel_states(
+                    kernel_block_size
+                )
                 # Skipped layers (--kv-cache-dtype-skip-layers) keep the
                 # unquantized shape; only the quantized primary uses the
                 # quantized cache dtype's (possibly packed) layout.
@@ -317,7 +399,7 @@ def _reshape_kv_cache(
                 )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
-                    kernel_block_size,
+                    shape_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
                     cache_dtype_str=layer_cache_dtype,
@@ -337,28 +419,14 @@ def _reshape_kv_cache(
                     kv_cache_stride_order,
                     kernel_num_blocks,
                     packing,
+                    num_blocks_per_kv_block,
                 )
 
             elif isinstance(kv_cache_spec, MambaSpec):
                 has_mamba = True
-                state_tensors = []
-                storage_offset_bytes = 0
-                for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                    dtype_size = get_dtype_size(dtype)
-                    num_element_per_page = kv_cache_spec.page_size_bytes // dtype_size
-                    target_shape = (num_blocks, *shape)
-                    stride = torch.empty(target_shape).stride()
-                    target_stride = (num_element_per_page, *stride[1:])
-                    assert storage_offset_bytes % dtype_size == 0
-                    tensor = torch.as_strided(
-                        kv_raw_tensor.view(dtype),
-                        size=target_shape,
-                        stride=target_stride,
-                        storage_offset=storage_offset_bytes // dtype_size,
-                    )
-                    state_tensors.append(tensor)
-                    storage_offset_bytes += stride[0] * dtype_size
-                kv_caches[layer_name] = state_tensors
+                kv_caches[layer_name] = _reshape_mamba_kv_cache(
+                    kv_raw_tensor, kv_cache_spec, num_blocks, packing
+                )
             else:
                 raise NotImplementedError(
                     f"Unsupported KV cache spec type: {type(kv_cache_spec)}"

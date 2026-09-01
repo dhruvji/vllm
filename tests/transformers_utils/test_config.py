@@ -6,8 +6,83 @@ only get the `eos_token_id` from the tokenizer as defined by
 `BaseRenderer.get_eos_token_id`.
 """
 
+import pytest
+
 from vllm.tokenizers import get_tokenizer
-from vllm.transformers_utils.config import try_get_generation_config
+from vllm.transformers_utils import configs
+from vllm.transformers_utils.config import (
+    try_get_generation_config,
+)
+from vllm.transformers_utils.configs.glm5_next import (
+    Glm5NextConfig,
+    Glm5NextTextConfig,
+    Glm5NextVisionConfig,
+)
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "HunYuanVLConfig",
+        "HunYuanVLTextConfig",
+        "HunYuanVLVisionConfig",
+        "HCXVisionConfig",
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_glm5_config_registration_preserves_existing_lazy_exports(config_name):
+    assert getattr(configs, config_name).__name__ == config_name
+
+
+@pytest.mark.skip_global_cleanup
+def test_glm5_next_accepts_deepseek_sparse_attention_layers():
+    layer_types = ["linear_attention", "deepseek_sparse_attention"]
+
+    config = Glm5NextTextConfig(
+        num_hidden_layers=len(layer_types), layer_types=layer_types
+    )
+
+    assert config.layer_types == layer_types
+    assert config.layers_block_type == ["linear_attention", "attention"]
+
+
+@pytest.mark.skip_global_cleanup
+def test_glm5_next_accepts_prebuilt_subconfigs():
+    text_config = Glm5NextTextConfig(hidden_size=1024)
+    vision_config = Glm5NextVisionConfig(hidden_size=768)
+
+    config = Glm5NextConfig(
+        text_config=text_config,
+        vision_config=vision_config,
+    )
+
+    assert config.text_config is text_config
+    assert config.vision_config is vision_config
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "option"),
+    [
+        (
+            {"index_topk": 2048, "index_dsa_use_layernorm": False},
+            "index_dsa_use_layernorm",
+        ),
+        (
+            {"index_topk": 2048, "index_kpool_compress": False},
+            "index_kpool_compress",
+        ),
+        (
+            {"index_topk": 2048, "index_kpool_always_select_tail": False},
+            "index_kpool_always_select_tail",
+        ),
+        ({"hres_vwnstyle": False}, "hres_vwnstyle"),
+        ({"mhc_no_norm_weight": True}, "mhc_no_norm_weight"),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_glm5_next_rejects_unimplemented_config_options(kwargs, option):
+    with pytest.raises(NotImplementedError, match=option):
+        Glm5NextTextConfig(**kwargs)
 
 
 def test_get_llama3_eos_token():

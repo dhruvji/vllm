@@ -28,6 +28,14 @@ from ..utils import create_new_process_for_each_test
 from .registry import HF_EXAMPLE_MODELS
 
 
+@pytest.mark.skip_global_cleanup
+def test_glm_moe_dsa_keeps_existing_registry_implementation():
+    assert _TEXT_GENERATION_MODELS["GlmMoeDsaForCausalLM"] == (
+        "deepseek_v2",
+        "GlmMoeDsaForCausalLM",
+    )
+
+
 @pytest.mark.parametrize("model_arch", ModelRegistry.get_supported_archs())
 def test_registry_imports(model_arch):
     # Skip if transformers version is incompatible

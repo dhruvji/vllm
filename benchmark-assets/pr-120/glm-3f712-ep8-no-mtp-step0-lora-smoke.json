@@ -1,0 +1,7 @@
+{
+  "base_model": "glm-5.3-flash",
+  "lora_model": "step0-lora-r32",
+  "dp_rank": 0,
+  "completion_tokens_per_response": 64,
+  "status": "passed"
+}

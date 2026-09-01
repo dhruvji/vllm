@@ -231,7 +231,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             weight_layout = WeightLayout.BlockMajorK
             hidden_states_scale = a1q_scale.t().contiguous()
 
-        flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(
+        kwargs = dict(
             topk_ids=packed_topk_ids,
             routing_bias=None,
             hidden_states=hidden_states,
@@ -258,6 +258,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             output=output,
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
         )
+        flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(**kwargs)
 
 
 class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):

@@ -109,6 +109,34 @@ def _make_scheduler_output(
     )
 
 
+@pytest.mark.skip_global_cleanup
+def test_align_postprocess_snapshots_accepted_tokens_before_reset():
+    ctx = MagicMock()
+    ctx.is_initialized = True
+    ctx.num_layers = 2
+    ctx.num_state_types = 2
+    ctx.num_accepted_tokens_out = torch.empty(4, dtype=torch.int32)
+    accepted_tokens = torch.tensor([3, 2, 4, 1], dtype=torch.int32)
+    state_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    new_computed_tokens = torch.tensor([8, 8, 8, 8], dtype=torch.int32)
+    index_mapping = torch.arange(4, dtype=torch.int32)
+
+    with patch("vllm.v1.worker.mamba_utils.postprocess_mamba_fused_kernel") as kernel:
+        MambaSpecDecodeGPUContext.run_fused_postprocess_align(
+            ctx,
+            num_reqs=4,
+            num_accepted_tokens_gpu=accepted_tokens,
+            state_idx_gpu=state_indices,
+            new_num_computed_tokens_gpu=new_computed_tokens,
+            idx_mapping=index_mapping,
+        )
+
+    kernel_args = kernel.__getitem__.return_value.call_args.args
+    torch.testing.assert_close(ctx.num_accepted_tokens_out, accepted_tokens)
+    assert kernel_args[0] is ctx.num_accepted_tokens_out
+    assert kernel_args[15] is accepted_tokens
+
+
 def test_resumed_req_ids_cleared_from_mamba_state_idx():
     """When a request is force-preempted (e.g. reset_prefix_cache),
     it appears in resumed_req_ids but NOT in preempted_req_ids.

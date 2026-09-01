@@ -7,6 +7,8 @@ silu_no_mul, gelu_no_mul, relu2_no_mul where the activation output dimension
 equals N (not N // 2 like gated activations).
 """
 
+import math
+
 import pytest
 import torch
 
@@ -29,6 +31,77 @@ NO_MUL_ACTIVATIONS = [
     MoEActivation.GELU_NO_MUL,
     MoEActivation.RELU2_NO_MUL,
 ]
+
+
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(80),
+    reason="Requires compute capability >= 8.0",
+)
+@torch.inference_mode()
+def test_zero_weight_route_does_not_propagate_nonfinite_expert_output():
+    dtype = torch.bfloat16
+    num_experts = 8
+    hidden_size = 64
+    intermediate_size = 128
+    topk = 2
+    hidden_states = torch.ones(1, hidden_size, dtype=dtype, device="cuda")
+    w1 = torch.zeros(
+        num_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=dtype,
+        device="cuda",
+    )
+    w2 = torch.zeros(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=dtype,
+        device="cuda",
+    )
+    w1[1].fill_(torch.finfo(dtype).max)
+    w2[1].fill_(1)
+    topk_weights = torch.tensor([[1.0, 0.0]], dtype=torch.float32, device="cuda")
+    topk_ids = torch.tensor([[0, 1]], dtype=torch.int64, device="cuda")
+
+    experts = TritonExperts(
+        moe_config=make_dummy_moe_config(),
+        quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,
+    )
+    workspace1_shape, workspace2_shape, output_shape = experts.workspace_shapes(
+        M=1,
+        N=2 * intermediate_size,
+        K=hidden_size,
+        topk=topk,
+        global_num_experts=num_experts,
+        local_num_experts=num_experts,
+        expert_tokens_meta=None,
+        activation=MoEActivation.SILU,
+    )
+    workspace1 = torch.empty(math.prod(workspace1_shape), dtype=dtype, device="cuda")
+    workspace2 = torch.empty(math.prod(workspace2_shape), dtype=dtype, device="cuda")
+    output = torch.zeros(output_shape, dtype=dtype, device="cuda")
+
+    experts.apply(
+        output=output,
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=MoEActivation.SILU,
+        global_num_experts=num_experts,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=workspace1,
+        workspace2=workspace2,
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output).item() == 0
 
 
 def make_test_tensors(

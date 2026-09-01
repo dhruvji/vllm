@@ -533,7 +533,7 @@ void cp_gather_cache(
 void cp_gather_and_upconvert_fp8_kv_cache(
     torch::stable::Tensor const& src_cache,         // [NUM_BLOCKS, BLOCK_SIZE,
                                                     // 656]
-    torch::stable::Tensor const& dst,               // [TOT_TOKENS, 576]
+    torch::stable::Tensor const& dst,               // [TOT_TOKENS, 512 or 576]
     torch::stable::Tensor const& block_table,       // [BATCH, BLOCK_INDICES]
     torch::stable::Tensor const& workspace_starts,  // [BATCH]
     int64_t batch_size,

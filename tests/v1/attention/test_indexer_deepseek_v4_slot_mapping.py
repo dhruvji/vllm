@@ -6,8 +6,39 @@ import torch
 
 from tests.v1.attention.utils import create_vllm_config
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadataBuilder,
+    _prepare_uniform_decode_kernel,
+)
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.worker.block_table import get_block_table_width
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_uniform_decode_clamps_padded_sequence_lengths():
+    device = torch.device("cuda")
+    seq_lens = torch.tensor([10, 0], dtype=torch.int32, device=device)
+    decode_seq_lens = torch.empty(4, dtype=torch.int32, device=device)
+    block_table = torch.tensor([[3, 4], [0, 0]], dtype=torch.int32, device=device)
+    expanded_block_table = torch.empty((4, 2), dtype=torch.int32, device=device)
+    decode_lens = torch.empty(4, dtype=torch.int32, device=device)
+
+    _prepare_uniform_decode_kernel[(4,)](
+        seq_lens,
+        decode_seq_lens,
+        block_table,
+        block_table.stride(0),
+        expanded_block_table,
+        expanded_block_table.stride(0),
+        decode_lens,
+        2,
+        BLOCK_SIZE=2,
+    )
+
+    torch.testing.assert_close(
+        decode_seq_lens,
+        torch.tensor([9, 10, 0, 0], dtype=torch.int32, device=device),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -26,11 +57,14 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         compress_ratio=4,
     )
     vllm_config = create_vllm_config(max_model_len=1024)
+    max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, 1024)
+    block_table_width = get_block_table_width(max_num_blocks, kv_cache_spec.block_size)
     builder = DeepseekV32IndexerMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
         layer_names=["dummy"],
         vllm_config=vllm_config,
         device=device,
+        block_table_width=block_table_width,
     )
 
     # Construct a single request where:
@@ -62,6 +96,10 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
     )
 
     md = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert md.max_uncompressed_seq_len == 280
+    assert md.prefill is not None
+    assert md.prefill.max_uncompressed_seq_len == 280
 
     # The compressed slot_mapping retains the original uncompressed size (40).
     # Only every compress_ratio-th position gets a valid slot; the rest are -1.

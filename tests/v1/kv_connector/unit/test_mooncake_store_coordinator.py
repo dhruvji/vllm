@@ -3,6 +3,8 @@
 
 from math import lcm
 
+import pytest
+
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
     ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
@@ -13,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheGroupSpec,
     SlidingWindowSpec,
 )
@@ -92,11 +95,34 @@ def _swa(block_size=16, sliding_window=32):
     )
 
 
+def _kpool_tail(block_size=4):
+    return KpoolTailSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=None,
+        sliding_window=block_size,
+    )
+
+
 def _hashes(n: int) -> list[BlockHash]:
     return [BlockHash(bytes([i + 1]) * 4) for i in range(n)]
 
 
 # ----- Single-group coordinator -----
+
+
+@pytest.mark.skip_global_cleanup
+def test_coordinator_ignores_non_prefix_cacheable_group_hash_block_size():
+    groups = [
+        KVCacheGroupSpec(["attention"], _full(16)),
+        KVCacheGroupSpec(["kpool_tail"], _kpool_tail(4)),
+    ]
+
+    coord = _make_coord(groups, hash_block_size=16)
+
+    assert len(coord.attention_groups) == 1
+    assert coord.attention_groups[0][1] == [0]
 
 
 def test_coordinator_single_full_attention_all_hits():

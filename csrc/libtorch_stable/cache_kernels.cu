@@ -1087,6 +1087,9 @@ __global__ void gather_and_maybe_dequant_cache(
 #define CALL_GATHER_CACHE_576(SCALAR_T, CACHE_T, KV_DTYPE) \
   CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, 576)
 
+#define CALL_GATHER_CACHE_512(SCALAR_T, CACHE_T, KV_DTYPE) \
+  CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, 512)
+
 #define CALL_GATHER_CACHE_320(SCALAR_T, CACHE_T, KV_DTYPE) \
   CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, 320)
 
@@ -1124,10 +1127,9 @@ void gather_and_maybe_dequant_cache(
         seq_starts.value().scalar_type() == torch::headeronly::ScalarType::Int,
         "seq_starts must be int32");
   }
-  STD_TORCH_CHECK(
-      head_dim == 320 || head_dim == 576,
-      "gather_and_maybe_dequant_cache only support the head_dim to 320 or 576 "
-      "for better performance")
+  STD_TORCH_CHECK(head_dim == 320 || head_dim == 512 || head_dim == 576,
+                  "gather_and_maybe_dequant_cache only support the head_dim to "
+                  "320 or 512 or 576 for better performance")
 
   STD_TORCH_CHECK(src_cache.device() == dst.device(),
                   "src_cache and dst must be on the same device");
@@ -1156,6 +1158,9 @@ void gather_and_maybe_dequant_cache(
   if (head_dim == 576) {
     DISPATCH_BY_KV_CACHE_DTYPE(dst.scalar_type(), kv_cache_dtype,
                                CALL_GATHER_CACHE_576);
+  } else if (head_dim == 512) {
+    DISPATCH_BY_KV_CACHE_DTYPE(dst.scalar_type(), kv_cache_dtype,
+                               CALL_GATHER_CACHE_512);
   } else {
     DISPATCH_BY_KV_CACHE_DTYPE(dst.scalar_type(), kv_cache_dtype,
                                CALL_GATHER_CACHE_320);
@@ -1168,14 +1173,15 @@ namespace vllm {
 // Similar to cp_gather_cache but specifically for FP8->BF16 conversion
 __global__ void cp_gather_and_upconvert_fp8_kv_cache(
     const uint8_t* __restrict__ src_cache,    // [NUM_BLOCKS, BLOCK_SIZE, 656]
-    __nv_bfloat16* __restrict__ dst,          // [total_tokens, 576]
+    __nv_bfloat16* __restrict__ dst,          // [total_tokens, 512 or 576]
     const int32_t* __restrict__ block_table,  // [num_reqs, BLOCK_INDICES]
     const int32_t* __restrict__ workspace_starts,  // [num_reqs]
     const int32_t num_reqs, const int32_t block_size,
     const int32_t total_tokens, const int64_t block_table_stride,
     const int64_t cache_block_stride, const int64_t cache_entry_stride,
     const int64_t dst_entry_stride,
-    const int32_t* __restrict__ seq_starts) {  // Optional source offsets
+    const int32_t* __restrict__ seq_starts,  // Optional source offsets
+    const bool copy_rope) {
   const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   if (flat_warp_id >= total_tokens) return;
   const int lane_id = threadIdx.x & 31;
@@ -1228,9 +1234,11 @@ __global__ void cp_gather_and_upconvert_fp8_kv_cache(
   nope_dst[0] = *reinterpret_cast<const int4*>(&bf16_lo);
   nope_dst[1] = *reinterpret_cast<const int4*>(&bf16_hi);
 
-  const int* rope_src = reinterpret_cast<const int*>(token_ptr + 528);
-  int* rope_dst = reinterpret_cast<int*>(dst_ptr + 512);
-  rope_dst[lane_id] = rope_src[lane_id];
+  if (copy_rope) {
+    const int* rope_src = reinterpret_cast<const int*>(token_ptr + 528);
+    int* rope_dst = reinterpret_cast<int*>(dst_ptr + 512);
+    rope_dst[lane_id] = rope_src[lane_id];
+  }
 }
 
 template <typename scalar_t>
@@ -1383,7 +1391,7 @@ void cp_gather_cache(
 
 void cp_gather_and_upconvert_fp8_kv_cache(
     torch::stable::Tensor const& src_cache,    // [NUM_BLOCKS, BLOCK_SIZE, 656]
-    torch::stable::Tensor const& dst,          // [TOT_TOKENS, 576]
+    torch::stable::Tensor const& dst,          // [TOT_TOKENS, 512 or 576]
     torch::stable::Tensor const& block_table,  // [BATCH, BLOCK_INDICES]
     torch::stable::Tensor const& workspace_starts,  // [BATCH]
     int64_t batch_size,
@@ -1426,7 +1434,8 @@ void cp_gather_and_upconvert_fp8_kv_cache(
       src_cache.scalar_type());
   STD_TORCH_CHECK(dst.scalar_type() == torch::headeronly::ScalarType::BFloat16,
                   "dst must be bfloat16");
-  STD_TORCH_CHECK(head_dim == 576, "head_dim must be 576 for MLA");
+  STD_TORCH_CHECK(head_dim == 512 || head_dim == 576,
+                  "head_dim must be 512 or 576 for MLA");
 
   int64_t block_table_stride = block_table.stride(0);
   int64_t cache_block_stride = src_cache.stride(0);
@@ -1456,7 +1465,7 @@ void cp_gather_and_upconvert_fp8_kv_cache(
       workspace_starts.const_data_ptr<int32_t>(),
       static_cast<int32_t>(batch_size), block_size, total_tokens,
       block_table_stride, cache_block_stride, cache_entry_stride,
-      dst_entry_stride, seq_starts_ptr);
+      dst_entry_stride, seq_starts_ptr, head_dim == 576);
 }
 
 // Macro to dispatch the kernel based on the data type.

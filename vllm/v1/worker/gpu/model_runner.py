@@ -68,7 +68,6 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
-    get_uniform_token_count,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -112,7 +111,11 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    copy_kv_cache_blocks_inplace,
+    get_uniform_decode_token_count,
+)
 
 logger = init_logger(__name__)
 
@@ -509,6 +512,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kernel_block_sizes=self.kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
             static_forward_context=self.compilation_config.static_forward_context,
+            num_blocks=self.kv_cache_config.num_blocks,
             max_concurrency=self.vllm_config.max_concurrent_batches,
         )
 
@@ -858,6 +862,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_cache_block_copies,
             )
 
+    def _any_req_still_prefilling(
+        self, num_scheduled_tokens: dict[str, int], num_reqs: int
+    ) -> bool:
+        if num_reqs <= 0:
+            return False
+        states = self.req_states
+        indices = np.fromiter(
+            (states.req_id_to_index.get(req_id, -1) for req_id in num_scheduled_tokens),
+            dtype=np.intp,
+            count=num_reqs,
+        )
+        indices = indices[indices >= 0]
+        if indices.size == 0:
+            return False
+        return bool(
+            np.any(
+                states.num_computed_prefill_tokens[indices]
+                < states.prefill_len.np[indices]
+            )
+        )
+
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
     ) -> InputBatch:
@@ -1156,7 +1181,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
-        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        has_prefill = not dummy_run and self._any_req_still_prefilling(
+            scheduler_output.num_scheduled_tokens, num_reqs
+        )
+        uniform_tok_count = get_uniform_decode_token_count(
+            num_reqs, num_toks, max_query_len, has_prefill
+        )
 
         num_active_loras = 0
         if self.lora_config:

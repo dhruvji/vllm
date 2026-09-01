@@ -1,15 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+import threading
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from vllm.config.multimodal import MultiModalConfig
-from vllm.entrypoints.generate.adapter_serving import _lora_config_source_ids
+from vllm.entrypoints.generate.adapter_serving import (
+    EngramAdapterServingMixin,
+    _lora_config_source_ids,
+)
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
@@ -254,6 +263,271 @@ async def test_serving_completion_with_request_body_lora(mock_serving_setup):
     assert isinstance(generated_lora_request, LoRARequest)
     assert generated_lora_request.lora_name == "/fake/path/request-body-lora"
     assert generated_lora_request.lora_path == "/fake/path/request-body-lora"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
+async def test_request_body_structural_expert_requires_feature_flag(monkeypatch):
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+    adapter_path = "/fake/path/structural-expert"
+    counter = MagicMock()
+    counter.inc.return_value = 7
+    serving.models = SimpleNamespace(
+        lora_resolver_lock=defaultdict(asyncio.Lock),
+        lora_requests={},
+        lora_id_counter=counter,
+        is_base_model=lambda _model: True,
+    )
+    serving.model_config = SimpleNamespace(model=MODEL_NAME)
+    serving.engine_client = SimpleNamespace(
+        add_lora=AsyncMock(),
+        vllm_config=SimpleNamespace(
+            lora_config=SimpleNamespace(enable_structural_experts=False)
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving._resolve_glob",
+        lambda expert_id: expert_id,
+    )
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.asyncio.to_thread",
+        run_inline,
+    )
+
+    with pytest.raises(ValueError, match="--enable-structural-experts"):
+        await serving._process_expert([{"id": adapter_path}])
+
+    serving.engine_client.add_lora.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
+async def test_request_body_structural_expert_uses_lora_scheduler_slot(monkeypatch):
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+    counter = MagicMock()
+    counter.inc.return_value = 7
+    adapter_path = "/fake/path/structural-expert"
+    ordinary_lora = LoRARequest(
+        lora_name=adapter_path,
+        lora_int_id=3,
+        lora_path=adapter_path,
+    )
+    serving.models = SimpleNamespace(
+        lora_resolver_lock=defaultdict(asyncio.Lock),
+        lora_requests={adapter_path: ordinary_lora},
+        lora_id_counter=counter,
+        is_base_model=lambda _model: True,
+    )
+    serving.model_config = SimpleNamespace(model=MODEL_NAME)
+    serving.engine_client = SimpleNamespace(
+        add_lora=AsyncMock(),
+        vllm_config=SimpleNamespace(
+            lora_config=SimpleNamespace(enable_structural_experts=True)
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving._resolve_glob",
+        lambda expert_id: expert_id,
+    )
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.asyncio.to_thread",
+        run_inline,
+    )
+
+    request = await serving._process_expert([{"id": adapter_path}])
+
+    assert request is not None
+    assert request.is_structural_expert
+    assert request.lora_int_id == 7
+    assert request.lora_path == adapter_path
+    assert request != ordinary_lora
+    assert len({request, ordinary_lora}) == 2
+    assert serving.models.lora_requests[adapter_path] is ordinary_lora
+    serving.engine_client.add_lora.assert_awaited_once_with(request)
+
+
+@pytest.mark.skip_global_cleanup
+def test_staged_adapter_cache_reuses_durable_disk_path(monkeypatch, tmp_path):
+    monkeypatch.delenv("VLLM_LORA_RESOLVER_CACHE_DIR", raising=False)
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+
+    staging_root = serving._staged_adapter_dir("expert", "first")
+    assert staging_root.parent == tmp_path / "adapters" / "staged"
+    staged_dir = staging_root / "generation-existing"
+    staged_dir.mkdir(parents=True)
+    model_path = staged_dir / "adapter_model.safetensors"
+    model_path.touch()
+    (staged_dir / ".ready").touch()
+    (staging_root / "current").write_text(staged_dir.name)
+    manager = MagicMock()
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.get_adapter_manager", manager
+    )
+
+    resolved = serving._prepare_staged_expert_dir("first", force_redownload=False)
+
+    assert resolved == str(staged_dir)
+    assert model_path.exists()
+    manager.get_adapter.assert_not_called()
+
+
+@pytest.mark.skip_global_cleanup
+def test_staged_lora_publishes_complete_directory_before_reuse(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+    manager = MagicMock()
+    manager.get_adapter.return_value = {}
+
+    def download_json(*, json_id, target_path):
+        Path(target_path).write_text(json_id)
+
+    manager.download_json = MagicMock(side_effect=download_json)
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.get_adapter_manager",
+        lambda: manager,
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.safetensors_save_file",
+        lambda _data, path: Path(path).write_bytes(b"model"),
+    )
+
+    staged = Path(serving._prepare_staged_lora_dir("s3://bucket/adapter.bin", False))
+
+    assert (staged / "adapter_model.safetensors").read_bytes() == b"model"
+    assert (staged / "adapter_config.json").is_file()
+    assert (staged / ".ready").is_file()
+
+    manager.reset_mock()
+    assert serving._prepare_staged_lora_dir("s3://bucket/adapter.bin", False) == str(
+        staged
+    )
+    manager.get_adapter.assert_not_called()
+    manager.download_json.assert_not_called()
+
+
+@pytest.mark.skip_global_cleanup
+def test_staged_adapter_lock_serializes_shared_disk_writes(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    first_save_started = threading.Event()
+    release_first_save = threading.Event()
+    second_save_started = threading.Event()
+    save_call_lock = threading.Lock()
+    save_calls = 0
+
+    def save_adapter(_data, path):
+        nonlocal save_calls
+        with save_call_lock:
+            save_calls += 1
+            call = save_calls
+        if call == 1:
+            first_save_started.set()
+            assert release_first_save.wait(timeout=5)
+        else:
+            second_save_started.set()
+        Path(path).touch()
+
+    manager = MagicMock()
+    manager.get_adapter.return_value = {}
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.get_adapter_manager",
+        lambda: manager,
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.safetensors_save_file",
+        save_adapter,
+    )
+
+    first = EngramAdapterServingMixin()
+    first._init_engram_adapter_serving()
+    second = EngramAdapterServingMixin()
+    second._init_engram_adapter_serving()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_result = executor.submit(first._prepare_staged_expert_dir, "shared", True)
+        assert first_save_started.wait(timeout=5)
+        second_result = executor.submit(
+            second._prepare_staged_expert_dir, "shared", True
+        )
+        writes_overlapped = second_save_started.wait(timeout=0.5)
+        release_first_save.set()
+        first_result.result(timeout=5)
+        second_result.result(timeout=5)
+
+    assert not writes_overlapped
+
+
+@pytest.mark.skip_global_cleanup
+def test_force_redownload_publishes_immutable_adapter_generation(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+    manager = MagicMock()
+    manager.get_adapter.side_effect = [b"first", b"second"]
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.get_adapter_manager",
+        lambda: manager,
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.safetensors_save_file",
+        lambda data, path: Path(path).write_bytes(data),
+    )
+
+    first_dir = Path(serving._prepare_staged_expert_dir("shared", False))
+    second_dir = Path(serving._prepare_staged_expert_dir("shared", True))
+
+    assert second_dir != first_dir
+    assert (first_dir / "adapter_model.safetensors").read_bytes() == b"first"
+    assert (second_dir / "adapter_model.safetensors").read_bytes() == b"second"
+    assert serving._prepare_staged_expert_dir("shared", False) == str(second_dir)
+
+
+@pytest.mark.skip_global_cleanup
+def test_failed_force_redownload_preserves_published_adapter(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    serving = EngramAdapterServingMixin()
+    serving._init_engram_adapter_serving()
+    manager = MagicMock()
+    manager.get_adapter.return_value = {}
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.get_adapter_manager",
+        lambda: manager,
+    )
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.safetensors_save_file",
+        lambda _data, path: Path(path).write_bytes(b"published"),
+    )
+    staged_dir = Path(
+        serving._prepare_staged_expert_dir("shared", force_redownload=False)
+    )
+    model_path = staged_dir / "adapter_model.safetensors"
+
+    def fail_save(_data, _path):
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(
+        "vllm.entrypoints.generate.adapter_serving.safetensors_save_file",
+        fail_save,
+    )
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        serving._prepare_staged_expert_dir("shared", force_redownload=True)
+
+    assert model_path.read_bytes() == b"published"
+    assert (staged_dir / ".ready").exists()
+    assert serving._prepare_staged_expert_dir("shared", False) == str(staged_dir)
 
 
 @pytest.mark.asyncio

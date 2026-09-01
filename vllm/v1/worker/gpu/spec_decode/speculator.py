@@ -88,8 +88,19 @@ class DraftModelSpeculator(BaseSpeculator):
         self.hidden_size = self.draft_model_config.get_hidden_size()
         # Widen for HC-multiplexed residuals (e.g. DeepSeek V4 feeds the MTP
         # draft the target's pre-hc_head (T, hc_mult * hidden_size) residual).
-        # Non-HC models default to hc_mult=1 and are unaffected.
+        # Non-HC models default to hc_mult=1 and are unaffected. GLM-5.3-Flash is an
+        # exception: it carries hc_mult in the config even when hyper-connection
+        # is disabled (mhc=False), so the widened residual only applies when HC
+        # is actually on. Models without an mhc field keep the hc_mult behavior.
         hc_mult = getattr(self.draft_model_config.hf_config, "hc_mult", 1)
+        if getattr(self.draft_model_config.hf_config, "mhc", None) is False:
+            hc_mult = 1
+        # GLM-5.3-Flash MTP drafts from the regular hidden state + token embed
+        # (eh_proj: hidden*2 -> hidden), not the HC-multiplexed pre-hc_head
+        # residual, so never widen for it regardless of mhc. Covers the target
+        # (glm5_next) and MTP draft (glm5_next_mtp) config model_types.
+        if self.draft_model_config.hf_config.model_type.startswith("glm5_next"):
+            hc_mult = 1
         self.hidden_size = self.hidden_size * hc_mult
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
@@ -210,6 +221,8 @@ class DraftModelSpeculator(BaseSpeculator):
         num_reqs: int,
         num_reqs_padded: int,
         num_tokens_padded: int,
+        seq_lens_cpu_upper_bound: torch.Tensor,
+        step: int,
         num_query_per_req: int = 1,
         causal: bool | Mapping[int, bool] = True,
     ) -> dict[str, Any] | None:
@@ -224,6 +237,15 @@ class DraftModelSpeculator(BaseSpeculator):
             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
         ]
         slot_mappings = self.block_tables.slot_mappings[:, :num_tokens_padded]
+        draft_seq_lens_cpu_upper_bound = torch.zeros(
+            num_reqs_padded, dtype=torch.int32, device="cpu"
+        )
+        torch.add(
+            seq_lens_cpu_upper_bound[:num_reqs],
+            step,
+            out=draft_seq_lens_cpu_upper_bound[:num_reqs],
+        )
+        draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.max_model_len)
         attn_metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=num_reqs_padded,
@@ -239,6 +261,7 @@ class DraftModelSpeculator(BaseSpeculator):
             slot_mappings=slot_mappings,
             kv_cache_config=self.kv_cache_config,
             causal=causal,
+            seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
         )
         return attn_metadata
 
@@ -261,10 +284,32 @@ class DraftModelSpeculator(BaseSpeculator):
             "(communication: O(2*tp_size) vs O(vocab_size))."
         )
 
-    def _greedy_sample_draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.use_local_argmax_reduction:
+    def _compute_draft_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int | None = None,
+    ) -> torch.Tensor:
+        if spec_step_idx is None:
+            return self.model.compute_logits(hidden_states)
+        return self.model.compute_logits(hidden_states, spec_step_idx=spec_step_idx)
+
+    def _get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int | None = None,
+    ) -> torch.Tensor:
+        if spec_step_idx is None:
             return self.model.get_top_tokens(hidden_states)
-        logits = self.model.compute_logits(hidden_states)
+        return self.model.get_top_tokens(hidden_states, spec_step_idx=spec_step_idx)
+
+    def _greedy_sample_draft(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int | None = None,
+    ) -> torch.Tensor:
+        if self.use_local_argmax_reduction:
+            return self._get_top_tokens(hidden_states, spec_step_idx)
+        logits = self._compute_draft_logits(hidden_states, spec_step_idx)
         return logits.argmax(dim=-1)
 
     def sample_draft(
@@ -276,9 +321,10 @@ class DraftModelSpeculator(BaseSpeculator):
         seeds: torch.Tensor,
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
+        spec_step_idx: int | None = None,
     ) -> torch.Tensor:
         if draft_logits is not None:
-            logits = self.model.compute_logits(hidden_states)
+            logits = self._compute_draft_logits(hidden_states, spec_step_idx)
             # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
             # used for draft and target sampling.
             return gumbel_sample(
@@ -292,7 +338,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 output_processed_logits_col=draft_step,
                 use_fp64=self.use_fp64_gumbel,
             )
-        return self._greedy_sample_draft(hidden_states)
+        return self._greedy_sample_draft(hidden_states, spec_step_idx)
 
     def _copy_request_inputs(
         self,

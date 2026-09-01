@@ -160,9 +160,9 @@ def _zero_kv_warmup_config(runner: object) -> _ZeroKvWarmupConfig | None:
     if meta is None:
         return None
 
-    _, page_size_el, block_size, n_segs = meta
+    _, _, _, max_chunks, block_size, n_segs = meta
     return _ZeroKvWarmupConfig(
-        page_size_el=int(page_size_el),
+        page_size_el=int(max_chunks * block_size),
         block_size=int(block_size),
         n_segs=int(n_segs),
     )
@@ -195,16 +195,26 @@ def _warm_zero_kv_blocks_kernel(
         dtype=torch.uint64,
         device=device,
     )
+    seg_block_strides = torch.full(
+        (config.n_segs,),
+        config.page_size_el,
+        dtype=torch.int64,
+        device=device,
+    )
+    seg_page_sizes = seg_block_strides.clone()
 
     for n_blocks in _ZERO_KV_N_BLOCKS:
         block_ids = torch.arange(n_blocks, dtype=torch.int64, device=device)
-        grid = (n_blocks * config.n_segs * (config.page_size_el // config.block_size),)
+        grid = (
+            n_blocks,
+            config.n_segs,
+            config.page_size_el // config.block_size,
+        )
         _zero_kv_blocks_kernel[grid](
             seg_addrs,
+            seg_block_strides,
+            seg_page_sizes,
             block_ids,
-            n_blocks,
-            N_SEGS=config.n_segs,
-            PAGE_SIZE_EL=config.page_size_el,
             BLOCK_SIZE=config.block_size,
         )
 

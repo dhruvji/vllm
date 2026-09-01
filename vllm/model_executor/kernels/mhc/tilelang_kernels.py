@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import math
 from functools import cache
 from typing import TYPE_CHECKING, Any
@@ -18,6 +19,8 @@ if TYPE_CHECKING or current_platform.is_cuda_alike():
             "tilelang is required for mhc but is not installed. Install it with "
             "`pip install tilelang`."
         )
+    with contextlib.suppress(Exception):
+        import flashinfer.comm  # noqa: F401
     import tilelang
     import tilelang.language as T
 else:

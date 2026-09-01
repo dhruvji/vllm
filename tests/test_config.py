@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pydantic
 import pytest
+import torch
 from pydantic import ValidationError
 
 import vllm.config.vllm as vllm_config_module
@@ -37,6 +38,116 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_hybrid_mla_mamba_block_size_preserves_kernel_alignment(monkeypatch):
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.platforms.interface import Platform
+
+    class Backend:
+        @staticmethod
+        def get_supported_kernel_block_sizes():
+            return [64]
+
+    class Model:
+        @staticmethod
+        def get_mamba_state_shape_from_config(vllm_config):
+            return (1, 1), (1, 1, 1)
+
+        @staticmethod
+        def get_mamba_state_dtype_from_config(vllm_config):
+            return torch.bfloat16, torch.bfloat16
+
+    monkeypatch.setattr(
+        ModelRegistry,
+        "resolve_model_cls",
+        lambda *args, **kwargs: (Model, None),
+    )
+    cache_config = SimpleNamespace(
+        block_size=64,
+        cache_dtype="auto",
+        mamba_block_size=None,
+        mamba_cache_mode="align",
+        mamba_page_size_padded=None,
+        user_specified_mamba_block_size=False,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(
+            architecture="HybridMLAForCausalLM",
+            dtype=torch.bfloat16,
+            get_head_size=lambda: 128,
+            get_num_kv_heads=lambda parallel_config: 1,
+            use_mla=True,
+        ),
+        parallel_config=SimpleNamespace(),
+    )
+
+    Platform._align_hybrid_block_size(vllm_config, Backend)
+
+    assert cache_config.block_size == 128
+    assert cache_config.mamba_block_size == 128
+
+
+@pytest.mark.skip_global_cleanup
+def test_sm120_kpool_alignment_uses_64_token_pool_pages(monkeypatch):
+    from vllm.platforms.cuda import CudaPlatform
+
+    monkeypatch.setattr(
+        CudaPlatform,
+        "is_device_capability_family",
+        classmethod(lambda _cls, capability: capability == 120),
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(index_kpool=4),
+        )
+    )
+
+    assert CudaPlatform._get_indexer_block_alignment(config) == 256
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextMTPModel",
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_glm5next_defaults_to_breakable_cudagraph(architecture, monkeypatch):
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=[architecture]),
+        compilation_config=CompilationConfig(),
+    )
+    config._uses_breakable_cudagraph_by_default = lambda: (
+        VllmConfig._uses_breakable_cudagraph_by_default(config)
+    )
+
+    assert VllmConfig._maybe_enable_breakable_cudagraph(config)
+    assert config.compilation_config.mode == CompilationMode.NONE
+
+
+@pytest.mark.skip_global_cleanup
+def test_rocm_default_v2_architecture_exclusions_are_applied(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    vllm_config_module.default_v2_model_runner_architectures.cache_clear()
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"],
+            runner_type="generate",
+            is_moe=True,
+            is_hybrid=False,
+            is_attention_free=False,
+        )
+    )
+
+    try:
+        assert not VllmConfig._is_default_v2_model_runner_model(config)
+    finally:
+        vllm_config_module.default_v2_model_runner_architectures.cache_clear()
 
 
 def test_compile_config_repr_succeeds():
@@ -98,6 +209,7 @@ def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
     assert compilation_config.cudagraph_capture_sizes == expected_capture_sizes
 
 
+@pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
     ("model_config", "expected"),
     [
@@ -261,6 +373,17 @@ def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
                 is_hybrid=True,
             ),
             False,
+        ),
+        (
+            SimpleNamespace(
+                model="zai-org/GLM-5.3",
+                architectures=["Glm5NextForConditionalGeneration"],
+                runner_type="generate",
+                is_moe=True,
+                is_quantized=False,
+                is_hybrid=True,
+            ),
+            True,
         ),
         (
             SimpleNamespace(

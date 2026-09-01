@@ -108,6 +108,14 @@ class WorkerLoRAManager:
 
     def _load_adapter(self, lora_request: LoRARequest) -> LoRAModel:
         try:
+            if (
+                lora_request.is_structural_expert
+                and not self.lora_config.enable_structural_experts
+            ):
+                raise ValueError(
+                    "Structural expert adapters require "
+                    "--enable-structural-experts at engine startup."
+                )
             supported_lora_modules = self._adapter_manager.supported_lora_modules
             packed_modules_mapping = self._adapter_manager.packed_modules_mapping
             expected_lora_lst: list[str] = []
@@ -121,15 +129,20 @@ class WorkerLoRAManager:
             expected_lora_modules = set(expected_lora_lst)
             lora_path = get_adapter_absolute_path(lora_request.lora_path)
 
-            peft_helper = PEFTHelper.from_local_dir(
-                lora_path,
-                self.max_position_embeddings,
-                lora_request.tensorizer_config_dict,
-            )
-
-            # Validates the LoRA configuration against requirements before
-            # loading weights, throwing an exception if validation fails.
-            peft_helper.validate_legal(self.lora_config)
+            if lora_request.is_structural_expert:
+                peft_helper = PEFTHelper(
+                    r=1,
+                    lora_alpha=1,
+                    target_modules=[],
+                    vllm_max_position_embeddings=self.max_position_embeddings,
+                )
+            else:
+                peft_helper = PEFTHelper.from_local_dir(
+                    lora_path,
+                    self.max_position_embeddings,
+                    lora_request.tensorizer_config_dict,
+                )
+                peft_helper.validate_legal(self.lora_config)
 
             # For some models like Qwen2VL, we need to use hf_to_vllm_mapper
             # to ensure correct loading of lora weights. Drop the QKV/MLP fusion

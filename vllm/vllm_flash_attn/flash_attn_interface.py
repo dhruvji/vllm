@@ -4,6 +4,8 @@
 # ruff: noqa: E501
 
 
+from functools import lru_cache
+
 import torch
 
 # isort: off
@@ -47,6 +49,12 @@ except (ImportError, ModuleNotFoundError) as e:
 # isort: on
 
 DEFAULT_FA_VERSION = 2
+
+
+@lru_cache
+def _fa3_fwd_supports_only_qv() -> bool:
+    schema = torch.ops._vllm_fa3_C.fwd.default._schema
+    return "only_qv" in str(schema)
 
 
 def _is_fa2_supported() -> tuple[bool, str | None]:
@@ -212,6 +220,7 @@ def flash_attn_varlen_func(
     mask_mod=None,
     aux_tensors=None,
     dynamic_causal: "torch.Tensor | None" = None,
+    only_qv=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -344,7 +353,7 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA3 does not support mask_mod")
         if aux_tensors is not None:
             raise NotImplementedError("FA3 does not support aux_tensors")
-        out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
+        fa3_args = [
             q,
             k,
             v,
@@ -377,12 +386,23 @@ def flash_attn_varlen_func(
             scheduler_metadata,
             num_splits,
             None,  # pack_gqa
-            0,  # sm_margin
-            s_aux,  # s_aux
-            cp_world_size,
-            cp_rank,
-            cp_tot_seqused_k,
+        ]
+        if _fa3_fwd_supports_only_qv():
+            fa3_args.append(only_qv)
+        elif only_qv:
+            raise RuntimeError(
+                "FA3 only_qv requires a newer vLLM FlashAttention extension."
+            )
+        fa3_args.extend(
+            [
+                0,  # sm_margin
+                s_aux,  # s_aux
+                cp_world_size,
+                cp_rank,
+                cp_tot_seqused_k,
+            ]
         )
+        out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(*fa3_args)
     elif fa_version == 4:
         assert alibi_slopes is None, "Alibi is not supported in FA4"
 
@@ -445,7 +465,7 @@ def compile_flash_attn_varlen_func_from_specs(
         raise NotImplementedError("FA4 compile-only wrapper does not support dropout")
     del deterministic
 
-    from vllm.vllm_flash_attn.cute.interface import (
+    from vllm.vllm_flash_attn.cute.interface import (  # type: ignore[attr-defined]
         compile_flash_attn_varlen_func_from_specs as _fa4_compile_flash_attn_varlen_func_from_specs,
     )
 

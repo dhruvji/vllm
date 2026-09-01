@@ -25,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     SendBlockMeta,
     TransferRegion,
     _align_transfer_regions,
+    _get_kv_block_len,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
@@ -35,6 +36,7 @@ from vllm.utils.network_utils import get_open_port
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
 )
@@ -63,6 +65,46 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
                 ),
             )
         ],
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_get_kv_block_len_preserves_virtual_split():
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=64,
+        dtype=torch.float16,
+    )
+
+    assert (
+        _get_kv_block_len(spec, block_len=4096, virtually_split_kv_in_blocks=True)
+        == 2048
+    )
+    assert (
+        _get_kv_block_len(spec, block_len=4096, virtually_split_kv_in_blocks=False)
+        == 4096
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_get_kv_block_len_transfers_complete_kpool_tail_without_padding():
+    spec = KpoolTailSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=3,
+        dtype=torch.bfloat16,
+        sliding_window=16,
+        page_size_padded=1024,
+    )
+
+    assert (
+        _get_kv_block_len(
+            spec,
+            block_len=spec.page_size_bytes,
+            virtually_split_kv_in_blocks=True,
+        )
+        == spec.unpadded_page_size_bytes
     )
 
 

@@ -70,7 +70,9 @@ class MooncakeStoreCoordinator:
         retention_interval: int | None = None,
     ) -> None:
         assert all(
-            g.kv_cache_spec.block_size % hash_block_size == 0 for g in kv_cache_groups
+            g.kv_cache_spec.block_size % hash_block_size == 0
+            for g in kv_cache_groups
+            if g.kv_cache_spec.participates_in_prefix_caching
         ), "block_size must be divisible by hash_block_size"
         assert scheduler_block_size % hash_block_size == 0, (
             f"scheduler_block_size ({scheduler_block_size}) must be a multiple of "
@@ -101,6 +103,12 @@ class MooncakeStoreCoordinator:
             tuple[KVCacheSpec, list[int], type[SingleTypeKVCacheManager]]
         ] = []
         for i, g in enumerate(self.kv_cache_groups):
+            # Skip groups that opt out of prefix caching (e.g. GLM-5.3-Flash
+            # kpool tail): per-request scratch, never shareable, so they must
+            # not participate in hit lookup. Mirrors core's
+            # KVCacheCoordinator.verify_and_split_kv_cache_groups.
+            if not g.kv_cache_spec.participates_in_prefix_caching:
+                continue
             spec = _unwrap_spec(g.kv_cache_spec)
             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
             assert manager_cls is not None, (

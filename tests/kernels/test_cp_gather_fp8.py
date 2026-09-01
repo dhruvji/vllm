@@ -252,6 +252,40 @@ def test_cp_gather_and_upconvert_fp8_kv_cache(seq_lens, block_size):
     assert torch.equal(dst[:, NOPE_DIM:], expected[:, NOPE_DIM:])
 
 
+@pytest.mark.parametrize("head_dim", [NOPE_DIM, NOPE_DIM + ROPE_DIM])
+def test_cp_gather_and_upconvert_fp8_kv_cache_head_dim(head_dim):
+    """Gather NoPE-only and NoPE-plus-RoPE workspaces without overwrites."""
+    (
+        cache,
+        block_table,
+        workspace_starts,
+        num_reqs,
+        total_tokens,
+        expected,
+    ) = _build_test_case([64, 128], block_size=64)
+
+    guard_dim = 64
+    sentinel = 123
+    backing = torch.full(
+        (total_tokens, NOPE_DIM + ROPE_DIM + guard_dim),
+        sentinel,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    dst = backing[:, :head_dim]
+
+    ops.cp_gather_and_upconvert_fp8_kv_cache(
+        cache, dst, block_table, workspace_starts, num_reqs
+    )
+
+    torch.testing.assert_close(
+        dst[:, :NOPE_DIM], expected[:, :NOPE_DIM], atol=1e-3, rtol=1e-2
+    )
+    if head_dim > NOPE_DIM:
+        assert torch.equal(dst[:, NOPE_DIM:], expected[:, NOPE_DIM:])
+    assert torch.all(backing[:, head_dim:] == sentinel)
+
+
 def test_cp_gather_fp8_shuffled_blocks():
     """Test that the kernel correctly follows the block table when
     physical blocks are non-contiguous and out of order.

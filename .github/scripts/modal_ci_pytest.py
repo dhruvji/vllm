@@ -18,7 +18,7 @@ SECONDS_PER_MINUTE = 60
 CUDA_VARIANT = "cu130"
 FLASHINFER_CUDA_INDEX = "https://flashinfer.ai/whl/"
 PYTORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu130"
-FLASHINFER_VERSION = "0.6.14"
+FLASHINFER_VERSION = "0.6.18"
 
 BRANCH = os.environ.get("BRANCH", "main")
 COMMIT_HASH = os.environ.get("COMMIT_HASH") or os.environ.get("GITHUB_SHA")

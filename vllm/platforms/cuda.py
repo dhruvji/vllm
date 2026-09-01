@@ -381,8 +381,11 @@ class CudaPlatformBase(Platform):
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
                 )
-            except ImportError:
-                invalid_reasons_i = ["ImportError"]
+            except (ImportError, OSError) as e:
+                logger.debug(
+                    "Attention backend %s is unavailable", backend.name, exc_info=True
+                )
+                invalid_reasons_i = [f"{type(e).__name__}: {e}"]
             if invalid_reasons_i:
                 invalid_reasons[backend] = (priority, invalid_reasons_i)
             else:
@@ -391,6 +394,25 @@ class CudaPlatformBase(Platform):
                 )
 
         return valid_backends_priorities, invalid_reasons
+
+    @classmethod
+    def _get_indexer_block_alignment(cls, vllm_config: VllmConfig) -> int | None:
+        index_kpool = getattr(
+            vllm_config.model_config.hf_text_config, "index_kpool", None
+        )
+        if not index_kpool or index_kpool <= 1:
+            return None
+        from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+
+        # kpool paged-MQA indexer: the storage block (block_size /
+        # index_kpool) is virtually split into pool pages, so block_size
+        # must be a multiple of index_kpool times a legal pool page.
+        page = min(PAGED_MQA_PAGE_SIZES)
+        if cls.is_device_capability_family(120):
+            # The SM120 DeepGEMM paged-MQA kernel only accepts a 64-token
+            # fp8 indexer page.
+            page = max(PAGED_MQA_PAGE_SIZES)
+        return index_kpool * page
 
     @classmethod
     def get_attn_backend_cls(
@@ -410,8 +432,11 @@ class CudaPlatformBase(Platform):
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
                 )
-            except ImportError:
-                invalid_reasons = ["ImportError"]
+            except (ImportError, OSError) as e:
+                raise ValueError(
+                    f"Selected backend {selected_backend} is not valid for "
+                    f"this configuration. Reason: [{type(e).__name__}: {e}]"
+                ) from e
             if invalid_reasons:
                 raise ValueError(
                     f"Selected backend {selected_backend} is not valid for "

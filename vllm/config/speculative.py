@@ -56,6 +56,7 @@ MTPModelTypes = Literal[
     "hy_v3_mtp",
     "gemma4_mtp",
     "inkling_mtp",
+    "glm5_next_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
@@ -615,6 +616,12 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["MiniMaxM3MTP"]}
             )
+        if hf_config.model_type == "glm5_next":
+            hf_config.model_type = "glm5_next_mtp"
+            n_predict = hf_config.num_nextn_predict_layers
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["Glm5NextMTPModel"]}
+            )
 
         return hf_config
 
@@ -897,7 +904,10 @@ class SpeculativeConfig:
                     if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
-                        not in ("step3p5_mtp", "inkling_mtp")
+                        not in (
+                            "step3p5_mtp",
+                            "inkling_mtp",
+                        )
                     ):
                         logger.warning(
                             "Enabling num_speculative_tokens > 1 will run "
