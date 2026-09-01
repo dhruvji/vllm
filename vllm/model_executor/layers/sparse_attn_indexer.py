@@ -596,7 +596,7 @@ def sparse_attn_indexer(
                 topk_indices,
                 topk_workspace,
                 topk_tokens,
-                attn_metadata_narrowed.max_seq_len,
+                attn_metadata_narrowed.max_uncompressed_seq_len,
             )
         elif use_persistent_topk:
             workspace_manager = current_workspace_manager()

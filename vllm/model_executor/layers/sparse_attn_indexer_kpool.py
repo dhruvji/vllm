@@ -188,11 +188,15 @@ def _fill_short_decode_causal_indices(
     topk_indices_buffer: torch.Tensor,
     positions: torch.Tensor | None,
     num_decode_tokens: int,
-    max_seq_len: int,
+    max_uncompressed_seq_len: int,
     topk_tokens: int,
 ) -> bool:
     """Fill exact causal rows when sparse decode would select every token."""
-    if positions is None or positions.numel() == 0 or max_seq_len > topk_tokens:
+    if (
+        positions is None
+        or positions.numel() == 0
+        or max_uncompressed_seq_len > topk_tokens
+    ):
         return False
     _fill_causal_indices(
         topk_indices_buffer[:num_decode_tokens], positions[:num_decode_tokens]
@@ -398,16 +402,16 @@ def sparse_attn_indexer_kpool(
         # the top-k buffer with all causal token indices. The index-K cache was
         # already written above.
         n_prefill_sf = num_tokens - num_decode_tokens
-        # Host-side short-prefill predicate: max_prefill_seq_len is computed
-        # in the metadata builder (exact for prefill rows) and equals
+        # Host-side short-prefill predicate: max_uncompressed_seq_len is
+        # computed in the metadata builder (exact for prefill rows) and equals
         # positions[prefill_slice].max() + 1, so this replaces a
         # positions.max().item() device sync per layer. -1 (unknown metadata)
         # falls back to the device-side check.
-        if prefill_metadata.max_prefill_seq_len >= 0:
+        if prefill_metadata.max_uncompressed_seq_len >= 0:
             short_prefill = (
                 n_prefill_sf > 0
                 and positions is not None
-                and prefill_metadata.max_prefill_seq_len <= topk_tokens
+                and prefill_metadata.max_uncompressed_seq_len <= topk_tokens
             )
         else:
             short_prefill = (
@@ -669,7 +673,7 @@ def sparse_attn_indexer_kpool(
             topk_indices_buffer,
             positions,
             num_decode_tokens,
-            attn_metadata_narrowed.max_seq_len,
+            attn_metadata_narrowed.max_uncompressed_seq_len,
             topk_tokens,
         ):
             return topk_indices_buffer
@@ -749,7 +753,7 @@ def sparse_attn_indexer_kpool(
                 topk_dst,
                 topk_workspace,
                 select_k,
-                attn_metadata_narrowed.max_seq_len,
+                attn_metadata_narrowed.max_uncompressed_seq_len,
             )
         else:
             if current_platform.is_xpu():

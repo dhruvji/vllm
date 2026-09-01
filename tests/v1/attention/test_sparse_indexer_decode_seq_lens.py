@@ -65,6 +65,23 @@ def test_short_decode_leaves_buffer_unchanged_for_sparse_context():
     assert torch.equal(topk, before)
 
 
+def test_short_decode_uses_uncompressed_length_with_kpool():
+    topk = torch.full((1, TOPK_TOKENS + KPOOL - 1), 99, dtype=torch.int32)
+    before = topk.clone()
+    uncompressed_seq_len = 48
+    compressed_seq_len = uncompressed_seq_len // KPOOL
+
+    assert compressed_seq_len <= TOPK_TOKENS
+    assert not _fill_short_decode_causal_indices(
+        topk,
+        torch.tensor([uncompressed_seq_len - 1]),
+        num_decode_tokens=1,
+        max_uncompressed_seq_len=uncompressed_seq_len,
+        topk_tokens=TOPK_TOKENS,
+    )
+    assert torch.equal(topk, before)
+
+
 def make_non_uniform_batch():
     """3 requests: plain decode (1 token), MTP verify (4), adaptive verify (3).
 

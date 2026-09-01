@@ -192,7 +192,8 @@ class DeepseekV32IndexerPrefillChunkMetadata:
 @dataclass
 class DeepseekV32IndexerPrefillMetadata:
     chunks: list[DeepseekV32IndexerPrefillChunkMetadata]
-    max_prefill_seq_len: int = -1
+    # Raw token count; chunk lengths use index-cache units.
+    max_uncompressed_seq_len: int = -1
 
 
 @dataclass
@@ -217,8 +218,9 @@ class DeepSeekV32IndexerDecodeMetadata:
 class DeepseekV32IndexerMetadata:
     # FIXME (zyongye)
     # hacky way to access the data now, need to be in chunked meta
+    # These remain in raw token units; decode.seq_lens may be compressed.
     seq_lens: torch.Tensor
-    max_seq_len: int
+    max_uncompressed_seq_len: int
     slot_mapping: torch.Tensor
 
     # New for MLA (compared to FlashAttention)
@@ -663,7 +665,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     chunks.append(metadata)
             prefill_metadata = DeepseekV32IndexerPrefillMetadata(
                 chunks,
-                max_prefill_seq_len=(
+                max_uncompressed_seq_len=(
                     int(seq_lens_cpu[num_decodes:].max().item())
                     if num_prefills > 0
                     else 0
@@ -801,7 +803,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         attn_metadata = DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
-            max_seq_len=common_attn_metadata.max_seq_len,
+            max_uncompressed_seq_len=common_attn_metadata.max_seq_len,
             slot_mapping=compressed_slot_mapping,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
