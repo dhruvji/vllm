@@ -501,7 +501,6 @@ class ModelCudaGraphManager(CudaGraphManager):
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = None
                 if cg_mode == CUDAGraphMode.PIECEWISE:
-                    assert (attn_metadata is not None) == self.use_breakable_cg
                     batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens,
                         has_lora=has_lora,

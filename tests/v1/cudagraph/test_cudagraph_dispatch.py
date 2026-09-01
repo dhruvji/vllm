@@ -22,7 +22,13 @@ from vllm.config.lora import LoRAConfig
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.platforms import current_platform
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
-from vllm.v1.worker.gpu.cudagraph_utils import prepare_inputs_to_capture
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    AttentionState,
+    BatchExecutionDescriptor,
+    CudaGraphManager,
+    ModelCudaGraphManager,
+    prepare_inputs_to_capture,
+)
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -76,6 +82,71 @@ def test_prepare_capture_attention_metadata_mode(full_cudagraph):
         kv_cache_config,
         for_capture=full_cudagraph,
     )
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("use_breakable_cg", [False, True])
+def test_piecewise_capture_accepts_attention_metadata(use_breakable_cg):
+    manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
+    manager.use_breakable_cg = use_breakable_cg
+    manager.breakable_cg_runner = MagicMock(return_value=torch.zeros(4, 2))
+    manager.max_num_reqs = 8
+    manager.dp_size = 1
+    manager.is_first_pp_rank = True
+    manager.is_last_pp_rank = True
+    manager.hidden_states = None
+    manager.aux_hidden_states = []
+    manager.intermediate_tensors = None
+    manager.vllm_config = MagicMock(spec=VllmConfig)
+    manager.vllm_config.parallel_config = MagicMock(
+        data_parallel_size=1,
+        use_sequence_parallel_moe=False,
+        is_moe_model=False,
+    )
+    manager.vllm_config.compilation_config = MagicMock(
+        fast_moe_cold_start=False,
+        static_forward_context={},
+    )
+
+    desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE,
+        num_tokens=4,
+        num_reqs=None,
+    )
+    input_buffers = MagicMock()
+    input_buffers.input_ids = torch.zeros(4, dtype=torch.int64)
+    input_buffers.positions = torch.arange(4)
+    input_buffers.is_padding = torch.zeros(4, dtype=torch.bool)
+    model_state = MagicMock()
+    model_state.prepare_dummy_inputs.return_value = {}
+    model = MagicMock(spec=nn.Module)
+    model.return_value = torch.zeros(4, 2)
+    attn_metadata = MagicMock()
+
+    def capture_piecewise(_manager, create_forward_fn, _progress_bar_desc):
+        forward_fn = create_forward_fn(desc, warmup=True)
+        forward_fn(CUDAGraphMode.NONE)
+        forward_fn(CUDAGraphMode.PIECEWISE)
+
+    with (
+        patch.object(CudaGraphManager, "capture", new=capture_piecewise),
+        patch(
+            "vllm.v1.worker.gpu.cudagraph_utils.prepare_inputs_to_capture",
+            return_value=AttentionState(attn_metadata, MagicMock()),
+        ),
+    ):
+        manager.capture(
+            model,
+            model_state,
+            input_buffers,
+            intermediate_tensors=None,
+            block_tables=MagicMock(),
+            attn_groups=MagicMock(),
+            kv_cache_config=MagicMock(),
+        )
+
+    assert model.call_count == 2 - use_breakable_cg
+    assert manager.breakable_cg_runner.call_count == use_breakable_cg
 
 
 # Helper MLP for testing
